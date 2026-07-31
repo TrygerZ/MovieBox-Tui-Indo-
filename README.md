@@ -76,7 +76,7 @@ Fast and clean. No configuration, no torrents, and no debrid required.
 ### Streaming & Playback
 - **Instant Search & Catalogs:** Type to search instantly, or browse trending movies, shows, and anime using slash commands (e.g., `/movies`, `/anime`).
 - **Seamless Local Playback:** Resolves 4K/1080p streams and opens them instantly in your preferred local video player (`mpv`, `IINA`, or `VLC`).
-- **Integrated Subtitles:** Automatically fetches available subtitles and lets you select your preferred language before playback.
+- **Integrated Subtitles:** Automatically fetches available subtitles — built-in source, then SubDL, then OpenSubtitles — and lets you select your preferred language before playback.
 - **Live IPTV:** Press `Ctrl+T` to toggle Live TV mode and stream thousands of live television channels globally.
 
 ### Advanced Downloading
@@ -149,10 +149,32 @@ variables (bring your own API key):
 | `MOVIEBOX_OPENSUBTITLES_LANGUAGES` | Comma-separated subtitle languages to search | `id,en` |
 | `MOVIEBOX_OPENSUBTITLES_BASE_URL` | Override the OpenSubtitles API base URL | *(official API)* |
 
-> **Note:** OpenSubtitles enforces a limited free-tier quota. When no env vars
-> are set, behavior is unchanged — playback and downloads proceed without the
-> OpenSubtitles fallback. Searches and downloads are cached locally to avoid
-> wasting quota.
+> **Note:** OpenSubtitles enforces a limited free-tier quota. The remaining
+> daily downloads are shown right in the subtitle picker, and the automatic
+> lookup is skipped when the quota is low or exhausted so manual picks stay
+> available. Rate-limited requests (HTTP 429) are retried automatically, and
+> API errors are reported in plain language. When no env vars are set, behavior
+> is unchanged — playback and downloads proceed without the OpenSubtitles
+> fallback. Searches and downloads are cached locally to avoid wasting quota.
+
+### SubDL (Optional)
+
+Before falling back to OpenSubtitles, `moviebox-tui` first tries the free
+[SubDL](https://subdl.com) provider, so your OpenSubtitles quota is preserved
+whenever a match exists. It needs its own (free) API key:
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `MOVIEBOX_SUBDL_API_KEY` | SubDL API key (required for this feature) | *(empty)* |
+| `MOVIEBOX_SUBDL_ENABLED` | Enable/disable the SubDL fallback | `true` |
+| `MOVIEBOX_SUBDL_LANGUAGES` | Comma-separated subtitle languages to search | `id,en` |
+| `MOVIEBOX_SUBDL_BASE_URL` | Override the SubDL API base URL | *(official API)* |
+
+> **Note:** SubDL is tried before OpenSubtitles, so any match found there never
+> consumes the OpenSubtitles quota. When no API key is set, the provider is
+> disabled and playback falls back to OpenSubtitles as usual. Subtitle searches
+> and downloads are cached locally; downloads arrive as ZIP archives that are
+> extracted automatically.
 
 ### Embedded Subtitles (Optional)
 
