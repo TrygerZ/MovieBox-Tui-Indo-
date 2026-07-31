@@ -137,6 +137,12 @@ pub struct AppState {
 
     pub subtitle_popup: bool,
     pub is_download_subtitle_popup: bool,
+    pub subtitle_searching: bool,
+    pub subtitle_search_error: Option<String>,
+    pub os_subtitles: Vec<(String, String)>,
+    /// True while an OpenSubtitles search is running and we are deferring the
+    /// play/download decision (no built-in subtitle was available).
+    pub os_waiting: bool,
     pub season_subtitle_preference: Option<String>,
     pub subtitle_list: Vec<(String, String)>,
     pub subtitle_list_state: ListState,
@@ -239,6 +245,10 @@ impl Default for AppState {
 
             subtitle_popup: false,
             is_download_subtitle_popup: false,
+            subtitle_searching: false,
+            subtitle_search_error: None,
+            os_subtitles: Vec::new(),
+            os_waiting: false,
             season_subtitle_preference: None,
             subtitle_list: Vec::new(),
             subtitle_list_state: ListState::default(),

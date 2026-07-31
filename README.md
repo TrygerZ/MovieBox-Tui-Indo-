@@ -133,6 +133,27 @@ cargo install moviebox-tui
 
 Once installed, just open your terminal and type `moviebox-tui` to jump in!
 
+### OpenSubtitles (Optional)
+
+When a movie or episode has no Indonesian subtitle from the built-in source,
+`moviebox-tui` can look up subtitles from the official
+[OpenSubtitles](https://opensubtitles.com) API. Configure it with environment
+variables (bring your own API key):
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `MOVIEBOX_OPENSUBTITLES_API_KEY` | OpenSubtitles API key (required for this feature) | *(empty)* |
+| `MOVIEBOX_OPENSUBTITLES_USERNAME` | OpenSubtitles username (optional) | *(empty)* |
+| `MOVIEBOX_OPENSUBTITLES_PASSWORD` | OpenSubtitles password (optional) | *(empty)* |
+| `MOVIEBOX_OPENSUBTITLES_ENABLED` | Enable/disable the OpenSubtitles fallback | `true` |
+| `MOVIEBOX_OPENSUBTITLES_LANGUAGES` | Comma-separated subtitle languages to search | `id,en` |
+| `MOVIEBOX_OPENSUBTITLES_BASE_URL` | Override the OpenSubtitles API base URL | *(official API)* |
+
+> **Note:** OpenSubtitles enforces a limited free-tier quota. When no env vars
+> are set, behavior is unchanged — playback and downloads proceed without the
+> OpenSubtitles fallback. Searches and downloads are cached locally to avoid
+> wasting quota.
+
 ### Keyboard Controls
 
 <table>

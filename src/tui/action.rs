@@ -110,4 +110,14 @@ pub enum Action {
         crate::tui::state::PlayerKind,
         crate::providers::models::PlaybackSource,
     ),
+    OpenSubtitlesReady {
+        context_id: String,
+        candidates: Vec<(String, String)>,
+        is_download: bool,
+    },
+    OpenSubtitlesFailed {
+        context_id: String,
+        is_download: bool,
+        error: String,
+    },
 }

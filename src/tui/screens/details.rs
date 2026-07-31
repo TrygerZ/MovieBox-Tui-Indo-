@@ -999,7 +999,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
             }
         }
     }
-    if !state.selected_resources.is_some() {
+    if state.selected_resources.is_none() {
         frame.render_widget(streams_block, streams_area);
     }
     if state.subtitle_popup || state.is_download_subtitle_popup {

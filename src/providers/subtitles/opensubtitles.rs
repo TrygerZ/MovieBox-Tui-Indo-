@@ -1,0 +1,691 @@
+use super::cache;
+use super::{score_candidate, SubtitleContext};
+use crate::providers::subtitles::{OsCandidate, OsSearchOutcome};
+use serde::Deserialize;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+
+pub const BASE_URL: &str = "https://api.opensubtitles.com/api/v1";
+
+fn urlencoding_simple(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.' || b == b'~' {
+            out.push(b as char);
+        } else if b == b' ' {
+            out.push('+');
+        } else {
+            out.push_str(&format!("%{:02X}", b));
+        }
+    }
+    out
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct OpenSubtitlesConfig {
+    pub api_key: Option<String>,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub languages: Vec<String>,
+    pub enabled: bool,
+    pub base_url: Option<String>,
+}
+
+impl OpenSubtitlesConfig {
+    pub fn from_env() -> Self {
+        let enabled = std::env::var("MOVIEBOX_OPENSUBTITLES_ENABLED")
+            .map(|v| !v.eq_ignore_ascii_case("false") && v != "0")
+            .unwrap_or(true);
+        let languages = std::env::var("MOVIEBOX_OPENSUBTITLES_LANGUAGES")
+            .map(|v| {
+                v.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| vec!["id".to_string(), "en".to_string()]);
+        Self {
+            api_key: std::env::var("MOVIEBOX_OPENSUBTITLES_API_KEY").ok(),
+            username: std::env::var("MOVIEBOX_OPENSUBTITLES_USERNAME").ok(),
+            password: std::env::var("MOVIEBOX_OPENSUBTITLES_PASSWORD").ok(),
+            languages,
+            enabled,
+            base_url: std::env::var("MOVIEBOX_OPENSUBTITLES_BASE_URL").ok(),
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.enabled
+            && self
+                .api_key
+                .as_deref()
+                .is_some_and(|s| !s.is_empty())
+            && self
+                .username
+                .as_deref()
+                .is_some_and(|s| !s.is_empty())
+            && self
+                .password
+                .as_deref()
+                .is_some_and(|s| !s.is_empty())
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum OpenSubtitlesError {
+    #[error("missing OpenSubtitles credential: {0}")]
+    MissingCredentials(&'static str),
+    #[error("login failed: HTTP {0}")]
+    LoginHttp(u16),
+    #[error("login response has no token")]
+    MissingToken,
+    #[error("OpenSubtitles API error: HTTP {0}")]
+    Http(u16),
+    #[error("rate limited (retry after ~{0}s)")]
+    RateLimited(u64),
+    #[error("download quota exhausted: {0}")]
+    Quota(String),
+    #[error("subtitle not found")]
+    NotFound,
+    #[error("reqwest error: {0}")]
+    Reqwest(#[from] reqwest::Error),
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+}
+
+#[derive(Clone)]
+pub struct OpenSubtitlesClient {
+    http: reqwest::Client,
+    config: OpenSubtitlesConfig,
+    token: Arc<Mutex<Option<String>>>,
+    last_login_at: Arc<Mutex<Option<u64>>>,
+}
+
+impl OpenSubtitlesClient {
+    pub fn new(config: OpenSubtitlesConfig) -> Self {
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(12))
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        Self {
+            http,
+            config,
+            token: Arc::new(Mutex::new(None)),
+            last_login_at: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub fn from_env() -> Self {
+        Self::new(OpenSubtitlesConfig::from_env())
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.config.enabled()
+    }
+
+    fn base_url(&self) -> &str {
+        self.config.base_url.as_deref().unwrap_or(BASE_URL)
+    }
+
+    pub async fn ensure_token(&self) -> Result<String, OpenSubtitlesError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        {
+            let token_guard = self.token.lock().await;
+            let login_at_guard = self.last_login_at.lock().await;
+            if let (Some(t), Some(last)) = (token_guard.as_ref(), *login_at_guard) {
+                if now.saturating_sub(last) < 20 * 3600 {
+                    return Ok(t.clone());
+                }
+            }
+        }
+
+        let api_key = self
+            .config
+            .api_key
+            .as_deref()
+            .ok_or(OpenSubtitlesError::MissingCredentials("api_key"))?;
+        let username = self
+            .config
+            .username
+            .as_deref()
+            .ok_or(OpenSubtitlesError::MissingCredentials("username"))?;
+        let password = self
+            .config
+            .password
+            .as_deref()
+            .ok_or(OpenSubtitlesError::MissingCredentials("password"))?;
+
+        let url = format!("{}/login", self.base_url());
+        let res = self
+            .http
+            .post(&url)
+            .header("Api-Key", api_key)
+            .json(&serde_json::json!({
+                "username": username,
+                "password": password
+            }))
+            .send()
+            .await?;
+
+        if !res.status().is_success() {
+            return Err(OpenSubtitlesError::LoginHttp(res.status().as_u16()));
+        }
+
+        let login_res: LoginResponse = res.json().await?;
+        let token = login_res.user.token;
+        if token.is_empty() {
+            return Err(OpenSubtitlesError::MissingToken);
+        }
+
+        *self.token.lock().await = Some(token.clone());
+        *self.last_login_at.lock().await = Some(now);
+
+        Ok(token)
+    }
+
+    pub async fn search(&self, ctx: &SubtitleContext) -> Result<OsSearchOutcome, OpenSubtitlesError> {
+        let query_key = cache::search_query_key(ctx, &self.config.languages.join(","));
+        if let Some(cached_val) = cache::get_search_cache(&query_key) {
+            if let Ok(search_res) = serde_json::from_value::<SearchResponse>(cached_val) {
+                let candidates = self.parse_and_score_search(search_res, ctx);
+                return Ok(OsSearchOutcome {
+                    candidates,
+                    from_cache: true,
+                });
+            }
+        }
+
+        let api_key = self
+            .config
+            .api_key
+            .as_deref()
+            .ok_or(OpenSubtitlesError::MissingCredentials("api_key"))?;
+
+        let mut query_params: Vec<(&str, String)> = Vec::new();
+
+        let langs = self.config.languages.join(",");
+        query_params.push(("languages", langs));
+
+        if let Some(imdb_id) = &ctx.imdb_id {
+            query_params.push(("imdb_id", imdb_id.clone()));
+            if ctx.is_episode {
+                query_params.push(("type", "episode".to_string()));
+                if let Some(s) = ctx.season {
+                    query_params.push(("season_number", s.to_string()));
+                }
+                if let Some(e) = ctx.episode {
+                    query_params.push(("episode_number", e.to_string()));
+                }
+            } else {
+                query_params.push(("type", "movie".to_string()));
+            }
+        } else {
+            query_params.push(("query", ctx.title.clone()));
+            if let Some(yr) = &ctx.year {
+                query_params.push(("year", yr.clone()));
+            }
+            if ctx.is_episode {
+                query_params.push(("type", "episode".to_string()));
+                if let Some(s) = ctx.season {
+                    query_params.push(("season_number", s.to_string()));
+                }
+                if let Some(e) = ctx.episode {
+                    query_params.push(("episode_number", e.to_string()));
+                }
+            } else {
+                query_params.push(("type", "movie".to_string()));
+            }
+        }
+
+        let query_string = query_params
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, urlencoding_simple(v)))
+            .collect::<Vec<_>>()
+            .join("&");
+
+        let url = format!("{}/subtitles?{}", self.base_url(), query_string);
+        let req = self.http.get(&url).header("Api-Key", api_key);
+
+        let res = self.send_with_retry_429(req).await?;
+        if res.status().as_u16() == 429 {
+            let retry_after = res
+                .headers()
+                .get("Retry-After")
+                .and_then(|h| h.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(3);
+            return Err(OpenSubtitlesError::RateLimited(retry_after));
+        }
+        if !res.status().is_success() {
+            return Err(OpenSubtitlesError::Http(res.status().as_u16()));
+        }
+
+        let raw_val: serde_json::Value = res.json().await?;
+        cache::set_search_cache(&query_key, &raw_val);
+
+        let search_res: SearchResponse = serde_json::from_value(raw_val)?;
+        let candidates = self.parse_and_score_search(search_res, ctx);
+
+        Ok(OsSearchOutcome {
+            candidates,
+            from_cache: false,
+        })
+    }
+
+    fn parse_and_score_search(&self, search_res: SearchResponse, ctx: &SubtitleContext) -> Vec<OsCandidate> {
+        let mut list = Vec::new();
+        for item in search_res.data {
+            let score = score_candidate(&item, ctx);
+            for file in item.attributes.files {
+                let lang = item.attributes.language.clone().unwrap_or_else(|| "id".into());
+                let machine_translated = item.attributes.ai_translated.unwrap_or(false)
+                    || item.attributes.machine_translated.unwrap_or(false);
+                list.push(OsCandidate {
+                    label: String::new(),
+                    file_id: file.file_id,
+                    language: lang,
+                    score,
+                    release_name: item.attributes.release_name.clone(),
+                    download_count: item.attributes.download_count,
+                    machine_translated,
+                });
+            }
+        }
+        list.sort_by_key(|b| std::cmp::Reverse(b.score));
+        list.truncate(5);
+        list
+    }
+
+    /// Send a request, retrying once when the API responds 429 (rate limited).
+    /// The retry honours `Retry-After`, capped at 3 seconds.
+    async fn send_with_retry_429(
+        &self,
+        req: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, OpenSubtitlesError> {
+        let mut attempt = 0;
+        loop {
+            let builder = req
+                .try_clone()
+                .ok_or_else(|| OpenSubtitlesError::Http(0))?;
+            let res = builder.send().await?;
+            if res.status().as_u16() == 429 && attempt == 0 {
+                let retry_after = res
+                    .headers()
+                    .get("Retry-After")
+                    .and_then(|h| h.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(3);
+                tokio::time::sleep(std::time::Duration::from_secs(retry_after.min(3))).await;
+                attempt += 1;
+                continue;
+            }
+            return Ok(res);
+        }
+    }
+
+    pub async fn download_link(&self, file_id: u32) -> Result<DownloadResponse, OpenSubtitlesError> {
+        let token = self.ensure_token().await?;
+        let api_key = self
+            .config
+            .api_key
+            .as_deref()
+            .ok_or(OpenSubtitlesError::MissingCredentials("api_key"))?;
+
+        let url = format!("{}/download", self.base_url());
+        let req = self
+            .http
+            .post(&url)
+            .header("Api-Key", api_key)
+            .header("Authorization", format!("Bearer {token}"))
+            .json(&serde_json::json!({ "file_id": file_id }));
+        let res = self.send_with_retry_429(req).await?;
+
+        if res.status().as_u16() == 429 {
+            let retry_after = res
+                .headers()
+                .get("Retry-After")
+                .and_then(|h| h.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(3);
+            return Err(OpenSubtitlesError::RateLimited(retry_after));
+        }
+
+        if !res.status().is_success() {
+            return Err(OpenSubtitlesError::Http(res.status().as_u16()));
+        }
+
+        let dl_res: DownloadResponse = res.json().await?;
+        if let (Some(reqs), Some(rem)) = (dl_res.requests, dl_res.remaining) {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            cache::set_quota_cache(&cache::QuotaInfo {
+                requests: reqs,
+                remaining: rem,
+                updated_at: now,
+            });
+        }
+
+        Ok(dl_res)
+    }
+
+    pub async fn fetch_bytes(&self, link: &str) -> Result<Vec<u8>, OpenSubtitlesError> {
+        let res = self.http.get(link).send().await?.error_for_status()?;
+        let bytes = res.bytes().await?;
+        Ok(bytes.to_vec())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LoginResponse {
+    pub user: LoginUser,
+    #[serde(default)]
+    pub status: Option<u16>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LoginUser {
+    pub token: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SearchResponse {
+    #[serde(default)]
+    pub total_count: Option<u32>,
+    #[serde(default)]
+    pub data: Vec<SubtitleItem>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SubtitleItem {
+    pub id: String,
+    #[serde(rename = "type", default)]
+    pub item_type: Option<String>,
+    pub attributes: SubtitleAttributes,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SubtitleAttributes {
+    #[serde(default)]
+    pub language: Option<String>,
+    #[serde(rename = "release_name", default)]
+    pub release_name: Option<String>,
+    #[serde(default)]
+    pub files: Vec<SubtitleFile>,
+    #[serde(rename = "download_count", default)]
+    pub download_count: Option<u32>,
+    #[serde(rename = "ai_translated", default)]
+    pub ai_translated: Option<bool>,
+    #[serde(rename = "machine_translated", default)]
+    pub machine_translated: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SubtitleFile {
+    #[serde(rename = "file_id")]
+    pub file_id: u32,
+    #[serde(rename = "file_name", default)]
+    pub file_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DownloadResponse {
+    pub link: String,
+    #[serde(rename = "file_name", default)]
+    pub file_name: Option<String>,
+    #[serde(default)]
+    pub requests: Option<u32>,
+    #[serde(default)]
+    pub remaining: Option<u32>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_login_response() {
+        let json_data = serde_json::json!({
+            "user": {
+                "token": "secret_jwt_token"
+            },
+            "status": 200
+        });
+        let parsed: LoginResponse = serde_json::from_value(json_data).unwrap();
+        assert_eq!(parsed.user.token, "secret_jwt_token");
+    }
+
+    #[test]
+    fn test_parse_search_response() {
+        let json_data = serde_json::json!({
+            "total_count": 1,
+            "data": [{
+                "id": "101",
+                "attributes": {
+                    "language": "id",
+                    "release_name": "Avengers",
+                    "files": [{ "file_id": 555, "file_name": "sub.srt" }]
+                }
+            }]
+        });
+        let parsed: SearchResponse = serde_json::from_value(json_data).unwrap();
+        assert_eq!(parsed.data.len(), 1);
+        assert_eq!(parsed.data[0].attributes.files[0].file_id, 555);
+    }
+
+    #[test]
+    fn test_parse_download_response() {
+        let json_data = serde_json::json!({
+            "link": "https://dl.opensubtitles.org/en/file/abc.srt",
+            "file_name": "movie.id.srt",
+            "requests": 5,
+            "remaining": 15
+        });
+        let parsed: DownloadResponse = serde_json::from_value(json_data).unwrap();
+        assert_eq!(parsed.link, "https://dl.opensubtitles.org/en/file/abc.srt");
+        assert_eq!(parsed.file_name.as_deref(), Some("movie.id.srt"));
+        assert_eq!(parsed.requests, Some(5));
+        assert_eq!(parsed.remaining, Some(15));
+    }
+
+    #[test]
+    fn test_parse_search_empty() {
+        let json_data = serde_json::json!({ "data": [] });
+        let parsed: SearchResponse = serde_json::from_value(json_data).unwrap();
+        assert!(parsed.data.is_empty());
+        assert_eq!(parsed.total_count, None);
+    }
+
+    #[test]
+    fn test_deserialize_missing_optional_fields() {
+        let json_data = serde_json::json!({
+            "id": "42",
+            "attributes": {
+                "language": "id",
+                "files": [{ "file_id": 7 }]
+            }
+        });
+        let parsed: SubtitleItem = serde_json::from_value(json_data).unwrap();
+        assert_eq!(parsed.attributes.ai_translated, None);
+        assert_eq!(parsed.attributes.release_name, None);
+        assert_eq!(parsed.attributes.download_count, None);
+        assert_eq!(parsed.attributes.machine_translated, None);
+        assert_eq!(parsed.attributes.files[0].file_name, None);
+    }
+
+    #[test]
+    fn test_parse_language_as_name() {
+        let json_data = serde_json::json!({
+            "id": "9",
+            "attributes": {
+                "language": "Indonesian",
+                "files": [{ "file_id": 9 }]
+            }
+        });
+        let item: SubtitleItem = serde_json::from_value(json_data).unwrap();
+        let ctx = SubtitleContext::default();
+        let score = score_candidate(&item, &ctx);
+        assert!(score >= 50, "expected language bonus >= 50, got {score}");
+    }
+
+    /// Test-only helper: set/clear an env var, run `f`, then restore the
+    /// previous value. Keeps the mutation window minimal for test isolation.
+    fn with_env(key: &str, val: Option<&str>, f: impl FnOnce()) {
+        let prev = std::env::var(key).ok();
+        // SAFETY: test-only; the variable is restored right after the closure.
+        unsafe {
+            match val {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+        f();
+        // SAFETY: restoring the previous value keeps other tests isolated.
+        unsafe {
+            match prev {
+                Some(p) => std::env::set_var(key, p),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+
+    /// Shared lock so env-var-dependent tests never run concurrently (cargo
+    /// runs tests in parallel by default).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn test_config_from_env_enabled() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // All credentials present -> enabled with default languages.
+        with_env("MOVIEBOX_OPENSUBTITLES_API_KEY", Some("key"), || {
+            with_env("MOVIEBOX_OPENSUBTITLES_USERNAME", Some("user"), || {
+                with_env("MOVIEBOX_OPENSUBTITLES_PASSWORD", Some("pass"), || {
+                    with_env("MOVIEBOX_OPENSUBTITLES_ENABLED", None, || {
+                        let cfg = OpenSubtitlesConfig::from_env();
+                        assert!(cfg.enabled());
+                        assert_eq!(cfg.languages, vec!["id".to_string(), "en".to_string()]);
+                    });
+                });
+            });
+        });
+
+        // One credential missing -> disabled.
+        with_env("MOVIEBOX_OPENSUBTITLES_API_KEY", Some("key"), || {
+            with_env("MOVIEBOX_OPENSUBTITLES_USERNAME", Some("user"), || {
+                with_env("MOVIEBOX_OPENSUBTITLES_PASSWORD", None, || {
+                    let cfg = OpenSubtitlesConfig::from_env();
+                    assert!(!cfg.enabled());
+                });
+            });
+        });
+
+        // Explicitly disabled wins even with all credentials present.
+        with_env("MOVIEBOX_OPENSUBTITLES_API_KEY", Some("key"), || {
+            with_env("MOVIEBOX_OPENSUBTITLES_USERNAME", Some("user"), || {
+                with_env("MOVIEBOX_OPENSUBTITLES_PASSWORD", Some("pass"), || {
+                    with_env("MOVIEBOX_OPENSUBTITLES_ENABLED", Some("false"), || {
+                        let cfg = OpenSubtitlesConfig::from_env();
+                        assert!(!cfg.enabled());
+                    });
+                });
+            });
+        });
+    }
+
+    #[test]
+    fn test_config_default_languages() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        with_env("MOVIEBOX_OPENSUBTITLES_LANGUAGES", None, || {
+            let cfg = OpenSubtitlesConfig::from_env();
+            assert_eq!(cfg.languages, vec!["id".to_string(), "en".to_string()]);
+        });
+        with_env("MOVIEBOX_OPENSUBTITLES_LANGUAGES", Some("fr,de"), || {
+            let cfg = OpenSubtitlesConfig::from_env();
+            assert_eq!(cfg.languages, vec!["fr".to_string(), "de".to_string()]);
+        });
+    }
+
+    #[test]
+    fn test_urlencoding_simple() {
+        assert_eq!(urlencoding_simple("hello world"), "hello+world");
+        assert_eq!(urlencoding_simple("a&b"), "a%26b");
+        assert_eq!(
+            urlencoding_simple("café com açúcar"),
+            "caf%C3%A9+com+a%C3%A7%C3%BAcar"
+        );
+        assert_eq!(urlencoding_simple("abc123-_.~"), "abc123-_.~");
+    }
+
+    #[tokio::test]
+    async fn test_login_flow_http() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Minimal local mock server answering POST /login. Non-blocking accept
+        // with a deadline so a failing client can never hang the test process.
+        let server = std::thread::spawn(move || -> std::io::Result<String> {
+            listener.set_nonblocking(true)?;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(conn) => break conn,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() > deadline {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "mock server: no connection",
+                            ));
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    Err(e) => return Err(e),
+                }
+            };
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+            let mut buf = [0u8; 8192];
+            let n = stream.read(&mut buf)?;
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            let body = r#"{"user":{"token":"tok_123"}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes())?;
+            stream.flush()?;
+            Ok(request)
+        });
+
+        let config = OpenSubtitlesConfig {
+            api_key: Some("test_api_key".into()),
+            username: Some("test_user".into()),
+            password: Some("test_pass".into()),
+            languages: vec!["id".into()],
+            enabled: true,
+            base_url: Some(format!("http://{}", addr)),
+        };
+        let client = OpenSubtitlesClient::new(config);
+
+        let token = client.ensure_token().await.unwrap();
+        assert_eq!(token, "tok_123");
+
+        let request = server.join().unwrap().unwrap();
+        assert!(request.starts_with("POST /login HTTP/1.1"), "got: {request}");
+        assert!(
+            request.to_ascii_lowercase().contains("api-key: test_api_key"),
+            "missing Api-Key header in: {request}"
+        );
+        assert!(request.contains("test_user"), "missing username in: {request}");
+    }
+}

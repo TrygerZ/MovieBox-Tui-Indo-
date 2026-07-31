@@ -2,6 +2,8 @@ use crate::tui::state::PlayerKind;
 use std::{path::Path, process::Command};
 
 const MPV_WINDOWS: &str = r"C:\Program Files\mpv\mpv.exe";
+// winget `shinchiro.mpv` install location (tidak ditambahkan ke PATH)
+const MPV_WINDOWS_SHIINCHIRO: &str = r"C:\Program Files\MPV Player\mpv.exe";
 const MPV_MACOS: &str = "/Applications/mpv.app/Contents/MacOS/mpv";
 const VLC_WINDOWS: &str = r"C:\Program Files\VideoLAN\VLC\vlc.exe";
 const VLC_WINDOWS_X86: &str = r"C:\Program Files (x86)\VideoLAN\VLC\vlc.exe";
@@ -114,7 +116,7 @@ fn vlc_command(url: &str, subtitle: Option<&str>, headers: &[(String, String)]) 
 }
 
 fn mpv_executable() -> Option<String> {
-    first_executable(&[MPV_WINDOWS, MPV_MACOS], "mpv")
+    first_executable(&[MPV_WINDOWS, MPV_WINDOWS_SHIINCHIRO, MPV_MACOS], "mpv")
 }
 
 fn vlc_executable() -> Option<String> {

@@ -15,6 +15,10 @@ impl Drop for TerminalGuard {
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
+    // Load optional .env file from the current directory (never overrides
+    // real environment variables; missing file is not an error).
+    let _ = dotenvy::dotenv();
+
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|arg| arg == "--version" || arg == "-v" || arg == "-V") {
         println!("moviebox-tui {}", env!("CARGO_PKG_VERSION"));
