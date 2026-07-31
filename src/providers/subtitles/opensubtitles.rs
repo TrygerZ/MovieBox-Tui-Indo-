@@ -7,6 +7,10 @@ use tokio::sync::Mutex;
 
 pub const BASE_URL: &str = "https://api.opensubtitles.com/api/v1";
 
+/// Browser-like User-Agent so OpenSubtitles/Cloudflare doesn't reject the
+/// plain reqwest client with HTTP 403.
+const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36 MovieBox-Tui/1.0";
+
 fn urlencoding_simple(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
@@ -77,12 +81,12 @@ impl OpenSubtitlesConfig {
 pub enum OpenSubtitlesError {
     #[error("missing OpenSubtitles credential: {0}")]
     MissingCredentials(&'static str),
-    #[error("login failed: HTTP {0}")]
-    LoginHttp(u16),
+    #[error("login failed: HTTP {0}: {1}")]
+    LoginHttp(u16, String),
     #[error("login response has no token")]
     MissingToken,
-    #[error("OpenSubtitles API error: HTTP {0}")]
-    Http(u16),
+    #[error("OpenSubtitles API error: HTTP {0}: {1}")]
+    Http(u16, String),
     #[error("rate limited (retry after ~{0}s)")]
     RateLimited(u64),
     #[error("download quota exhausted: {0}")]
@@ -103,9 +107,29 @@ pub struct OpenSubtitlesClient {
     last_login_at: Arc<Mutex<Option<u64>>>,
 }
 
+/// Map a known OpenSubtitles gateway (Kong/Cloudflare) error body to a
+/// friendly, actionable message. The HTTP status code stays in the error
+/// variant (`LoginHttp`/`Http`), so only the body text is replaced here.
+/// Falls back to the original snippet when nothing matches.
+fn friendly_http_error(_status: u16, body: &str) -> String {
+    let lower = body.to_ascii_lowercase();
+    if lower.contains("kong-user-agent-block") {
+        "User-Agent diblokir gateway OpenSubtitles (perlu User-Agent browser/valid)".to_string()
+    } else if lower.contains("you cannot consume this service") {
+        "API key tidak valid atau tidak terdaftar di OpenSubtitles".to_string()
+    } else if lower.contains("missing username and password") {
+        "Field username/password tidak terkirim dengan benar".to_string()
+    } else if lower.contains("<html") || lower.contains("<!doctype") {
+        "Server mengembalikan halaman error (kemungkinan diblokir WAF/Cloudflare)".to_string()
+    } else {
+        body.to_string()
+    }
+}
+
 impl OpenSubtitlesClient {
     pub fn new(config: OpenSubtitlesConfig) -> Self {
         let http = reqwest::Client::builder()
+            .user_agent(USER_AGENT)
             .timeout(std::time::Duration::from_secs(12))
             .connect_timeout(std::time::Duration::from_secs(5))
             .build()
@@ -128,6 +152,20 @@ impl OpenSubtitlesClient {
 
     fn base_url(&self) -> &str {
         self.config.base_url.as_deref().unwrap_or(BASE_URL)
+    }
+
+    /// Read the response body as a short single-line snippet for error
+    /// messages, capped at 300 chars so a huge Cloudflare page can't bloat
+    /// the UI. Falls back to a placeholder when the body is unreadable.
+    async fn body_snippet(res: reqwest::Response) -> String {
+        let body = res.text().await.unwrap_or_default();
+        let snippet: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
+        let snippet: String = snippet.chars().take(300).collect();
+        if snippet.is_empty() {
+            "(no response body)".to_string()
+        } else {
+            snippet
+        }
     }
 
     pub async fn ensure_token(&self) -> Result<String, OpenSubtitlesError> {
@@ -163,19 +201,34 @@ impl OpenSubtitlesClient {
             .ok_or(OpenSubtitlesError::MissingCredentials("password"))?;
 
         let url = format!("{}/login", self.base_url());
-        let res = self
+        let req = self
             .http
             .post(&url)
             .header("Api-Key", api_key)
             .json(&serde_json::json!({
                 "username": username,
                 "password": password
-            }))
-            .send()
-            .await?;
+            }));
+
+        // Login shares the same 429 policy as every other API call: honour
+        // `Retry-After` (capped), retry once, then surface `RateLimited` if
+        // the gateway is still throttling us.
+        let res = self.send_with_retry_429(req).await?;
+        if res.status().as_u16() == 429 {
+            let retry_after = res
+                .headers()
+                .get("Retry-After")
+                .and_then(|h| h.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(3);
+            return Err(OpenSubtitlesError::RateLimited(retry_after));
+        }
 
         if !res.status().is_success() {
-            return Err(OpenSubtitlesError::LoginHttp(res.status().as_u16()));
+            let status = res.status().as_u16();
+            let body = Self::body_snippet(res).await;
+            let message = friendly_http_error(status, &body);
+            return Err(OpenSubtitlesError::LoginHttp(status, message));
         }
 
         let login_res: LoginResponse = res.json().await?;
@@ -264,7 +317,10 @@ impl OpenSubtitlesClient {
             return Err(OpenSubtitlesError::RateLimited(retry_after));
         }
         if !res.status().is_success() {
-            return Err(OpenSubtitlesError::Http(res.status().as_u16()));
+            let status = res.status().as_u16();
+            let body = Self::body_snippet(res).await;
+            let message = friendly_http_error(status, &body);
+            return Err(OpenSubtitlesError::Http(status, message));
         }
 
         let raw_val: serde_json::Value = res.json().await?;
@@ -313,7 +369,7 @@ impl OpenSubtitlesClient {
         loop {
             let builder = req
                 .try_clone()
-                .ok_or_else(|| OpenSubtitlesError::Http(0))?;
+                .ok_or_else(|| OpenSubtitlesError::Http(0, String::new()))?;
             let res = builder.send().await?;
             if res.status().as_u16() == 429 && attempt == 0 {
                 let retry_after = res
@@ -358,7 +414,10 @@ impl OpenSubtitlesClient {
         }
 
         if !res.status().is_success() {
-            return Err(OpenSubtitlesError::Http(res.status().as_u16()));
+            let status = res.status().as_u16();
+            let body = Self::body_snippet(res).await;
+            let message = friendly_http_error(status, &body);
+            return Err(OpenSubtitlesError::Http(status, message));
         }
 
         let dl_res: DownloadResponse = res.json().await?;
@@ -378,7 +437,20 @@ impl OpenSubtitlesClient {
     }
 
     pub async fn fetch_bytes(&self, link: &str) -> Result<Vec<u8>, OpenSubtitlesError> {
-        let res = self.http.get(link).send().await?.error_for_status()?;
+        // The download link requires the same `Api-Key` header as every other
+        // endpoint; without it OpenSubtitles answers HTTP 403.
+        let api_key = self
+            .config
+            .api_key
+            .as_deref()
+            .ok_or(OpenSubtitlesError::MissingCredentials("api_key"))?;
+        let res = self
+            .http
+            .get(link)
+            .header("Api-Key", api_key)
+            .send()
+            .await?
+            .error_for_status()?;
         let bytes = res.bytes().await?;
         Ok(bytes.to_vec())
     }
@@ -687,5 +759,210 @@ mod tests {
             "missing Api-Key header in: {request}"
         );
         assert!(request.contains("test_user"), "missing username in: {request}");
+    }
+
+    #[test]
+    fn test_friendly_http_error_kong_user_agent_block() {
+        // Arrange
+        let body =
+            r#"{"message":"Not allowed - blocked by Kong","kong-user-agent-block":"not_allowed"}"#;
+
+        // Act
+        let msg = friendly_http_error(403, body);
+
+        // Assert
+        assert_eq!(
+            msg,
+            "User-Agent diblokir gateway OpenSubtitles (perlu User-Agent browser/valid)"
+        );
+    }
+
+    #[test]
+    fn test_friendly_http_error_invalid_api_key() {
+        // Arrange
+        let body = r#"{"message":"You cannot consume this service. Your API key is invalid or deactivated."}"#;
+
+        // Act
+        let msg = friendly_http_error(401, body);
+
+        // Assert
+        assert_eq!(msg, "API key tidak valid atau tidak terdaftar di OpenSubtitles");
+    }
+
+    #[test]
+    fn test_friendly_http_error_missing_credentials() {
+        // Arrange
+        let body = r#"{"message":"Missing username and password in the request"}"#;
+
+        // Act
+        let msg = friendly_http_error(401, body);
+
+        // Assert
+        assert_eq!(msg, "Field username/password tidak terkirim dengan benar");
+    }
+
+    #[test]
+    fn test_friendly_http_error_html_waf_page() {
+        // Arrange
+        let body = "<!DOCTYPE html><html><head><title>Attention Required! | Cloudflare</title></head><body>Request blocked</body></html>";
+
+        // Act
+        let msg = friendly_http_error(403, body);
+
+        // Assert
+        assert_eq!(
+            msg,
+            "Server mengembalikan halaman error (kemungkinan diblokir WAF/Cloudflare)"
+        );
+    }
+
+    #[test]
+    fn test_friendly_http_error_falls_back_to_snippet() {
+        // Arrange
+        let body = "some unknown error text";
+
+        // Act
+        let msg = friendly_http_error(500, body);
+
+        // Assert
+        assert_eq!(msg, body);
+    }
+
+    #[test]
+    fn test_friendly_http_error_matching_is_case_insensitive() {
+        // Arrange
+        let body = r#"{"message":"Kong-User-Agent-Block"}"#;
+
+        // Act
+        let msg = friendly_http_error(403, body);
+
+        // Assert
+        assert_eq!(
+            msg,
+            "User-Agent diblokir gateway OpenSubtitles (perlu User-Agent browser/valid)"
+        );
+    }
+
+    /// Spawn a minimal mock HTTP server that accepts `num_connections`
+    /// connections and answers request `i` with `respond(i)`. Every response
+    /// must include `Connection: close` so reqwest opens a fresh connection
+    /// per request (required to observe retries). Returns the server handle
+    /// and the bound address.
+    fn spawn_mock_server(
+        num_connections: usize,
+        respond: impl Fn(usize) -> String + Send + 'static,
+    ) -> (
+        std::thread::JoinHandle<std::io::Result<Vec<String>>>,
+        std::net::SocketAddr,
+    ) {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || -> std::io::Result<Vec<String>> {
+            listener.set_nonblocking(true)?;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut requests = Vec::with_capacity(num_connections);
+            let mut idx = 0usize;
+            while idx < num_connections {
+                let (mut stream, _) = loop {
+                    match listener.accept() {
+                        Ok(conn) => break conn,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            if std::time::Instant::now() > deadline {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::TimedOut,
+                                    "mock server: no connection",
+                                ));
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                        }
+                        Err(e) => return Err(e),
+                    }
+                };
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+                let mut buf = [0u8; 8192];
+                let n = stream.read(&mut buf)?;
+                requests.push(String::from_utf8_lossy(&buf[..n]).to_string());
+                let response = respond(idx);
+                stream.write_all(response.as_bytes())?;
+                stream.flush()?;
+                idx += 1;
+            }
+            Ok(requests)
+        });
+        (handle, addr)
+    }
+
+    #[tokio::test]
+    async fn test_login_flow_retries_on_429() {
+        // Arrange: first attempt is throttled, the retry succeeds.
+        let (server, addr) = spawn_mock_server(2, |idx| {
+            if idx == 0 {
+                "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+            } else {
+                let body = r#"{"user":{"token":"tok_retry"}}"#;
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+            }
+        });
+        let config = OpenSubtitlesConfig {
+            api_key: Some("test_api_key".into()),
+            username: Some("test_user".into()),
+            password: Some("test_pass".into()),
+            languages: vec!["id".into()],
+            enabled: true,
+            base_url: Some(format!("http://{}", addr)),
+        };
+        let client = OpenSubtitlesClient::new(config);
+
+        // Act
+        let token = client.ensure_token().await.unwrap();
+
+        // Assert
+        assert_eq!(token, "tok_retry");
+        let requests = server.join().unwrap().unwrap();
+        assert_eq!(requests.len(), 2, "expected exactly one retry after the 429");
+        assert!(
+            requests[0].starts_with("POST /login HTTP/1.1"),
+            "got: {}",
+            requests[0]
+        );
+        assert!(
+            requests[1].starts_with("POST /login HTTP/1.1"),
+            "got: {}",
+            requests[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_login_flow_returns_rate_limited_after_retry() {
+        // Arrange: the gateway keeps answering 429 even after the retry.
+        let (server, addr) = spawn_mock_server(2, |_| {
+            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+        });
+        let config = OpenSubtitlesConfig {
+            api_key: Some("test_api_key".into()),
+            username: Some("test_user".into()),
+            password: Some("test_pass".into()),
+            languages: vec!["id".into()],
+            enabled: true,
+            base_url: Some(format!("http://{}", addr)),
+        };
+        let client = OpenSubtitlesClient::new(config);
+
+        // Act
+        let err = client.ensure_token().await.unwrap_err();
+
+        // Assert
+        match err {
+            OpenSubtitlesError::RateLimited(retry_after) => assert_eq!(retry_after, 0),
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+        let requests = server.join().unwrap().unwrap();
+        assert_eq!(requests.len(), 2, "expected one retry then RateLimited");
     }
 }

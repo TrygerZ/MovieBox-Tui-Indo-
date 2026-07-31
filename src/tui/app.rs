@@ -66,9 +66,37 @@ fn pick_best_os_candidate(candidates: &[OsCandidate]) -> Option<&OsCandidate> {
         .or_else(|| candidates.first())
 }
 
+/// Heuristic guard against caching non-subtitle content (e.g. an HTML error
+/// page or a JSON error body from a proxy/CDN) as a 30-day cache entry.
+/// Real SRT/VTT/ASS files start with a line number, `WEBVTT`, or
+/// `[Script Info]`; anything else that is non-empty and not HTML/JSON is
+/// accepted as a subtitle.
+fn looks_like_subtitle(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return false;
+    }
+    // Only the top of the file matters; subtitle markers live there.
+    let head = &bytes[..bytes.len().min(2048)];
+    let lower = head.to_ascii_lowercase();
+    // Reject HTML error/challenge pages.
+    for marker in ["<!doctype", "<html", "<head", "<body"] {
+        if lower.windows(marker.len()).any(|w| w == marker.as_bytes()) {
+            return false;
+        }
+    }
+    // Reject JSON error bodies (e.g. `{"error": "..."}`).
+    if let Some(start) = head.iter().position(|b| !b.is_ascii_whitespace()) {
+        if head[start] == b'{' {
+            return false;
+        }
+    }
+    true
+}
+
 /// Resolve an OpenSubtitles file to a local cache path (checking the cache
-/// first, otherwise downloading). Returns `None` on any failure so playback
-/// degrades gracefully.
+/// first, otherwise downloading). Returns `Err(reason)` when the subtitle
+/// could not be resolved so callers can surface the reason to the user;
+/// playback still degrades gracefully when the caller ignores the error.
 async fn resolve_os_subtitle_to_cache(
     provider: ProviderKind,
     subject_id: &str,
@@ -76,7 +104,7 @@ async fn resolve_os_subtitle_to_cache(
     episode: usize,
     file_id: u32,
     lang: &str,
-) -> Option<String> {
+) -> Result<String, String> {
     let os = crate::providers::subtitles::opensubtitles::OpenSubtitlesClient::from_env();
     let target_path = crate::providers::subtitles::cache::subtitle_path(
         provider,
@@ -89,25 +117,36 @@ async fn resolve_os_subtitle_to_cache(
     );
     if let Some(cached) = crate::providers::subtitles::cache::get_cached_subtitle_path(&target_path)
     {
-        return Some(cached.to_string_lossy().to_string());
+        return Ok(cached.to_string_lossy().to_string());
     }
-    if let Ok(dl) = os.download_link(file_id).await {
-        let ext = crate::providers::subtitles::cache::subtitle_extension(dl.file_name.as_deref());
-        let target_path = crate::providers::subtitles::cache::subtitle_path(
-            provider,
-            subject_id,
-            season,
-            episode,
-            file_id,
-            lang,
-            ext,
+    let dl = os
+        .download_link(file_id)
+        .await
+        .map_err(|e| format!("OpenSubtitles download failed: {e}"))?;
+    let ext = crate::providers::subtitles::cache::subtitle_extension(dl.file_name.as_deref());
+    let target_path = crate::providers::subtitles::cache::subtitle_path(
+        provider,
+        subject_id,
+        season,
+        episode,
+        file_id,
+        lang,
+        ext,
+    );
+    let bytes = os
+        .fetch_bytes(&dl.link)
+        .await
+        .map_err(|e| format!("Subtitle download failed: {e}"))?;
+    if !looks_like_subtitle(&bytes) {
+        return Err(
+            "Subtitle download failed: response is not subtitle content (HTML/JSON error page)"
+                .to_string(),
         );
-        if let Ok(bytes) = os.fetch_bytes(&dl.link).await {
-            let _ = crate::providers::subtitles::cache::set_subtitle_cache(&target_path, &bytes);
-            return Some(target_path.to_string_lossy().to_string());
-        }
     }
-    None
+    if let Err(e) = crate::providers::subtitles::cache::set_subtitle_cache(&target_path, &bytes) {
+        return Err(format!("Failed to write subtitle cache: {e}"));
+    }
+    Ok(target_path.to_string_lossy().to_string())
 }
 
 /// Search OpenSubtitles for the best candidate and resolve it to a local cache
@@ -125,6 +164,7 @@ async fn resolve_best_os_subtitle(ctx: &SubtitleContext) -> Option<String> {
         &best.language,
     )
     .await
+    .ok()
 }
 
 pub struct App {
@@ -2655,7 +2695,7 @@ impl App {
                                 tokio::spawn(async move {
                                     let mut resolved = None;
                                     if let Some(fid) = file_id {
-                                        resolved = crate::tui::app::resolve_os_subtitle_to_cache(
+                                        match crate::tui::app::resolve_os_subtitle_to_cache(
                                             provider,
                                             &subject_id,
                                             season,
@@ -2663,7 +2703,17 @@ impl App {
                                             fid,
                                             &lang,
                                         )
-                                        .await;
+                                        .await
+                                        {
+                                            Ok(path) => resolved = Some(path),
+                                            Err(reason) => {
+                                                // Surface the failure, but keep
+                                                // playing without a subtitle.
+                                                sender
+                                                    .send(Action::SetStatus(format!("Error:{reason}")))
+                                                    .ok();
+                                            }
+                                        }
                                     }
                                     if open_with {
                                         sender.send(Action::ShowPlayerPicker(link, resolved)).ok();
@@ -2719,7 +2769,8 @@ impl App {
                                         fid,
                                         &lang,
                                     )
-                                    .await;
+                                    .await
+                                    .ok();
                                 }
                                 sender.send(Action::DownloadStream(resolved)).ok();
                             });
@@ -4514,18 +4565,26 @@ impl App {
                         || kind == crate::tui::state::PlayerKind::Iina
                     {
                         if let Some(s_url) = sub {
-                            if let Ok(resp) = reqwest::get(&s_url).await {
-                                if let Ok(bytes) = resp.bytes().await {
-                                    let temp_path = std::env::temp_dir().join(format!(
-                                        "moviebox_sub_{}.srt",
-                                        std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap_or_default()
-                                            .as_millis()
-                                    ));
-                                    if tokio::fs::write(&temp_path, bytes).await.is_ok() {
-                                        local_sub = Some(temp_path.to_string_lossy().to_string());
-                                        sub_temp_path = Some(temp_path);
+                            // `s_url` may already be a local file (subtitle
+                            // cached on disk); reqwest cannot fetch local paths
+                            // and VLC/IINA can read the file directly, so only
+                            // download remote URLs to a temp file.
+                            let is_local = std::path::Path::new(&s_url).is_file();
+                            if !is_local {
+                                if let Ok(resp) = reqwest::get(&s_url).await {
+                                    if let Ok(bytes) = resp.bytes().await {
+                                        let temp_path = std::env::temp_dir().join(format!(
+                                            "moviebox_sub_{}.srt",
+                                            std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .unwrap_or_default()
+                                                .as_millis()
+                                        ));
+                                        if tokio::fs::write(&temp_path, bytes).await.is_ok() {
+                                            local_sub =
+                                                Some(temp_path.to_string_lossy().to_string());
+                                            sub_temp_path = Some(temp_path);
+                                        }
                                     }
                                 }
                             }
@@ -4568,18 +4627,26 @@ impl App {
                         || kind == crate::tui::state::PlayerKind::Iina
                     {
                         if let Some(s_url) = source.subtitle.as_ref() {
-                            if let Ok(resp) = reqwest::get(s_url).await {
-                                if let Ok(bytes) = resp.bytes().await {
-                                    let temp_path = std::env::temp_dir().join(format!(
-                                        "moviebox_sub_{}.srt",
-                                        std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap_or_default()
-                                            .as_millis()
-                                    ));
-                                    if tokio::fs::write(&temp_path, bytes).await.is_ok() {
-                                        local_sub = Some(temp_path.to_string_lossy().to_string());
-                                        sub_temp_path = Some(temp_path);
+                            // `s_url` may already be a local file (subtitle
+                            // cached on disk); reqwest cannot fetch local paths
+                            // and VLC/IINA can read the file directly, so only
+                            // download remote URLs to a temp file.
+                            let is_local = std::path::Path::new(s_url).is_file();
+                            if !is_local {
+                                if let Ok(resp) = reqwest::get(s_url).await {
+                                    if let Ok(bytes) = resp.bytes().await {
+                                        let temp_path = std::env::temp_dir().join(format!(
+                                            "moviebox_sub_{}.srt",
+                                            std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .unwrap_or_default()
+                                                .as_millis()
+                                        ));
+                                        if tokio::fs::write(&temp_path, bytes).await.is_ok() {
+                                            local_sub =
+                                                Some(temp_path.to_string_lossy().to_string());
+                                            sub_temp_path = Some(temp_path);
+                                        }
                                     }
                                 }
                             }
@@ -4895,5 +4962,23 @@ mod tests {
 
         // Empty list -> None.
         assert_eq!(pick_best_os_candidate(&[]), None);
+    }
+
+    #[test]
+    fn test_looks_like_subtitle() {
+        // Known subtitle markers are accepted.
+        assert!(looks_like_subtitle(b"1\n00:00:01,000 --> 00:00:04,000\nHello\n"));
+        assert!(looks_like_subtitle(b"WEBVTT\n\n00:00:01.000 --> 00:00:04.000\nHello\n"));
+        assert!(looks_like_subtitle(b"[Script Info]\nTitle: Test\n"));
+
+        // Non-empty content that is not HTML/JSON is accepted.
+        assert!(looks_like_subtitle(b"plain text subtitle-ish content"));
+
+        // Empty, HTML, and JSON error pages are rejected.
+        assert!(!looks_like_subtitle(b""));
+        assert!(!looks_like_subtitle(b"<!DOCTYPE html><html><body>Error</body></html>"));
+        assert!(!looks_like_subtitle(b"<html>\n<head><title>403</title></head></html>"));
+        assert!(!looks_like_subtitle(b"{\"error\":\"rate limit exceeded\"}"));
+        assert!(!looks_like_subtitle(b"  {\"error\":\"forbidden\"}"));
     }
 }
