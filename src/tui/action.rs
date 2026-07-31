@@ -104,6 +104,11 @@ pub enum Action {
     UpdateAvailable(String),
     CheckForUpdates,
     SetStatus(String),
+    Notify {
+        kind: crate::tui::overlay::NotificationKind,
+        title: String,
+        message: String,
+    },
     Refresh,
     ClearCache,
     LaunchPlayback(
@@ -116,6 +121,16 @@ pub enum Action {
         is_download: bool,
     },
     OpenSubtitlesFailed {
+        context_id: String,
+        is_download: bool,
+        error: String,
+    },
+    SubdlReady {
+        context_id: String,
+        candidates: Vec<(String, String)>,
+        is_download: bool,
+    },
+    SubdlFailed {
         context_id: String,
         is_download: bool,
         error: String,

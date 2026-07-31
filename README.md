@@ -154,6 +154,17 @@ variables (bring your own API key):
 > OpenSubtitles fallback. Searches and downloads are cached locally to avoid
 > wasting quota.
 
+### Embedded Subtitles (Optional)
+
+MKV/MP4 streams may carry subtitles baked into the file. When a stream has no
+external subtitle, `moviebox-tui` shows a hint based on the file extension, and
+can optionally probe the stream with `ffprobe` (if installed) to report the
+embedded tracks. Playback is never changed — your player auto-loads them.
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `MOVIEBOX_PROBE_EMBEDDED_SUBTITLES` | Probe streams with `ffprobe` to list embedded subtitle tracks | `false` |
+
 ### Keyboard Controls
 
 <table>

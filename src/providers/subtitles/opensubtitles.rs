@@ -1,5 +1,5 @@
 use super::cache;
-use super::{score_candidate, SubtitleContext};
+use super::{SubtitleContext, score_candidate};
 use crate::providers::subtitles::{OsCandidate, OsSearchOutcome};
 use serde::Deserialize;
 use std::sync::Arc;
@@ -62,18 +62,9 @@ impl OpenSubtitlesConfig {
 
     pub fn enabled(&self) -> bool {
         self.enabled
-            && self
-                .api_key
-                .as_deref()
-                .is_some_and(|s| !s.is_empty())
-            && self
-                .username
-                .as_deref()
-                .is_some_and(|s| !s.is_empty())
-            && self
-                .password
-                .as_deref()
-                .is_some_and(|s| !s.is_empty())
+            && self.api_key.as_deref().is_some_and(|s| !s.is_empty())
+            && self.username.as_deref().is_some_and(|s| !s.is_empty())
+            && self.password.as_deref().is_some_and(|s| !s.is_empty())
     }
 }
 
@@ -243,7 +234,10 @@ impl OpenSubtitlesClient {
         Ok(token)
     }
 
-    pub async fn search(&self, ctx: &SubtitleContext) -> Result<OsSearchOutcome, OpenSubtitlesError> {
+    pub async fn search(
+        &self,
+        ctx: &SubtitleContext,
+    ) -> Result<OsSearchOutcome, OpenSubtitlesError> {
         let query_key = cache::search_query_key(ctx, &self.config.languages.join(","));
         if let Some(cached_val) = cache::get_search_cache(&query_key) {
             if let Ok(search_res) = serde_json::from_value::<SearchResponse>(cached_val) {
@@ -335,12 +329,20 @@ impl OpenSubtitlesClient {
         })
     }
 
-    fn parse_and_score_search(&self, search_res: SearchResponse, ctx: &SubtitleContext) -> Vec<OsCandidate> {
+    fn parse_and_score_search(
+        &self,
+        search_res: SearchResponse,
+        ctx: &SubtitleContext,
+    ) -> Vec<OsCandidate> {
         let mut list = Vec::new();
         for item in search_res.data {
             let score = score_candidate(&item, ctx);
             for file in item.attributes.files {
-                let lang = item.attributes.language.clone().unwrap_or_else(|| "id".into());
+                let lang = item
+                    .attributes
+                    .language
+                    .clone()
+                    .unwrap_or_else(|| "id".into());
                 let machine_translated = item.attributes.ai_translated.unwrap_or(false)
                     || item.attributes.machine_translated.unwrap_or(false);
                 list.push(OsCandidate {
@@ -386,7 +388,10 @@ impl OpenSubtitlesClient {
         }
     }
 
-    pub async fn download_link(&self, file_id: u32) -> Result<DownloadResponse, OpenSubtitlesError> {
+    pub async fn download_link(
+        &self,
+        file_id: u32,
+    ) -> Result<DownloadResponse, OpenSubtitlesError> {
         let token = self.ensure_token().await?;
         let api_key = self
             .config
@@ -753,12 +758,20 @@ mod tests {
         assert_eq!(token, "tok_123");
 
         let request = server.join().unwrap().unwrap();
-        assert!(request.starts_with("POST /login HTTP/1.1"), "got: {request}");
         assert!(
-            request.to_ascii_lowercase().contains("api-key: test_api_key"),
+            request.starts_with("POST /login HTTP/1.1"),
+            "got: {request}"
+        );
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("api-key: test_api_key"),
             "missing Api-Key header in: {request}"
         );
-        assert!(request.contains("test_user"), "missing username in: {request}");
+        assert!(
+            request.contains("test_user"),
+            "missing username in: {request}"
+        );
     }
 
     #[test]
@@ -786,7 +799,10 @@ mod tests {
         let msg = friendly_http_error(401, body);
 
         // Assert
-        assert_eq!(msg, "API key tidak valid atau tidak terdaftar di OpenSubtitles");
+        assert_eq!(
+            msg,
+            "API key tidak valid atau tidak terdaftar di OpenSubtitles"
+        );
     }
 
     #[test]
@@ -925,7 +941,11 @@ mod tests {
         // Assert
         assert_eq!(token, "tok_retry");
         let requests = server.join().unwrap().unwrap();
-        assert_eq!(requests.len(), 2, "expected exactly one retry after the 429");
+        assert_eq!(
+            requests.len(),
+            2,
+            "expected exactly one retry after the 429"
+        );
         assert!(
             requests[0].starts_with("POST /login HTTP/1.1"),
             "got: {}",

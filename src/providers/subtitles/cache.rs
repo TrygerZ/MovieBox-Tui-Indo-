@@ -2,7 +2,14 @@ use crate::providers::models::ProviderKind;
 use std::path::PathBuf;
 
 pub const SUBTITLE_FILE_TTL_SECS: u64 = 30 * 24 * 60 * 60; // 30 days
-pub const SEARCH_CACHE_TTL_SECS: u64 = 7 * 24 * 60 * 60;   // 7 days
+pub const SEARCH_CACHE_TTL_SECS: u64 = 7 * 24 * 60 * 60; // 7 days
+
+/// Cache schema version for subtitle file keys. Bump this ONLY when the cache
+/// key layout in `subtitle_path` changes intentionally. It is deliberately
+/// independent of the app version, so an app release does not invalidate the
+/// 30-day subtitle cache (which would re-download files and burn the
+/// OpenSubtitles daily quota).
+pub const SUBTITLE_CACHE_SCHEMA: &str = "v1";
 
 pub fn subtitle_root() -> PathBuf {
     let mut path = dirs::cache_dir().unwrap_or_else(std::env::temp_dir);
@@ -35,7 +42,34 @@ pub fn subtitle_path(
         &episode.to_string(),
         &file_id.to_string(),
         lang,
-        env!("CARGO_PKG_VERSION"),
+        SUBTITLE_CACHE_SCHEMA,
+    ]);
+    subtitle_root().join(format!("{key}.{ext}"))
+}
+
+/// Namespaced cache path for a SubDL subtitle. Same layout as
+/// [`subtitle_path`], but the hash includes a `"subdl"` token and the string
+/// `n_id` (e.g. `3197651-3213944`) instead of the u32 `file_id`, so a SubDL
+/// key can NEVER collide with an OpenSubtitles/MovieBox key for the same
+/// subject.
+pub fn subdl_subtitle_path(
+    provider: ProviderKind,
+    subject_id: &str,
+    season: usize,
+    episode: usize,
+    subdl_id: &str,
+    lang: &str,
+    ext: &str,
+) -> PathBuf {
+    let key = hash_key(&[
+        provider.cache_key(),
+        subject_id,
+        &season.to_string(),
+        &episode.to_string(),
+        "subdl",
+        subdl_id,
+        lang,
+        SUBTITLE_CACHE_SCHEMA,
     ]);
     subtitle_root().join(format!("{key}.{ext}"))
 }
@@ -101,7 +135,9 @@ pub fn set_subtitle_cache(path: &PathBuf, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 pub fn search_cache_path(query_key: &str) -> PathBuf {
-    subtitle_root().join("search").join(format!("{query_key}.json"))
+    subtitle_root()
+        .join("search")
+        .join(format!("{query_key}.json"))
 }
 
 pub fn search_query_key(ctx: &super::SubtitleContext, languages: &str) -> String {
@@ -183,6 +219,44 @@ pub fn set_quota_cache(quota: &QuotaInfo) {
     }
 }
 
+/// Remaining downloads below which the app stops auto-resolving OpenSubtitles
+/// subtitles, so the small daily quota is preserved for manual picks.
+pub const OS_QUOTA_LOW_THRESHOLD: u32 = 5;
+
+/// Outcome of the local quota guard for an OpenSubtitles auto-resolve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuotaAction {
+    /// Proceed with the auto-resolve (no cache yet, or quota is healthy).
+    Resolve,
+    /// Skip the auto-resolve: quota is low but not yet exhausted.
+    SkipLow,
+    /// Skip the auto-resolve: the daily quota is exhausted.
+    SkipExhausted,
+}
+
+impl QuotaAction {
+    /// Whether the caller may proceed with the auto-resolve.
+    pub fn allows_resolve(self) -> bool {
+        matches!(self, QuotaAction::Resolve)
+    }
+}
+
+/// Decide whether an OpenSubtitles auto-resolve should run, based only on the
+/// locally cached quota (never an API call). `None` (no cache yet) allows the
+/// resolve so the first run behaves exactly as before.
+pub fn decide_auto_resolve(quota: Option<&QuotaInfo>, low_threshold: u32) -> QuotaAction {
+    let Some(quota) = quota else {
+        return QuotaAction::Resolve;
+    };
+    if quota.remaining == 0 {
+        QuotaAction::SkipExhausted
+    } else if quota.remaining < low_threshold {
+        QuotaAction::SkipLow
+    } else {
+        QuotaAction::Resolve
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,7 +299,166 @@ mod tests {
     fn test_subtitle_path_differs_by_lang() {
         let a = subtitle_path(ProviderKind::MovieBox, "subj", 1, 2, 100, "id", "srt");
         let b = subtitle_path(ProviderKind::MovieBox, "subj", 1, 2, 100, "en", "srt");
-        assert_ne!(a, b, "different languages must produce different cache keys");
+        assert_ne!(
+            a, b,
+            "different languages must produce different cache keys"
+        );
+    }
+
+    #[test]
+    fn test_subtitle_path_stable_across_releases() {
+        // The subtitle cache key must not depend on the app version, otherwise
+        // every release invalidates the 30-day cache and re-downloads burn the
+        // OpenSubtitles daily quota. Only a manual schema bump may change it.
+        let path = subtitle_path(ProviderKind::MovieBox, "subj", 1, 2, 123, "id", "srt");
+        let stem = path
+            .file_stem()
+            .expect("path has a stem")
+            .to_string_lossy()
+            .to_string();
+
+        // Rebuild the key with the stable schema constant: must match the path.
+        let schema_key = hash_key(&[
+            "moviebox",
+            "subj",
+            "1",
+            "2",
+            "123",
+            "id",
+            SUBTITLE_CACHE_SCHEMA,
+        ]);
+        assert_eq!(
+            stem, schema_key,
+            "key must be derived from the stable schema, not the app version"
+        );
+
+        // A hypothetical different app release must not alter the key.
+        let versioned_key = hash_key(&[
+            "moviebox",
+            "subj",
+            "1",
+            "2",
+            "123",
+            "id",
+            "0.0.0-other-release",
+        ]);
+        assert_ne!(
+            stem, versioned_key,
+            "app version must not leak into the cache key"
+        );
+    }
+
+    #[test]
+    fn test_subdl_subtitle_path_namespaced() {
+        let path = subdl_subtitle_path(
+            ProviderKind::MovieBox,
+            "subj",
+            1,
+            2,
+            "3197651-3213944",
+            "id",
+            "srt",
+        );
+        let s = path.to_string_lossy().to_string();
+        assert!(s.contains("moviebox-tui"), "path: {s}");
+        assert!(s.contains("subtitles"), "path: {s}");
+        assert!(s.ends_with(".srt"), "path: {s}");
+
+        // The `subdl` namespace token must be part of the cache key so a
+        // SubDL entry can never collide with an OS/MovieBox entry.
+        let stem = path
+            .file_stem()
+            .expect("path has a stem")
+            .to_string_lossy()
+            .to_string();
+        let expected = hash_key(&[
+            "moviebox",
+            "subj",
+            "1",
+            "2",
+            "subdl",
+            "3197651-3213944",
+            "id",
+            SUBTITLE_CACHE_SCHEMA,
+        ]);
+        assert_eq!(
+            stem, expected,
+            "key must include the `subdl` namespace token"
+        );
+    }
+
+    #[test]
+    fn test_subdl_subtitle_path_differs_by_id_lang_and_os() {
+        let a = subdl_subtitle_path(
+            ProviderKind::MovieBox,
+            "subj",
+            1,
+            2,
+            "3197651-3213944",
+            "id",
+            "srt",
+        );
+        let b = subdl_subtitle_path(
+            ProviderKind::MovieBox,
+            "subj",
+            1,
+            2,
+            "3197652-3213945",
+            "id",
+            "srt",
+        );
+        assert_ne!(a, b, "different subdl_id must produce different cache keys");
+
+        let c = subdl_subtitle_path(
+            ProviderKind::MovieBox,
+            "subj",
+            1,
+            2,
+            "3197651-3213944",
+            "en",
+            "srt",
+        );
+        assert_ne!(
+            a, c,
+            "different languages must produce different cache keys"
+        );
+
+        // The namespace prefix guarantees a SubDL key never equals the OS key
+        // for the same numeric id.
+        let os = subtitle_path(ProviderKind::MovieBox, "subj", 1, 2, 3197651, "id", "srt");
+        assert_ne!(a, os, "SubDL namespace must not collide with OS keys");
+    }
+
+    #[test]
+    fn test_subdl_subtitle_path_stable_across_releases() {
+        let path = subdl_subtitle_path(
+            ProviderKind::MovieBox,
+            "subj",
+            1,
+            2,
+            "3197651-3213944",
+            "id",
+            "srt",
+        );
+        let stem = path
+            .file_stem()
+            .expect("path has a stem")
+            .to_string_lossy()
+            .to_string();
+        let schema_key = hash_key(&[
+            "moviebox",
+            "subj",
+            "1",
+            "2",
+            "subdl",
+            "3197651-3213944",
+            "id",
+            SUBTITLE_CACHE_SCHEMA,
+        ]);
+        assert_eq!(
+            stem, schema_key,
+            "key must be derived from the stable schema, not the app version"
+        );
     }
 
     #[test]
@@ -241,8 +474,15 @@ mod tests {
         };
         let key_id_en = search_query_key(&ctx, "id,en");
         let key_fr = search_query_key(&ctx, "fr");
-        assert_ne!(key_id_en, key_fr, "languages must be part of the search cache key");
-        assert_eq!(key_id_en, search_query_key(&ctx, "id,en"), "key must be stable");
+        assert_ne!(
+            key_id_en, key_fr,
+            "languages must be part of the search cache key"
+        );
+        assert_eq!(
+            key_id_en,
+            search_query_key(&ctx, "id,en"),
+            "key must be stable"
+        );
     }
 
     #[test]
@@ -285,8 +525,7 @@ mod tests {
 
         // Write via an open handle so we can set an old mtime on it (needs
         // write access on Windows) and drop the handle before removal.
-        let old =
-            std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 24 * 60 * 60);
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 24 * 60 * 60);
         {
             let mut f = std::fs::OpenOptions::new()
                 .write(true)
@@ -294,7 +533,8 @@ mod tests {
                 .truncate(true)
                 .open(&path)
                 .unwrap();
-            f.write_all(b"1\n00:00:01,000 --> 00:00:02,000\nTest\n").unwrap();
+            f.write_all(b"1\n00:00:01,000 --> 00:00:02,000\nTest\n")
+                .unwrap();
             f.set_times(std::fs::FileTimes::new().set_modified(old))
                 .unwrap();
         }
@@ -307,5 +547,89 @@ mod tests {
         assert!(!path.exists(), "expired file should have been removed");
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_decide_auto_resolve_no_cache_allows_resolve() {
+        assert_eq!(
+            decide_auto_resolve(None, OS_QUOTA_LOW_THRESHOLD),
+            QuotaAction::Resolve
+        );
+    }
+
+    #[test]
+    fn test_decide_auto_resolve_exhausted_skips() {
+        let quota = QuotaInfo {
+            requests: 20,
+            remaining: 0,
+            updated_at: 0,
+        };
+        assert_eq!(
+            decide_auto_resolve(Some(&quota), OS_QUOTA_LOW_THRESHOLD),
+            QuotaAction::SkipExhausted
+        );
+    }
+
+    #[test]
+    fn test_decide_auto_resolve_low_skips() {
+        for remaining in 1..OS_QUOTA_LOW_THRESHOLD {
+            let quota = QuotaInfo {
+                requests: 20,
+                remaining,
+                updated_at: 0,
+            };
+            assert_eq!(
+                decide_auto_resolve(Some(&quota), OS_QUOTA_LOW_THRESHOLD),
+                QuotaAction::SkipLow
+            );
+        }
+    }
+
+    #[test]
+    fn test_decide_auto_resolve_healthy_resolves() {
+        for remaining in [OS_QUOTA_LOW_THRESHOLD, 10, 100] {
+            let quota = QuotaInfo {
+                requests: 20,
+                remaining,
+                updated_at: 0,
+            };
+            assert_eq!(
+                decide_auto_resolve(Some(&quota), OS_QUOTA_LOW_THRESHOLD),
+                QuotaAction::Resolve
+            );
+        }
+    }
+
+    #[test]
+    fn test_decide_auto_resolve_custom_threshold() {
+        let low = QuotaInfo {
+            requests: 20,
+            remaining: 2,
+            updated_at: 0,
+        };
+        assert_eq!(decide_auto_resolve(Some(&low), 3), QuotaAction::SkipLow);
+        let healthy = QuotaInfo {
+            requests: 20,
+            remaining: 3,
+            updated_at: 0,
+        };
+        assert_eq!(decide_auto_resolve(Some(&healthy), 3), QuotaAction::Resolve);
+        // A zero threshold never skips for a positive quota.
+        let positive = QuotaInfo {
+            requests: 20,
+            remaining: 1,
+            updated_at: 0,
+        };
+        assert_eq!(
+            decide_auto_resolve(Some(&positive), 0),
+            QuotaAction::Resolve
+        );
+    }
+
+    #[test]
+    fn test_quota_action_allows_resolve() {
+        assert!(QuotaAction::Resolve.allows_resolve());
+        assert!(!QuotaAction::SkipLow.allows_resolve());
+        assert!(!QuotaAction::SkipExhausted.allows_resolve());
     }
 }

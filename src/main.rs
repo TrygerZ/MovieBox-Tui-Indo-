@@ -20,7 +20,10 @@ async fn main() -> std::io::Result<()> {
     let _ = dotenvy::dotenv();
 
     let args: Vec<String> = std::env::args().collect();
-    if args.iter().any(|arg| arg == "--version" || arg == "-v" || arg == "-V") {
+    if args
+        .iter()
+        .any(|arg| arg == "--version" || arg == "-v" || arg == "-V")
+    {
         println!("moviebox-tui {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }

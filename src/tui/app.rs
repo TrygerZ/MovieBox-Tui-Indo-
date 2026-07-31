@@ -54,14 +54,27 @@ fn parse_os_marker(marker: &str) -> Option<(u32, String)> {
     Some((file_id, lang))
 }
 
+/// Parse a SubDL cache marker (`subdl:{n_id}:{lang}`) into its parts.
+/// Returns `None` when the marker is not a valid SubDL marker; the language
+/// part defaults to `"id"` when missing.
+fn parse_subdl_marker(marker: &str) -> Option<(String, String)> {
+    let rest = marker.strip_prefix("subdl:")?;
+    let mut parts = rest.splitn(2, ':');
+    let subdl_id = parts.next()?.to_string();
+    if subdl_id.is_empty() {
+        return None;
+    }
+    let lang = parts.next().unwrap_or("id").to_string();
+    Some((subdl_id, lang))
+}
+
 /// Pick the best OpenSubtitles candidate: the first Indonesian one, or the
 /// top-ranked candidate when no Indonesian subtitle exists.
 fn pick_best_os_candidate(candidates: &[OsCandidate]) -> Option<&OsCandidate> {
     candidates
         .iter()
         .find(|c| {
-            c.language.eq_ignore_ascii_case("id")
-                || c.language.eq_ignore_ascii_case("indonesian")
+            c.language.eq_ignore_ascii_case("id") || c.language.eq_ignore_ascii_case("indonesian")
         })
         .or_else(|| candidates.first())
 }
@@ -107,13 +120,7 @@ async fn resolve_os_subtitle_to_cache(
 ) -> Result<String, String> {
     let os = crate::providers::subtitles::opensubtitles::OpenSubtitlesClient::from_env();
     let target_path = crate::providers::subtitles::cache::subtitle_path(
-        provider,
-        subject_id,
-        season,
-        episode,
-        file_id,
-        lang,
-        "srt",
+        provider, subject_id, season, episode, file_id, lang, "srt",
     );
     if let Some(cached) = crate::providers::subtitles::cache::get_cached_subtitle_path(&target_path)
     {
@@ -125,13 +132,7 @@ async fn resolve_os_subtitle_to_cache(
         .map_err(|e| format!("OpenSubtitles download failed: {e}"))?;
     let ext = crate::providers::subtitles::cache::subtitle_extension(dl.file_name.as_deref());
     let target_path = crate::providers::subtitles::cache::subtitle_path(
-        provider,
-        subject_id,
-        season,
-        episode,
-        file_id,
-        lang,
-        ext,
+        provider, subject_id, season, episode, file_id, lang, ext,
     );
     let bytes = os
         .fetch_bytes(&dl.link)
@@ -149,9 +150,73 @@ async fn resolve_os_subtitle_to_cache(
     Ok(target_path.to_string_lossy().to_string())
 }
 
-/// Search OpenSubtitles for the best candidate and resolve it to a local cache
-/// path. Returns `None` when no candidate is found or any step fails.
+/// Resolve a SubDL subtitle (`n_id`) to a local cache path (checking the
+/// cache first, otherwise downloading the anonymous `dl.subdl.com` archive).
+/// Returns `Err(reason)` when the subtitle could not be resolved so callers
+/// can surface the reason to the user; playback still degrades gracefully
+/// when the caller ignores the error.
+async fn resolve_subdl_subtitle_to_cache(
+    provider: ProviderKind,
+    subject_id: &str,
+    season: usize,
+    episode: usize,
+    subdl_id: &str,
+    lang: &str,
+) -> Result<String, String> {
+    let subdl = crate::providers::subtitles::subdl::SubdlClient::from_env();
+    let target_path = crate::providers::subtitles::cache::subdl_subtitle_path(
+        provider, subject_id, season, episode, subdl_id, lang, "srt",
+    );
+    if let Some(cached) = crate::providers::subtitles::cache::get_cached_subtitle_path(&target_path)
+    {
+        return Ok(cached.to_string_lossy().to_string());
+    }
+    let (ext, bytes) = subdl
+        .download_bytes(subdl_id)
+        .await
+        .map_err(|e| format!("SubDL download failed: {e}"))?;
+    if !looks_like_subtitle(&bytes) {
+        return Err(
+            "SubDL download failed: response is not subtitle content (HTML/JSON error page)"
+                .to_string(),
+        );
+    }
+    let target_path = crate::providers::subtitles::cache::subdl_subtitle_path(
+        provider, subject_id, season, episode, subdl_id, lang, &ext,
+    );
+    if let Err(e) = crate::providers::subtitles::cache::set_subtitle_cache(&target_path, &bytes) {
+        return Err(format!("Failed to write subtitle cache: {e}"));
+    }
+    Ok(target_path.to_string_lossy().to_string())
+}
+
+/// Search for the best subtitle and resolve it to a local cache path.
+/// SubDL is tried first (free, never consumes the OpenSubtitles quota); when
+/// it is disabled, fails or finds nothing, OpenSubtitles is used as the
+/// fallback. Returns `None` when no candidate is found or any step fails.
 async fn resolve_best_os_subtitle(ctx: &SubtitleContext) -> Option<String> {
+    // Step 1: SubDL (gratis, tidak konsumsi kuota OS).
+    let subdl = crate::providers::subtitles::subdl::SubdlClient::from_env();
+    if subdl.enabled() {
+        if let Ok(outcome) = subdl.search(ctx).await {
+            // Candidates are already sorted by score (Indonesian first).
+            if let Some(best) = outcome.candidates.first() {
+                if let Ok(path) = resolve_subdl_subtitle_to_cache(
+                    ctx.provider,
+                    &ctx.subject_id,
+                    ctx.season.unwrap_or(0),
+                    ctx.episode.unwrap_or(0),
+                    &best.subtitle_id,
+                    &best.language,
+                )
+                .await
+                {
+                    return Some(path);
+                }
+            }
+        }
+    }
+    // Step 2: OpenSubtitles (existing behaviour).
     let os = crate::providers::subtitles::opensubtitles::OpenSubtitlesClient::from_env();
     let outcome = os.search(ctx).await.ok()?;
     let best = pick_best_os_candidate(&outcome.candidates)?;
@@ -2684,12 +2749,12 @@ impl App {
                             if marker.starts_with("os:") {
                                 let parsed = crate::tui::app::parse_os_marker(marker);
                                 let file_id = parsed.as_ref().map(|(fid, _)| *fid);
-                                let lang = parsed
-                                    .map(|(_, l)| l)
-                                    .unwrap_or_else(|| "id".to_string());
+                                let lang =
+                                    parsed.map(|(_, l)| l).unwrap_or_else(|| "id".to_string());
                                 let sender = self.action_sender.clone();
                                 let provider = self.state.active_provider;
-                                let subject_id = self.state.active_subject_id.clone().unwrap_or_default();
+                                let subject_id =
+                                    self.state.active_subject_id.clone().unwrap_or_default();
                                 let season = self.state.selected_season;
                                 let episode = self.state.selected_episode;
                                 tokio::spawn(async move {
@@ -2710,7 +2775,52 @@ impl App {
                                                 // Surface the failure, but keep
                                                 // playing without a subtitle.
                                                 sender
-                                                    .send(Action::SetStatus(format!("Error:{reason}")))
+                                                    .send(Action::SetStatus(format!(
+                                                        "Error:{reason}"
+                                                    )))
+                                                    .ok();
+                                            }
+                                        }
+                                    }
+                                    if open_with {
+                                        sender.send(Action::ShowPlayerPicker(link, resolved)).ok();
+                                    } else {
+                                        sender.send(Action::LaunchMpv(link, resolved)).ok();
+                                    }
+                                });
+                                return None;
+                            } else if marker.starts_with("subdl:") {
+                                let parsed = crate::tui::app::parse_subdl_marker(marker);
+                                let subdl_id = parsed.as_ref().map(|(id, _)| id.clone());
+                                let lang =
+                                    parsed.map(|(_, l)| l).unwrap_or_else(|| "id".to_string());
+                                let sender = self.action_sender.clone();
+                                let provider = self.state.active_provider;
+                                let subject_id =
+                                    self.state.active_subject_id.clone().unwrap_or_default();
+                                let season = self.state.selected_season;
+                                let episode = self.state.selected_episode;
+                                tokio::spawn(async move {
+                                    let mut resolved = None;
+                                    if let Some(sid) = subdl_id {
+                                        match crate::tui::app::resolve_subdl_subtitle_to_cache(
+                                            provider,
+                                            &subject_id,
+                                            season,
+                                            episode,
+                                            &sid,
+                                            &lang,
+                                        )
+                                        .await
+                                        {
+                                            Ok(path) => resolved = Some(path),
+                                            Err(reason) => {
+                                                // Surface the failure, but keep
+                                                // playing without a subtitle.
+                                                sender
+                                                    .send(Action::SetStatus(format!(
+                                                        "Error:{reason}"
+                                                    )))
                                                     .ok();
                                             }
                                         }
@@ -2750,12 +2860,11 @@ impl App {
                         if marker.starts_with("os:") {
                             let parsed = crate::tui::app::parse_os_marker(marker);
                             let file_id = parsed.as_ref().map(|(fid, _)| *fid);
-                            let lang = parsed
-                                .map(|(_, l)| l)
-                                .unwrap_or_else(|| "id".to_string());
+                            let lang = parsed.map(|(_, l)| l).unwrap_or_else(|| "id".to_string());
                             let sender = self.action_sender.clone();
                             let provider = self.state.active_provider;
-                            let subject_id = self.state.active_subject_id.clone().unwrap_or_default();
+                            let subject_id =
+                                self.state.active_subject_id.clone().unwrap_or_default();
                             let season = self.state.selected_season;
                             let episode = self.state.selected_episode;
                             tokio::spawn(async move {
@@ -2767,6 +2876,33 @@ impl App {
                                         season,
                                         episode,
                                         fid,
+                                        &lang,
+                                    )
+                                    .await
+                                    .ok();
+                                }
+                                sender.send(Action::DownloadStream(resolved)).ok();
+                            });
+                            return None;
+                        } else if marker.starts_with("subdl:") {
+                            let parsed = crate::tui::app::parse_subdl_marker(marker);
+                            let subdl_id = parsed.as_ref().map(|(id, _)| id.clone());
+                            let lang = parsed.map(|(_, l)| l).unwrap_or_else(|| "id".to_string());
+                            let sender = self.action_sender.clone();
+                            let provider = self.state.active_provider;
+                            let subject_id =
+                                self.state.active_subject_id.clone().unwrap_or_default();
+                            let season = self.state.selected_season;
+                            let episode = self.state.selected_episode;
+                            tokio::spawn(async move {
+                                let mut resolved = None;
+                                if let Some(sid) = subdl_id {
+                                    resolved = crate::tui::app::resolve_subdl_subtitle_to_cache(
+                                        provider,
+                                        &subject_id,
+                                        season,
+                                        episode,
+                                        &sid,
                                         &lang,
                                     )
                                     .await
@@ -3086,10 +3222,13 @@ impl App {
                         let os_enabled =
                             crate::providers::subtitles::opensubtitles::OpenSubtitlesConfig::from_env()
                                 .enabled();
+                        // Quota guard: skip the auto-resolve when the daily
+                        // OpenSubtitles quota is low or exhausted.
+                        let os_auto_resolve = self.state.os_quota_gate(os_enabled).allows_resolve();
                         tokio::spawn(async move {
                             match client.resolve_release(&release).await {
                                 Ok(mut source) => {
-                                    let os_subtitle = if os_enabled {
+                                    let os_subtitle = if os_enabled && os_auto_resolve {
                                         match &subtitle_ctx {
                                             Some(ctx) => {
                                                 crate::tui::app::resolve_best_os_subtitle(ctx).await
@@ -3100,6 +3239,46 @@ impl App {
                                         None
                                     };
                                     source.subtitle = os_subtitle;
+                                    // When no external subtitle was resolved, tell
+                                    // the user about possible embedded tracks in
+                                    // the container (mpv auto-loads them; `j`
+                                    // cycles tracks). Playback is unchanged.
+                                    if source.subtitle.is_none() {
+                                        let url = source.url.clone();
+                                        let headers = source.headers.clone();
+                                        let notify_sender = sender.clone();
+                                        let likely =
+                                            crate::tui::embedded::container_supports_embedded_subs(
+                                                &url,
+                                            );
+                                        if likely || crate::tui::embedded::probe_enabled() {
+                                            tokio::spawn(async move {
+                                                let report = if crate::tui::embedded::probe_enabled(
+                                                ) {
+                                                    crate::tui::embedded::probe_embedded_subtitle_tracks(
+                                                        &url, &headers,
+                                                    )
+                                                    .await
+                                                } else {
+                                                    None
+                                                };
+                                                let message =
+                                                    crate::tui::embedded::format_embedded_notice(
+                                                        likely,
+                                                        report.as_ref(),
+                                                    );
+                                                if !message.is_empty() {
+                                                    notify_sender
+                                                        .send(Action::Notify {
+                                                            kind: crate::tui::overlay::NotificationKind::Info,
+                                                            title: "Embedded subtitles".to_string(),
+                                                            message,
+                                                        })
+                                                        .ok();
+                                                }
+                                            });
+                                        }
+                                    }
                                     if open_with {
                                         sender.send(Action::ShowPlaybackPicker(source)).ok();
                                     } else {
@@ -3288,6 +3467,125 @@ impl App {
                     format!("OpenSubtitles: {error}"),
                 );
             }
+            Action::SubdlReady {
+                context_id,
+                candidates,
+                is_download,
+            } => {
+                self.state.subtitle_searching = false;
+                // P5: strict equality guard. Discard results that no longer
+                // match the content the user is currently viewing.
+                let current_ctx = format!(
+                    "{}:{}:{}",
+                    self.state.active_subject_id.clone().unwrap_or_default(),
+                    self.get_selected_resource_id().unwrap_or_default(),
+                    self.state.selected_episode
+                );
+                if current_ctx != context_id {
+                    self.state.os_waiting = false;
+                    return None;
+                }
+
+                if self.state.os_waiting {
+                    // The play/download decision was deferred until the search
+                    // finished. Resume it now.
+                    self.state.os_waiting = false;
+                    if candidates.is_empty() {
+                        if is_download {
+                            self.action_sender.send(Action::DownloadStream(None)).ok();
+                        } else if let Some(link) = self.state.pending_play_link.take() {
+                            let open_with = self.state.pending_open_with;
+                            if open_with {
+                                self.action_sender
+                                    .send(Action::ShowPlayerPicker(link, None))
+                                    .ok();
+                            } else {
+                                self.action_sender.send(Action::LaunchMpv(link, None)).ok();
+                            }
+                        }
+                    } else {
+                        // P4: reset the list to ["None"] + SubDL candidates,
+                        // then show the subtitle popup.
+                        self.state.os_subtitles = candidates.clone();
+                        let mut list = vec![("None".to_string(), "".to_string())];
+                        for (label, marker) in candidates {
+                            if !list.iter().any(|(l, _)| l == &label) {
+                                list.push((label, marker));
+                            }
+                        }
+                        self.state.subtitle_list = list;
+                        self.state.subtitle_list_state.select(Some(0));
+                        self.state.show_help = false;
+                        self.state.player_picker_popup = false;
+                        if is_download {
+                            self.state.subtitle_popup = false;
+                            self.state.is_download_subtitle_popup = true;
+                            self.state.pending_play_link = None;
+                        } else {
+                            self.state.is_download_subtitle_popup = false;
+                            self.state.subtitle_popup = true;
+                        }
+                    }
+                } else {
+                    // A MovieBox subtitle popup is already open; append the
+                    // SubDL candidates to it. If the popup was dismissed in
+                    // the meantime (Escape), do NOT reopen it — that was the
+                    // "late popup" race.
+                    let popup_open = if is_download {
+                        self.state.is_download_subtitle_popup
+                    } else {
+                        self.state.subtitle_popup
+                    };
+                    if !popup_open {
+                        return None;
+                    }
+                    self.state.os_subtitles = candidates.clone();
+                    for (label, marker) in candidates {
+                        if !self.state.subtitle_list.iter().any(|(l, _)| l == &label) {
+                            self.state.subtitle_list.push((label, marker));
+                        }
+                    }
+                }
+            }
+            Action::SubdlFailed {
+                context_id,
+                is_download,
+                error,
+            } => {
+                self.state.subtitle_searching = false;
+                let current_ctx = format!(
+                    "{}:{}:{}",
+                    self.state.active_subject_id.clone().unwrap_or_default(),
+                    self.get_selected_resource_id().unwrap_or_default(),
+                    self.state.selected_episode
+                );
+                if current_ctx != context_id {
+                    // Stale failure from a previous search — ignore it.
+                    return None;
+                }
+                self.state.subtitle_search_error = Some(error.clone());
+                if self.state.os_waiting {
+                    // Resume the deferred play/download without subtitles.
+                    self.state.os_waiting = false;
+                    if is_download {
+                        self.action_sender.send(Action::DownloadStream(None)).ok();
+                    } else if let Some(link) = self.state.pending_play_link.take() {
+                        let open_with = self.state.pending_open_with;
+                        if open_with {
+                            self.action_sender
+                                .send(Action::ShowPlayerPicker(link, None))
+                                .ok();
+                        } else {
+                            self.action_sender.send(Action::LaunchMpv(link, None)).ok();
+                        }
+                    }
+                }
+                self.state.notify(
+                    NotificationKind::Warning,
+                    "Subtitles unavailable",
+                    format!("SubDL: {error}"),
+                );
+            }
             Action::ShowSubtitlePopup(link, ext_captions, open_with) => {
                 let mut options = vec![("None".to_string(), "".to_string())];
                 let mut has_indonesian = false;
@@ -3315,12 +3613,18 @@ impl App {
                     }
                 }
 
+                let subdl_enabled =
+                    crate::providers::subtitles::subdl::SubdlClient::from_env().enabled();
                 let os_enabled = !has_indonesian
                     && crate::providers::subtitles::opensubtitles::OpenSubtitlesConfig::from_env()
                         .enabled();
+                // Quota guard: skip the auto OS search when the daily quota is
+                // low or exhausted (play without subtitles instead).
+                let os_auto_resolve = self.state.os_quota_gate(os_enabled).allows_resolve();
+                let search_any = subdl_enabled || (os_enabled && os_auto_resolve);
 
                 // P3: never spawn a second search while one is already running.
-                if os_enabled
+                if search_any
                     && !self.state.subtitle_searching
                     && let Some(ctx) = self.build_subtitle_context()
                 {
@@ -3328,38 +3632,78 @@ impl App {
                     self.state.notify(
                         NotificationKind::Info,
                         "Looking for subtitles",
-                        "Searching OpenSubtitles...",
+                        "Searching SubDL & OpenSubtitles...",
                     );
-                    let os = crate::providers::subtitles::opensubtitles::OpenSubtitlesClient::from_env();
                     let sender = self.action_sender.clone();
                     let context_id = format!(
                         "{}:{}:{}",
                         ctx.subject_id, ctx.resource_id, self.state.selected_episode
                     );
                     tokio::spawn(async move {
-                        match os.search(&ctx).await {
-                            Ok(outcome) => {
-                                let merged = crate::providers::subtitles::merge_os_candidates(
-                                    Vec::new(),
-                                    &outcome.candidates,
-                                );
-                                sender
-                                    .send(Action::OpenSubtitlesReady {
-                                        context_id,
-                                        candidates: merged,
-                                        is_download: false,
-                                    })
-                                    .ok();
+                        // (a) SubDL first — free, never consumes the
+                        // OpenSubtitles quota.
+                        let subdl = crate::providers::subtitles::subdl::SubdlClient::from_env();
+                        if subdl.enabled() {
+                            match subdl.search(&ctx).await {
+                                Ok(outcome) => {
+                                    let merged =
+                                        crate::providers::subtitles::merge_subdl_candidates(
+                                            Vec::new(),
+                                            &outcome.candidates,
+                                        );
+                                    if !merged.is_empty() {
+                                        sender
+                                            .send(Action::SubdlReady {
+                                                context_id,
+                                                candidates: merged,
+                                                is_download: false,
+                                            })
+                                            .ok();
+                                        return;
+                                    }
+                                }
+                                Err(_) => {
+                                    // Fall through to OpenSubtitles.
+                                }
                             }
-                            Err(err) => {
-                                sender
-                                    .send(Action::OpenSubtitlesFailed {
-                                        context_id,
-                                        is_download: false,
-                                        error: err.to_string(),
-                                    })
-                                    .ok();
+                        }
+                        // (b) OpenSubtitles (existing behaviour).
+                        if os_enabled && os_auto_resolve {
+                            let os = crate::providers::subtitles::opensubtitles::OpenSubtitlesClient::from_env();
+                            match os.search(&ctx).await {
+                                Ok(outcome) => {
+                                    let merged = crate::providers::subtitles::merge_os_candidates(
+                                        Vec::new(),
+                                        &outcome.candidates,
+                                    );
+                                    sender
+                                        .send(Action::OpenSubtitlesReady {
+                                            context_id,
+                                            candidates: merged,
+                                            is_download: false,
+                                        })
+                                        .ok();
+                                }
+                                Err(err) => {
+                                    sender
+                                        .send(Action::OpenSubtitlesFailed {
+                                            context_id,
+                                            is_download: false,
+                                            error: err.to_string(),
+                                        })
+                                        .ok();
+                                }
                             }
+                        } else {
+                            // (c) No provider available — resume play without
+                            // subtitles so the deferred decision does not hang.
+                            sender
+                                .send(Action::SubdlFailed {
+                                    context_id,
+                                    is_download: false,
+                                    error: "No subtitles found".into(),
+                                })
+                                .ok();
                         }
                     });
                 }
@@ -3374,9 +3718,9 @@ impl App {
                     self.state.pending_play_link = Some(link);
                     self.state.pending_open_with = open_with;
                     self.state.os_waiting = false;
-                } else if os_enabled {
-                    // No built-in subtitle and OpenSubtitles is being searched:
-                    // defer the play decision until the search completes.
+                } else if search_any {
+                    // No built-in subtitle and a search is running: defer the
+                    // play decision until it completes.
                     self.state.pending_play_link = Some(link);
                     self.state.pending_open_with = open_with;
                     self.state.os_waiting = true;
@@ -3420,12 +3764,18 @@ impl App {
                     }
                 }
 
+                let subdl_enabled =
+                    crate::providers::subtitles::subdl::SubdlClient::from_env().enabled();
                 let os_enabled = !has_indonesian
                     && crate::providers::subtitles::opensubtitles::OpenSubtitlesConfig::from_env()
                         .enabled();
+                // Quota guard: skip the auto OS search when the daily quota is
+                // low or exhausted (play without subtitles instead).
+                let os_auto_resolve = self.state.os_quota_gate(os_enabled).allows_resolve();
+                let search_any = subdl_enabled || (os_enabled && os_auto_resolve);
 
                 // P3: never spawn a second search while one is already running.
-                if os_enabled
+                if search_any
                     && !self.state.subtitle_searching
                     && let Some(ctx) = self.build_subtitle_context()
                 {
@@ -3433,38 +3783,78 @@ impl App {
                     self.state.notify(
                         NotificationKind::Info,
                         "Looking for subtitles",
-                        "Searching OpenSubtitles...",
+                        "Searching SubDL & OpenSubtitles...",
                     );
-                    let os = crate::providers::subtitles::opensubtitles::OpenSubtitlesClient::from_env();
                     let sender = self.action_sender.clone();
                     let context_id = format!(
                         "{}:{}:{}",
                         ctx.subject_id, ctx.resource_id, self.state.selected_episode
                     );
                     tokio::spawn(async move {
-                        match os.search(&ctx).await {
-                            Ok(outcome) => {
-                                let merged = crate::providers::subtitles::merge_os_candidates(
-                                    Vec::new(),
-                                    &outcome.candidates,
-                                );
-                                sender
-                                    .send(Action::OpenSubtitlesReady {
-                                        context_id,
-                                        candidates: merged,
-                                        is_download: true,
-                                    })
-                                    .ok();
+                        // (a) SubDL first — free, never consumes the
+                        // OpenSubtitles quota.
+                        let subdl = crate::providers::subtitles::subdl::SubdlClient::from_env();
+                        if subdl.enabled() {
+                            match subdl.search(&ctx).await {
+                                Ok(outcome) => {
+                                    let merged =
+                                        crate::providers::subtitles::merge_subdl_candidates(
+                                            Vec::new(),
+                                            &outcome.candidates,
+                                        );
+                                    if !merged.is_empty() {
+                                        sender
+                                            .send(Action::SubdlReady {
+                                                context_id,
+                                                candidates: merged,
+                                                is_download: true,
+                                            })
+                                            .ok();
+                                        return;
+                                    }
+                                }
+                                Err(_) => {
+                                    // Fall through to OpenSubtitles.
+                                }
                             }
-                            Err(err) => {
-                                sender
-                                    .send(Action::OpenSubtitlesFailed {
-                                        context_id,
-                                        is_download: true,
-                                        error: err.to_string(),
-                                    })
-                                    .ok();
+                        }
+                        // (b) OpenSubtitles (existing behaviour).
+                        if os_enabled && os_auto_resolve {
+                            let os = crate::providers::subtitles::opensubtitles::OpenSubtitlesClient::from_env();
+                            match os.search(&ctx).await {
+                                Ok(outcome) => {
+                                    let merged = crate::providers::subtitles::merge_os_candidates(
+                                        Vec::new(),
+                                        &outcome.candidates,
+                                    );
+                                    sender
+                                        .send(Action::OpenSubtitlesReady {
+                                            context_id,
+                                            candidates: merged,
+                                            is_download: true,
+                                        })
+                                        .ok();
+                                }
+                                Err(err) => {
+                                    sender
+                                        .send(Action::OpenSubtitlesFailed {
+                                            context_id,
+                                            is_download: true,
+                                            error: err.to_string(),
+                                        })
+                                        .ok();
+                                }
                             }
+                        } else {
+                            // (c) No provider available — resume without a
+                            // subtitle so the deferred download does not hang.
+                            sender
+                                .send(Action::SubdlFailed {
+                                    context_id,
+                                    is_download: true,
+                                    error: "No subtitles found".into(),
+                                })
+                                .ok();
                         }
                     });
                 }
@@ -3477,8 +3867,8 @@ impl App {
                     self.state.subtitle_list = options;
                     self.state.subtitle_list_state.select(Some(0));
                     self.state.os_waiting = false;
-                } else if os_enabled {
-                    // Defer the download until the OpenSubtitles search completes.
+                } else if search_any {
+                    // Defer the download until the search completes.
                     self.state.os_waiting = true;
                     self.state.subtitle_list.clear();
                     self.state.os_subtitles.clear();
@@ -3529,12 +3919,15 @@ impl App {
                         let os_enabled =
                             crate::providers::subtitles::opensubtitles::OpenSubtitlesConfig::from_env()
                                 .enabled();
+                        // Quota guard: skip the auto-resolve when the daily
+                        // OpenSubtitles quota is low or exhausted.
+                        let os_auto_resolve = self.state.os_quota_gate(os_enabled).allows_resolve();
                         tokio::spawn(async move {
                             match client.resolve_release(&release).await {
                                 Ok(source) => {
                                     let resolved = if subtitle_url.is_some() {
                                         subtitle_url
-                                    } else if os_enabled {
+                                    } else if os_enabled && os_auto_resolve {
                                         match &subtitle_ctx {
                                             Some(ctx) => {
                                                 crate::tui::app::resolve_best_os_subtitle(ctx).await
@@ -3544,9 +3937,28 @@ impl App {
                                     } else {
                                         None
                                     };
+                                    let resolved_none = resolved.is_none();
+                                    let notify_sender = sender.clone();
+                                    let url = source.url.clone();
                                     sender
                                         .send(Action::StartDownload(resolved, Some(source.url)))
                                         .ok();
+                                    // Downloaded MKV/MP4 files may carry embedded
+                                    // subtitle tracks — let the user know they can
+                                    // pick the track in their player.
+                                    if resolved_none
+                                        && crate::tui::embedded::container_supports_embedded_subs(
+                                            &url,
+                                        )
+                                    {
+                                        notify_sender
+                                            .send(Action::Notify {
+                                                kind: crate::tui::overlay::NotificationKind::Info,
+                                                title: "Embedded subtitles".to_string(),
+                                                message: "The downloaded file may contain embedded subtitles (MKV/MP4) — select the subtitle track in your player.".to_string(),
+                                            })
+                                            .ok();
+                                    }
                                 }
                                 Err(error) => {
                                     sender
@@ -3865,6 +4277,13 @@ impl App {
                     self.state.status_message = msg;
                     self.state.status_timer = 150;
                 }
+            }
+            Action::Notify {
+                kind,
+                title,
+                message,
+            } => {
+                self.state.notify(kind, title, message);
             }
             Action::InitStreamPool(subject_id) => {
                 if self.state.active_provider != ProviderKind::MovieBox {
@@ -4780,7 +5199,12 @@ impl App {
                     None
                 }
             })
-            .or_else(|| details.get("year").and_then(|y| y.as_u64()).map(|y| y.to_string()));
+            .or_else(|| {
+                details
+                    .get("year")
+                    .and_then(|y| y.as_u64())
+                    .map(|y| y.to_string())
+            });
         let imdb_id = crate::providers::subtitles::extract_imdb_id(details);
         let (season, episode) = if is_episode {
             (
@@ -4932,6 +5356,28 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_subdl_marker() {
+        assert_eq!(
+            parse_subdl_marker("subdl:3197651-3213944:id"),
+            Some(("3197651-3213944".to_string(), "id".to_string()))
+        );
+        // Missing language part defaults to "id".
+        assert_eq!(
+            parse_subdl_marker("subdl:3197651-3213944"),
+            Some(("3197651-3213944".to_string(), "id".to_string()))
+        );
+        assert_eq!(
+            parse_subdl_marker("subdl:3197651-3213944:en"),
+            Some(("3197651-3213944".to_string(), "en".to_string()))
+        );
+        // Invalid / non-SubDL markers.
+        assert_eq!(parse_subdl_marker("subdl:"), None);
+        assert_eq!(parse_subdl_marker("os:123:id"), None);
+        assert_eq!(parse_subdl_marker("http://example.com/sub.srt"), None);
+        assert_eq!(parse_subdl_marker(""), None);
+    }
+
+    #[test]
     fn test_pick_best_os_candidate_prefers_id() {
         let en = OsCandidate {
             label: String::new(),
@@ -4967,8 +5413,12 @@ mod tests {
     #[test]
     fn test_looks_like_subtitle() {
         // Known subtitle markers are accepted.
-        assert!(looks_like_subtitle(b"1\n00:00:01,000 --> 00:00:04,000\nHello\n"));
-        assert!(looks_like_subtitle(b"WEBVTT\n\n00:00:01.000 --> 00:00:04.000\nHello\n"));
+        assert!(looks_like_subtitle(
+            b"1\n00:00:01,000 --> 00:00:04,000\nHello\n"
+        ));
+        assert!(looks_like_subtitle(
+            b"WEBVTT\n\n00:00:01.000 --> 00:00:04.000\nHello\n"
+        ));
         assert!(looks_like_subtitle(b"[Script Info]\nTitle: Test\n"));
 
         // Non-empty content that is not HTML/JSON is accepted.
@@ -4976,8 +5426,12 @@ mod tests {
 
         // Empty, HTML, and JSON error pages are rejected.
         assert!(!looks_like_subtitle(b""));
-        assert!(!looks_like_subtitle(b"<!DOCTYPE html><html><body>Error</body></html>"));
-        assert!(!looks_like_subtitle(b"<html>\n<head><title>403</title></head></html>"));
+        assert!(!looks_like_subtitle(
+            b"<!DOCTYPE html><html><body>Error</body></html>"
+        ));
+        assert!(!looks_like_subtitle(
+            b"<html>\n<head><title>403</title></head></html>"
+        ));
         assert!(!looks_like_subtitle(b"{\"error\":\"rate limit exceeded\"}"));
         assert!(!looks_like_subtitle(b"  {\"error\":\"forbidden\"}"));
     }

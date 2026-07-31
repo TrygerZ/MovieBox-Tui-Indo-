@@ -1,5 +1,6 @@
 pub mod cache;
 pub mod opensubtitles;
+pub mod subdl;
 
 use crate::providers::models::ProviderKind;
 use opensubtitles::OpenSubtitlesError;
@@ -61,12 +62,33 @@ pub fn merge_os_candidates(
     out
 }
 
+/// Merge SubDL candidates into a label/marker list (dedup by lowercased
+/// label). Mirrors [`merge_os_candidates`]; markers use the `subdl:{n_id}:{lang}`
+/// format so the UI can resolve them independently of OpenSubtitles.
+pub fn merge_subdl_candidates(
+    base: Vec<(String, String)>,
+    candidates: &[subdl::SubdlCandidate],
+) -> Vec<(String, String)> {
+    let mut out = base;
+    let existing_labels: std::collections::HashSet<String> =
+        out.iter().map(|(n, _)| n.to_lowercase()).collect();
+    for c in candidates {
+        let label = subdl::build_subdl_label(c);
+        if existing_labels.contains(&label.to_lowercase()) {
+            continue;
+        }
+        out.push((label, subdl::subdl_marker(c)));
+    }
+    out
+}
+
 pub fn build_label(c: &OsCandidate) -> String {
-    let lang = if c.language.eq_ignore_ascii_case("id") || c.language.eq_ignore_ascii_case("indonesian") {
-        "Indonesian".to_string()
-    } else {
-        c.language.clone()
-    };
+    let lang =
+        if c.language.eq_ignore_ascii_case("id") || c.language.eq_ignore_ascii_case("indonesian") {
+            "Indonesian".to_string()
+        } else {
+            c.language.clone()
+        };
     let mut label = format!("{lang} [OS]");
     if let Some(rn) = &c.release_name {
         let short: String = rn.chars().take(40).collect();
@@ -117,7 +139,9 @@ pub fn score_candidate(item: &opensubtitles::SubtitleItem, ctx: &SubtitleContext
     }
     if attr.release_name.as_deref().is_some_and(|r| {
         ctx.title.split_whitespace().take(3).any(|tok| {
-            let t = tok.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+            let t = tok
+                .trim_matches(|c: char| !c.is_alphanumeric())
+                .to_lowercase();
             t.len() >= 4 && r.to_lowercase().contains(&t)
         })
     }) {
@@ -156,7 +180,10 @@ mod tests {
 
     #[test]
     fn test_merge_os_candidates_dedup() {
-        let base = vec![("Indonesian [OS] · test · 10 dl".to_string(), "os:1:id".to_string())];
+        let base = vec![(
+            "Indonesian [OS] · test · 10 dl".to_string(),
+            "os:1:id".to_string(),
+        )];
         let cands = vec![
             OsCandidate {
                 label: "".into(),
@@ -219,15 +246,16 @@ mod tests {
             }
         }))
         .unwrap();
-        let without_bonus: opensubtitles::SubtitleItem = serde_json::from_value(serde_json::json!({
-            "id": "2",
-            "attributes": {
-                "language": "en",
-                "release_name": "Some Other Movie",
-                "files": [{ "file_id": 2 }]
-            }
-        }))
-        .unwrap();
+        let without_bonus: opensubtitles::SubtitleItem =
+            serde_json::from_value(serde_json::json!({
+                "id": "2",
+                "attributes": {
+                    "language": "en",
+                    "release_name": "Some Other Movie",
+                    "files": [{ "file_id": 2 }]
+                }
+            }))
+            .unwrap();
 
         let ctx = SubtitleContext {
             provider: ProviderKind::MovieBox,
@@ -268,6 +296,61 @@ mod tests {
     }
 
     #[test]
+    fn test_merge_subdl_candidates_dedup() {
+        use crate::providers::subtitles::subdl::SubdlCandidate;
+        // Base entry whose label exactly matches candidate 1's label, so the
+        // dedup path is exercised (labels are compared case-insensitively).
+        let base = vec![(
+            "Indonesian [SubDL] · dup · 10 dl · 8.0★".to_string(),
+            "subdl:old:id".to_string(),
+        )];
+        let cands = vec![
+            SubdlCandidate {
+                subtitle_id: "old".into(),
+                language: "id".into(),
+                score: 100,
+                release_name: Some("dup".into()),
+                rating: Some(8.0),
+                download_count: Some(10),
+            },
+            SubdlCandidate {
+                subtitle_id: "3197651-3213944".into(),
+                language: "id".into(),
+                score: 90,
+                release_name: Some("Dilan 1990".into()),
+                rating: Some(7.5),
+                download_count: Some(5),
+            },
+        ];
+        let merged = merge_subdl_candidates(base, &cands);
+        assert_eq!(merged.len(), 2, "duplicate label must be skipped");
+        let (label, marker) = &merged[1];
+        assert_eq!(marker, "subdl:3197651-3213944:id");
+        assert!(label.contains("[SubDL]"));
+    }
+
+    #[test]
+    fn test_merge_subdl_candidates_marker_format() {
+        use crate::providers::subtitles::subdl::SubdlCandidate;
+        let cands = vec![SubdlCandidate {
+            subtitle_id: "3197651-3213944".into(),
+            language: "id".into(),
+            score: 60,
+            release_name: Some("Dilan 1990".into()),
+            rating: None,
+            download_count: Some(5),
+        }];
+        let merged = merge_subdl_candidates(vec![("None".to_string(), String::new())], &cands);
+        assert_eq!(merged.len(), 2);
+        let marker = &merged[1].1;
+        assert_eq!(marker, "subdl:3197651-3213944:id");
+        assert!(marker.starts_with("subdl:"));
+        let (nid, lang) = marker[6..].split_once(':').unwrap();
+        assert_eq!(nid, "3197651-3213944");
+        assert_eq!(lang, "id");
+    }
+
+    #[test]
     fn test_build_label_contains_os() {
         let c = OsCandidate {
             label: String::new(),
@@ -287,6 +370,9 @@ mod tests {
 
         let parts: Vec<&str> = label.split(" · ").collect();
         assert_eq!(parts.len(), 3, "unexpected label shape: {label}");
-        assert!(parts[1].chars().count() <= 40, "release name not truncated: {label}");
+        assert!(
+            parts[1].chars().count() <= 40,
+            "release name not truncated: {label}"
+        );
     }
 }

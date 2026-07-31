@@ -1014,13 +1014,19 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
                 }
             })
             .collect::<Vec<_>>();
+        // Show the remaining OpenSubtitles quota while the user picks a
+        // subtitle, so the number is visible after every OS operation.
+        let picker_title = match state.os_quota_remaining {
+            Some(remaining) => format!("Subtitles · OS quota: {remaining}"),
+            None => "Subtitles".to_string(),
+        };
         crate::tui::overlay::picker(
             frame,
             area,
             &items,
             &mut state.subtitle_list_state,
             crate::tui::overlay::PickerSpec {
-                title: "Subtitles",
+                title: &picker_title,
                 confirm_label: if state.is_download_subtitle_popup {
                     "Download"
                 } else {

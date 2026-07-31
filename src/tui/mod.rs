@@ -1,5 +1,6 @@
 pub mod action;
 pub mod app;
+pub mod embedded;
 pub mod event;
 pub mod iptv_data;
 pub mod overlay;

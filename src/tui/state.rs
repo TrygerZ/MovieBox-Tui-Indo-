@@ -1,4 +1,7 @@
 use crate::providers::models::ProviderKind;
+use crate::providers::subtitles::cache::{
+    OS_QUOTA_LOW_THRESHOLD, QuotaAction, decide_auto_resolve, get_quota_cache,
+};
 use ratatui::widgets::{ListState, TableState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,6 +146,12 @@ pub struct AppState {
     /// True while an OpenSubtitles search is running and we are deferring the
     /// play/download decision (no built-in subtitle was available).
     pub os_waiting: bool,
+    /// Remaining OpenSubtitles downloads from the local quota cache, shown in
+    /// the subtitle picker. `None` when unknown or OpenSubtitles is disabled.
+    pub os_quota_remaining: Option<u32>,
+    /// Last quota value for which a low/exhausted warning was shown, so the
+    /// warning fires only once per value. `Some(0)` = "exhausted" was warned.
+    pub os_quota_warned: Option<u32>,
     pub season_subtitle_preference: Option<String>,
     pub subtitle_list: Vec<(String, String)>,
     pub subtitle_list_state: ListState,
@@ -249,6 +258,8 @@ impl Default for AppState {
             subtitle_search_error: None,
             os_subtitles: Vec::new(),
             os_waiting: false,
+            os_quota_remaining: None,
+            os_quota_warned: None,
             season_subtitle_preference: None,
             subtitle_list: Vec::new(),
             subtitle_list_state: ListState::default(),
@@ -301,5 +312,49 @@ impl AppState {
     pub fn expire_notifications(&mut self) {
         self.notifications
             .retain(|notification| !notification.expired());
+    }
+
+    /// Gate an OpenSubtitles auto-resolve/search on the locally cached quota
+    /// (no API call). Updates the quota shown in the UI and warns, at most once
+    /// per quota value, when the remaining downloads are low or exhausted.
+    /// Returns the action for the caller to act on; when OpenSubtitles is
+    /// disabled this always returns `Resolve` so the app behaves exactly as
+    /// before.
+    pub fn os_quota_gate(&mut self, os_enabled: bool) -> QuotaAction {
+        if !os_enabled {
+            self.os_quota_remaining = None;
+            return QuotaAction::Resolve;
+        }
+        let Some(quota) = get_quota_cache() else {
+            self.os_quota_remaining = None;
+            return QuotaAction::Resolve;
+        };
+        self.os_quota_remaining = Some(quota.remaining);
+        let action = decide_auto_resolve(Some(&quota), OS_QUOTA_LOW_THRESHOLD);
+        match action {
+            QuotaAction::SkipLow if self.os_quota_warned != Some(quota.remaining) => {
+                self.notify(
+                    crate::tui::overlay::NotificationKind::Warning,
+                    "OpenSubtitles quota low",
+                    format!(
+                        "Only {n} download{s} left today — auto-download skipped.",
+                        n = quota.remaining,
+                        s = if quota.remaining == 1 { "" } else { "s" }
+                    ),
+                );
+                self.os_quota_warned = Some(quota.remaining);
+            }
+            QuotaAction::SkipExhausted if self.os_quota_warned != Some(0) => {
+                self.notify(
+                    crate::tui::overlay::NotificationKind::Warning,
+                    "OpenSubtitles quota exhausted",
+                    "Daily download quota used up. Playing without subtitles.",
+                );
+                self.os_quota_warned = Some(0);
+            }
+            QuotaAction::Resolve => self.os_quota_warned = None,
+            _ => {}
+        }
+        action
     }
 }
