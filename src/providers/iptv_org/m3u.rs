@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Channel {
@@ -52,7 +52,12 @@ impl M3UParser {
         }
 
         let content = if needs_download {
-            let client = reqwest::Client::new();
+            // Timeouts so a dead playlist URL can't block the fetch task forever;
+            // mirrors timeouts used by the other providers (subdl, moviebox).
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(15))
+                .connect_timeout(Duration::from_secs(5))
+                .build()?;
             let res = client.get(url).send().await?.text().await?;
             fs::write(&file_path, &res).ok();
             res
@@ -64,6 +69,9 @@ impl M3UParser {
     }
 
     fn parse_m3u(&self, content: &str) -> Vec<Channel> {
+        // Strip UTF-8 BOM so "\u{feff}#EXTM3U" is recognized as the header
+        // instead of being parsed as a bogus stream-URL channel.
+        let content = content.trim_start_matches('\u{feff}');
         let mut channels = Vec::new();
         let mut current_channel = Channel {
             id: String::new(),
@@ -114,5 +122,25 @@ impl M3UParser {
         }
 
         channels
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn utf8_bom_is_stripped_before_parsing() {
+        let parser = M3UParser::new();
+        let content = concat!(
+            "\u{feff}#EXTM3U\n",
+            "#EXTINF:-1 tvg-id=\"cnn\" tvg-logo=\"http://logo/x.png\" group-title=\"News\",CNN International\n",
+            "http://stream.example/cnn.m3u8\n",
+        );
+        let channels = parser.parse_m3u(content);
+        assert_eq!(channels.len(), 1, "BOM must not produce a bogus channel");
+        assert_eq!(channels[0].name, "CNN International");
+        assert_eq!(channels[0].id, "cnn");
+        assert_eq!(channels[0].stream_url, "http://stream.example/cnn.m3u8");
     }
 }

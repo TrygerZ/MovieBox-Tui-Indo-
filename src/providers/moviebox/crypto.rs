@@ -5,6 +5,8 @@ use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use url::Url;
 
+use crate::providers::moviebox::client::ScraperError;
+
 const SECRET_KEY_DEFAULT: &str = "76iRl07s0xSN9jqmEWAt79EBJZulIQIsV64FZr2O";
 const SIGNATURE_BODY_MAX_BYTES: usize = 102_400;
 
@@ -73,8 +75,8 @@ pub fn build_canonical_string(
     url: &str,
     body: Option<&str>,
     timestamp_ms: u64,
-) -> String {
-    let parsed = Url::parse(url).expect("URL is valid by construction from base and path");
+) -> Result<String, ScraperError> {
+    let parsed = Url::parse(url).map_err(|e| ScraperError::InvalidUrl(e.to_string()))?;
     let path = parsed.path();
     let query = sorted_query_string(url);
     let canonical_url = if query.is_empty() {
@@ -96,7 +98,7 @@ pub fn build_canonical_string(
         (String::new(), String::new())
     };
 
-    format!(
+    Ok(format!(
         "{}\n{}\n{}\n{}\n{}\n{}\n{}",
         method.to_uppercase(),
         accept.unwrap_or(""),
@@ -105,7 +107,7 @@ pub fn build_canonical_string(
         timestamp_ms,
         body_hash,
         canonical_url
-    )
+    ))
 }
 
 pub fn generate_x_tr_signature(
@@ -115,15 +117,15 @@ pub fn generate_x_tr_signature(
     url: &str,
     body: Option<&str>,
     timestamp_ms: u64,
-) -> String {
-    let canonical = build_canonical_string(method, accept, content_type, url, body, timestamp_ms);
+) -> Result<String, ScraperError> {
+    let canonical = build_canonical_string(method, accept, content_type, url, body, timestamp_ms)?;
     let secret_bytes = b64_decode(SECRET_KEY_DEFAULT);
 
     let mut mac = HmacMd5::new_from_slice(&secret_bytes).expect("HMAC can take key of any size");
     mac.update(canonical.as_bytes());
     let sig_b64 = b64_encode(&mac.finalize().into_bytes());
 
-    format!("{}|2|{}", timestamp_ms, sig_b64)
+    Ok(format!("{}|2|{}", timestamp_ms, sig_b64))
 }
 
 pub fn build_signed_headers(
@@ -134,7 +136,7 @@ pub fn build_signed_headers(
     user_agent: &str,
     client_info: &str,
     spoofed_ip: &str,
-) -> reqwest::header::HeaderMap {
+) -> Result<reqwest::header::HeaderMap, ScraperError> {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("System time is after UNIX EPOCH")
@@ -144,8 +146,7 @@ pub fn build_signed_headers(
     let content_type = "application/json";
 
     let client_token = generate_x_client_token(ts);
-    let signature =
-        generate_x_tr_signature(method, Some(accept), Some(content_type), url, body, ts);
+    let signature = generate_x_tr_signature(method, Some(accept), Some(content_type), url, body, ts)?;
 
     let mut headers = reqwest::header::HeaderMap::new();
 
@@ -164,13 +165,15 @@ pub fn build_signed_headers(
     headers.insert("X-Forwarded-For", spoofed_ip.parse().expect("Valid ASCII"));
 
     if let Some(token) = auth_token {
+        let auth_value = format!("Bearer {}", token);
         headers.insert(
             reqwest::header::AUTHORIZATION,
-            format!("Bearer {}", token).parse().expect("Valid ASCII"),
+            reqwest::header::HeaderValue::from_str(&auth_value)
+                .map_err(|e| ScraperError::InvalidHeader(e.to_string()))?,
         );
     }
 
-    headers
+    Ok(headers)
 }
 
 pub(crate) fn generate_client_info_and_ua() -> (String, String) {
@@ -255,4 +258,40 @@ pub(crate) fn random_spoofed_ip() -> String {
     let c: u8 = rng.random_range(1..254);
     let d: u8 = rng.random_range(1..254);
     format!("{}.{}.{}", prefix, c, d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn control_char_token_returns_error_instead_of_panicking() {
+        // Regression: a server-controlled `x-user` token with control chars
+        // used to panic on `HeaderValue::parse().expect("Valid ASCII")`.
+        let result = build_signed_headers(
+            "GET",
+            "https://api6.aoneroom.com/path?q=1",
+            None,
+            Some("tok\x01en\x1b"),
+            "user-agent",
+            "client-info",
+            "1.2.3.4",
+        );
+        assert!(matches!(result, Err(ScraperError::InvalidHeader(_))));
+    }
+
+    #[test]
+    fn invalid_url_returns_error_instead_of_panicking() {
+        // Regression: a URL that fails to parse used to panic in
+        // `Url::parse(...).expect(...)`.
+        let result = build_canonical_string(
+            "GET",
+            Some("application/json"),
+            Some("application/json"),
+            "https://api6.aoneroom.com:99999/path?q=1",
+            None,
+            1,
+        );
+        assert!(matches!(result, Err(ScraperError::InvalidUrl(_))));
+    }
 }

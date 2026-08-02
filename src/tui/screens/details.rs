@@ -167,6 +167,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
                 None
             }
         })
+        .map(|g| crate::tui::text::sanitize_terminal_text(&g))
         .unwrap_or_else(|| "N/A".to_string());
     let duration = details_json
         .get("duration")

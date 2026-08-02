@@ -4,6 +4,12 @@ pub mod crypto;
 use client::{MovieBoxClient, ScraperError};
 use serde_json::{Value, json};
 
+/// Percent-encode a server-controlled id before interpolating it into a path,
+/// so spaces / `#` / control characters cannot break URL construction.
+fn encode_id(id: &str) -> String {
+    url::form_urlencoded::byte_serialize(id.as_bytes()).collect()
+}
+
 impl MovieBoxClient {
     pub async fn search(&self, query: &str, page: usize) -> Result<Value, ScraperError> {
         let payload = json!({
@@ -32,7 +38,7 @@ impl MovieBoxClient {
     pub async fn get_details(&self, subject_id: &str) -> Result<Value, ScraperError> {
         let path = format!(
             "/wefeed-mobile-bff/subject-api/get?subjectId={}",
-            subject_id
+            encode_id(subject_id)
         );
         let mut details = self.get(&path).await?;
 
@@ -45,7 +51,7 @@ impl MovieBoxClient {
         if stype == 2 {
             let season_path = format!(
                 "/wefeed-mobile-bff/subject-api/season-info?subjectId={}",
-                subject_id
+                encode_id(subject_id)
             );
             if let Ok(season_info) = self.get(&season_path).await {
                 if let Value::Object(ref mut map) = details {
@@ -87,12 +93,20 @@ impl MovieBoxClient {
         let path = if season == 0 && episode == 0 {
             format!(
                 "/wefeed-mobile-bff/subject-api/resource?subjectId={}&page={}&perPage={}{}",
-                subject_id, page, per_page, res_param
+                encode_id(subject_id),
+                page,
+                per_page,
+                res_param
             )
         } else {
             format!(
                 "/wefeed-mobile-bff/subject-api/resource?subjectId={}&se={}&ep={}&page={}&perPage={}{}",
-                subject_id, season, episode, page, per_page, res_param
+                encode_id(subject_id),
+                season,
+                episode,
+                page,
+                per_page,
+                res_param
             )
         };
         self.get(&path).await
@@ -112,7 +126,9 @@ impl MovieBoxClient {
 
         let path = format!(
             "/wefeed-mobile-bff/subject-api/resource?subjectId={}&page={}&perPage=20{}",
-            subject_id, page, res_param
+            encode_id(subject_id),
+            page,
+            res_param
         );
 
         let res = self.get(&path).await?;
@@ -134,7 +150,7 @@ impl MovieBoxClient {
     ) -> Result<Vec<u32>, ScraperError> {
         let path = format!(
             "/wefeed-mobile-bff/subject-api/resource?subjectId={}&page=1&perPage=20",
-            subject_id
+            encode_id(subject_id)
         );
         let res = self.get(&path).await?;
 
@@ -163,8 +179,21 @@ impl MovieBoxClient {
     ) -> Result<Value, ScraperError> {
         let path = format!(
             "/wefeed-mobile-bff/subject-api/get-ext-captions?subjectId={}&resourceId={}",
-            subject_id, resource_id
+            encode_id(subject_id),
+            resource_id
         );
         self.get(&path).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_id_percent_encodes_url_breakers() {
+        assert_eq!(encode_id("a b#c"), "a+b%23c");
+        assert_eq!(encode_id("12345"), "12345");
+        assert_eq!(encode_id("x\x1b y"), "x%1B+y");
     }
 }

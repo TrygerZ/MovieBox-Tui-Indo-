@@ -11,6 +11,10 @@ pub const BASE_URL: &str = "https://api.opensubtitles.com/api/v1";
 /// plain reqwest client with HTTP 403.
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36 MovieBox-Tui/1.0";
 
+/// Maximum bytes buffered for a subtitle file (50 MB). Endpoints answering
+/// larger bodies are rejected instead of exhausting memory.
+const MAX_SUBTITLE_BYTES: u64 = 50 * 1024 * 1024;
+
 fn urlencoding_simple(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
@@ -82,6 +86,8 @@ pub enum OpenSubtitlesError {
     RateLimited(u64),
     #[error("download quota exhausted: {0}")]
     Quota(String),
+    #[error("subtitle file too large (over {0} MB)")]
+    BodyTooLarge(u64),
     #[error("subtitle not found")]
     NotFound,
     #[error("reqwest error: {0}")]
@@ -157,6 +163,28 @@ impl OpenSubtitlesClient {
         } else {
             snippet
         }
+    }
+
+    /// Read a response body into memory, rejecting it when `Content-Length`
+    /// exceeds `cap` or the stream grows beyond it (guards against a
+    /// misbehaving download host serving multi-GB responses).
+    async fn read_body_limited(
+        mut res: reqwest::Response,
+        cap: u64,
+    ) -> Result<Vec<u8>, OpenSubtitlesError> {
+        if let Some(len) = res.content_length() {
+            if len > cap {
+                return Err(OpenSubtitlesError::BodyTooLarge(cap / (1024 * 1024)));
+            }
+        }
+        let mut buf = Vec::with_capacity(res.content_length().unwrap_or(0).min(cap) as usize);
+        while let Some(chunk) = res.chunk().await? {
+            if buf.len() as u64 + chunk.len() as u64 > cap {
+                return Err(OpenSubtitlesError::BodyTooLarge(cap / (1024 * 1024)));
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        Ok(buf)
     }
 
     pub async fn ensure_token(&self) -> Result<String, OpenSubtitlesError> {
@@ -342,7 +370,7 @@ impl OpenSubtitlesClient {
                     .attributes
                     .language
                     .clone()
-                    .unwrap_or_else(|| "id".into());
+                    .unwrap_or_else(|| "und".into());
                 let machine_translated = item.attributes.ai_translated.unwrap_or(false)
                     || item.attributes.machine_translated.unwrap_or(false);
                 list.push(OsCandidate {
@@ -449,15 +477,22 @@ impl OpenSubtitlesClient {
             .api_key
             .as_deref()
             .ok_or(OpenSubtitlesError::MissingCredentials("api_key"))?;
-        let res = self
-            .http
-            .get(link)
-            .header("Api-Key", api_key)
-            .send()
-            .await?
-            .error_for_status()?;
-        let bytes = res.bytes().await?;
-        Ok(bytes.to_vec())
+        let req = self.http.get(link).header("Api-Key", api_key);
+        // The download host throttles like the API does; retry once honouring
+        // `Retry-After` (same policy as `send_with_retry_429`) so a single 429
+        // does not waste the already-decremented download quota.
+        let res = self.send_with_retry_429(req).await?;
+        if res.status().as_u16() == 429 {
+            let retry_after = res
+                .headers()
+                .get("Retry-After")
+                .and_then(|h| h.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(3);
+            return Err(OpenSubtitlesError::RateLimited(retry_after));
+        }
+        let res = res.error_for_status()?;
+        Self::read_body_limited(res, MAX_SUBTITLE_BYTES).await
     }
 }
 
@@ -611,6 +646,43 @@ mod tests {
         let ctx = SubtitleContext::default();
         let score = score_candidate(&item, &ctx);
         assert!(score >= 50, "expected language bonus >= 50, got {score}");
+    }
+
+    #[test]
+    fn test_missing_language_defaults_to_und_not_indonesian() {
+        // Regression: an API entry without a `language` must NOT be tagged
+        // Indonesian (which would win the +50 bonus and be auto-picked as the
+        // Indonesian fallback).
+        let search_res: SearchResponse = serde_json::from_value(serde_json::json!({
+            "total_count": 1,
+            "data": [{
+                "id": "1",
+                "attributes": {
+                    "release_name": "Movie",
+                    "files": [{ "file_id": 1 }],
+                    "download_count": 0
+                }
+            }]
+        }))
+        .unwrap();
+        let client = OpenSubtitlesClient::new(OpenSubtitlesConfig::default());
+        let cands = client.parse_and_score_search(search_res, &SubtitleContext::default());
+        assert_eq!(cands.len(), 1);
+        assert_eq!(cands[0].language, "und");
+        assert!(
+            cands[0].score < 50,
+            "missing language must not get the +50 Indonesian bonus, got {}",
+            cands[0].score
+        );
+        let label = crate::providers::subtitles::build_label(&cands[0]);
+        assert!(!label.starts_with("Indonesian"), "label: {label}");
+        // The explicit `id` path still wins the bonus.
+        let id_item: SubtitleItem = serde_json::from_value(serde_json::json!({
+            "id": "2",
+            "attributes": { "language": "id", "files": [{ "file_id": 2 }], "download_count": 0 }
+        }))
+        .unwrap();
+        assert!(score_candidate(&id_item, &SubtitleContext::default()) >= 50);
     }
 
     /// Test-only helper: set/clear an env var, run `f`, then restore the
@@ -884,7 +956,12 @@ mod tests {
                 let (mut stream, _) = loop {
                     match listener.accept() {
                         Ok(conn) => break conn,
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        // Tolerate transient accept errors (e.g. Windows
+                        // WSAECONNABORTED/10053 when the client aborts a
+                        // previous connection right before reconnecting) —
+                        // retry until the deadline instead of failing the
+                        // whole mock server.
+                        Err(_) => {
                             if std::time::Instant::now() > deadline {
                                 return Err(std::io::Error::new(
                                     std::io::ErrorKind::TimedOut,
@@ -893,16 +970,63 @@ mod tests {
                             }
                             std::thread::sleep(std::time::Duration::from_millis(20));
                         }
-                        Err(e) => return Err(e),
                     }
                 };
+                // Read the whole request (head + declared body) before
+                // responding so the socket holds no unread data when
+                // dropped: on Windows, dropping a socket with unread data
+                // sends an RST that races the client's retry connection and
+                // flakes the tests with `IncompleteMessage`/10053.
                 stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
-                let mut buf = [0u8; 8192];
-                let n = stream.read(&mut buf)?;
-                requests.push(String::from_utf8_lossy(&buf[..n]).to_string());
+                let mut req = Vec::new();
+                let mut chunk = [0u8; 8192];
+                let mut need = None; // head end + Content-Length body bytes
+                let n0 = stream.read(&mut chunk);
+                if let Err(e) = n0 {
+                    return Err(e);
+                }
+                let mut n = n0.unwrap();
+                loop {
+                    if n == 0 {
+                        break;
+                    }
+                    req.extend_from_slice(&chunk[..n]);
+                    if need.is_none()
+                        && let Some(pos) =
+                            req.windows(4).position(|w| w == b"\r\n\r\n")
+                    {
+                        let content_length = String::from_utf8_lossy(&req[..pos])
+                            .lines()
+                            .find_map(|line| {
+                                let (k, v) = line.split_once(':')?;
+                                k.eq_ignore_ascii_case("content-length").then(|| {
+                                    v.trim().parse::<usize>().ok()
+                                })?
+                            })
+                            .unwrap_or(0);
+                        need = Some(pos + 4 + content_length);
+                    }
+                    if let Some(need) = need
+                        && req.len() >= need
+                    {
+                        break;
+                    }
+                    let r = stream.read(&mut chunk);
+                    match r {
+                        Ok(0) => break,
+                        Ok(k) => n = k,
+                        Err(e) => return Err(e),
+                    }
+                }
+                requests.push(String::from_utf8_lossy(&req).to_string());
                 let response = respond(idx);
                 stream.write_all(response.as_bytes())?;
                 stream.flush()?;
+                // Hold the socket open briefly after writing the response:
+                // closing it immediately races the client's response read on
+                // Windows and the connection can be aborted before the
+                // headers arrive, surfacing as `IncompleteMessage` flakes.
+                std::thread::sleep(std::time::Duration::from_millis(100));
                 idx += 1;
             }
             Ok(requests)
@@ -984,5 +1108,72 @@ mod tests {
         }
         let requests = server.join().unwrap().unwrap();
         assert_eq!(requests.len(), 2, "expected one retry then RateLimited");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_bytes_rejects_oversized_response() {
+        // Regression: a response declaring a >50 MB body must be rejected
+        // before any buffering, not exhaust memory.
+        let (server, addr) = spawn_mock_server(1, |_| {
+            "HTTP/1.1 200 OK\r\nContent-Length: 62914560\r\nConnection: close\r\n\r\n".to_string()
+        });
+        let config = OpenSubtitlesConfig {
+            api_key: Some("test_api_key".into()),
+            username: Some("test_user".into()),
+            password: Some("test_pass".into()),
+            languages: vec!["id".into()],
+            enabled: true,
+            base_url: Some(format!("http://{}", addr)),
+        };
+        let client = OpenSubtitlesClient::new(config);
+
+        let err = client
+            .fetch_bytes(&format!("http://{addr}/file.srt"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, OpenSubtitlesError::BodyTooLarge(_)),
+            "expected BodyTooLarge, got {err:?}"
+        );
+        let _ = server.join();
+    }
+
+    #[tokio::test]
+    async fn test_fetch_bytes_retries_on_429() {
+        // Regression: a single 429 from the download host must be retried once
+        // (honouring Retry-After), not fail the resolve outright.
+        let (server, addr) = spawn_mock_server(2, |idx| {
+            if idx == 0 {
+                "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+            } else {
+                let body = b"1\n00:00:01,000 --> 00:00:02,000\nTest\n";
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    String::from_utf8_lossy(body)
+                )
+            }
+        });
+        let config = OpenSubtitlesConfig {
+            api_key: Some("test_api_key".into()),
+            username: Some("test_user".into()),
+            password: Some("test_pass".into()),
+            languages: vec!["id".into()],
+            enabled: true,
+            base_url: Some(format!("http://{}", addr)),
+        };
+        let client = OpenSubtitlesClient::new(config);
+
+        let bytes = client
+            .fetch_bytes(&format!("http://{addr}/file.srt"))
+            .await
+            .unwrap();
+        assert!(bytes.starts_with(b"1\n00:00:01,000"), "got: {bytes:?}");
+        let requests = server.join().unwrap().unwrap();
+        assert_eq!(
+            requests.len(),
+            2,
+            "expected exactly one retry after the 429"
+        );
     }
 }

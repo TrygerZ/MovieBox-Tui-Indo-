@@ -366,14 +366,19 @@ fn is_genre(value: &str) -> bool {
 
 fn strip_trailing_year(value: &str) -> String {
     let trimmed = value.trim();
-    if trimmed.len() >= 6 {
-        let suffix = &trimmed[trimmed.len() - 6..];
-        if suffix.starts_with('(')
-            && suffix.ends_with(')')
-            && suffix[1..5].bytes().all(|byte| byte.is_ascii_digit())
-        {
-            return trimmed[..trimmed.len() - 6].trim_end().to_string();
-        }
+    // Verify byte boundaries before slicing: a multi-byte (e.g. CJK) char at
+    // the end would make `trimmed[len-6..]` panic with "byte index is not a
+    // char boundary". Checking the `(` / `)` positions and the 4 middle bytes
+    // being ASCII digits guarantees every slice below is on a char boundary.
+    let len = trimmed.len();
+    if len >= 6
+        && trimmed.ends_with(')')
+        && trimmed.as_bytes()[len - 6] == b'('
+        && trimmed.as_bytes()[len - 5..len - 1]
+            .iter()
+            .all(|byte| byte.is_ascii_digit())
+    {
+        return trimmed[..len - 6].trim_end().to_string();
     }
     trimmed.to_string()
 }
@@ -511,4 +516,21 @@ fn normalize_filename(value: &str) -> String {
         .chars()
         .filter(|character| character.is_ascii_alphanumeric())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_trailing_year_handles_multibyte_titles() {
+        // Regression: title ending in a multi-byte (CJK) char used to panic
+        // with "byte index is not a char boundary" when slicing the last 6
+        // bytes. Must return the input untouched.
+        assert_eq!(strip_trailing_year("ドラゴン2024"), "ドラゴン2024");
+        assert_eq!(strip_trailing_year("ドラゴン (2024)"), "ドラゴン");
+        assert_eq!(strip_trailing_year("One Piece (2023)"), "One Piece");
+        assert_eq!(strip_trailing_year("Movie (abcd)"), "Movie (abcd)");
+        assert_eq!(strip_trailing_year("abc"), "abc");
+    }
 }

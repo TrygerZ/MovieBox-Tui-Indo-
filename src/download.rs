@@ -69,6 +69,14 @@ pub enum DownloadOutcome {
     Paused { bytes: u64 },
 }
 
+/// Cap reported bytes at the known total so the UI percentage never exceeds 100.
+fn cap_at_total(downloaded: u64, total: Option<u64>) -> u64 {
+    match total {
+        Some(total) => downloaded.min(total),
+        None => downloaded,
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum DownloadError {
     #[error("server returned HTTP {0}")]
@@ -136,6 +144,19 @@ where
             }
         };
 
+        if response.status() == StatusCode::RANGE_NOT_SATISFIABLE
+            && metadata.total.is_some_and(|total| offset > total)
+        {
+            // Remote file shrank below our partial; discard and start over.
+            truncate(&partial).await?;
+            metadata = ResumeMetadata::default();
+            write_metadata(&metadata_path, &metadata).await?;
+            last_error = Some(DownloadError::InvalidRange(
+                "remote file size changed; partial reset".into(),
+            ));
+            retry_delay(attempt).await;
+            continue;
+        }
         if response.status() == StatusCode::RANGE_NOT_SATISFIABLE && metadata.total == Some(offset)
         {
             finalize(&partial, &metadata_path, destination).await?;
@@ -256,11 +277,12 @@ where
                     downloaded += chunk.len() as u64;
                     if last_report.elapsed() >= Duration::from_millis(200) {
                         let elapsed = started.elapsed().as_secs_f64();
+                        let session_bytes = downloaded.saturating_sub(offset);
                         report(DownloadProgress {
-                            downloaded,
+                            downloaded: cap_at_total(downloaded, metadata.total),
                             total: metadata.total,
                             bytes_per_second: if elapsed > 0.0 {
-                                downloaded as f64 / elapsed
+                                session_bytes as f64 / elapsed
                             } else {
                                 0.0
                             },
@@ -283,7 +305,7 @@ where
                         break;
                     }
                     report(DownloadProgress {
-                        downloaded,
+                        downloaded: cap_at_total(downloaded, metadata.total),
                         total: metadata.total.or(Some(downloaded)),
                         bytes_per_second: if transfer_started.elapsed().as_secs_f64() > 0.0 {
                             downloaded.saturating_sub(offset) as f64
@@ -703,5 +725,214 @@ fn header_string(
 async fn retry_delay(attempt: usize) {
     if attempt < MAX_ATTEMPTS {
         tokio::time::sleep(Duration::from_secs(1 << (attempt - 1))).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::sync::Mutex;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("moviebox-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Minimal blocking mock HTTP server: sends the headers immediately, then
+    /// (after `body_delay`) the body, so the progress-report loop in `download`
+    /// has time to emit mid-stream reports. Serves up to `MAX_ATTEMPTS`
+    /// connections and exits when idle past its deadline.
+    fn spawn_mock_server(
+        responder: impl Fn(&str) -> (String, Vec<u8>) + Send + 'static,
+        body_delay: Duration,
+    ) -> std::net::SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            for _ in 0..MAX_ATTEMPTS {
+                let (mut stream, _) = loop {
+                    match listener.accept() {
+                        Ok(conn) => break conn,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            if std::time::Instant::now() > deadline {
+                                return;
+                            }
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(_) => return,
+                    }
+                };
+                let mut buf = [0u8; 8192];
+                let Ok(n) = stream.read(&mut buf) else { continue };
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                let (head, body) = responder(&request);
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.flush();
+                std::thread::sleep(body_delay);
+                let _ = stream.write_all(&body);
+                let _ = stream.flush();
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn resume_speed_uses_session_bytes_not_total() {
+        let dir = temp_dir("resume_speed");
+        let dest = dir.join("movie.bin");
+        // Pre-existing partial: 1 MiB on disk, metadata records 1 MiB + 4096.
+        tokio::fs::write(dir.join("movie.bin.part"), vec![b'a'; 1_000_000])
+            .await
+            .unwrap();
+        tokio::fs::write(dir.join("movie.bin.part.json"), br#"{"total":1004096}"#)
+            .await
+            .unwrap();
+
+        let body = vec![b'b'; 4096];
+        let addr = spawn_mock_server(
+            move |_request: &str| {
+                (
+                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 1000000-1004095/1004096\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n"
+                        .to_string(),
+                    body.clone(),
+                )
+            },
+            Duration::from_millis(400),
+        );
+
+        let client = reqwest::Client::new();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let reporter = reports.clone();
+        let outcome = download(
+            &client,
+            &format!("http://{addr}/movie.bin"),
+            &dest,
+            cancel,
+            move |progress| reporter.lock().unwrap().push(progress),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, DownloadOutcome::Completed { bytes: 1_004_096 });
+        let offset = 1_000_000u64;
+        let reports = reports.lock().unwrap();
+        assert!(!reports.is_empty());
+        for progress in reports.iter() {
+            // Speed must be session bytes / elapsed, never total / elapsed.
+            // The server holds the body for 400 ms, so elapsed >= 0.1 s: fixed
+            // code yields <= session * 10 B/s; the old bug divided offset +
+            // session by elapsed, producing ~MB/s.
+            let session = progress.downloaded.saturating_sub(offset);
+            assert!(
+                progress.bytes_per_second <= session as f64 * 10.0,
+                "speed {:.0} B/s for session {session} B — inflated by the resumed offset",
+                progress.bytes_per_second
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn shrunk_remote_file_resets_partial_and_restarts() {
+        let dir = temp_dir("shrunk_remote");
+        let dest = dir.join("movie.bin");
+        // Partial (100 B) is larger than the recorded total (50 B) and the
+        // remote has since shrunk to 30 B → first request gets a 416.
+        tokio::fs::write(dir.join("movie.bin.part"), vec![b'a'; 100])
+            .await
+            .unwrap();
+        tokio::fs::write(dir.join("movie.bin.part.json"), br#"{"total":50}"#)
+            .await
+            .unwrap();
+
+        let body = vec![b'c'; 30];
+        let addr = spawn_mock_server(
+            move |request: &str| {
+                if request.contains("Range: bytes=100-") {
+                    (
+                        "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string(),
+                        Vec::new(),
+                    )
+                } else {
+                    (
+                        "HTTP/1.1 200 OK\r\nContent-Length: 30\r\nConnection: close\r\n\r\n"
+                            .to_string(),
+                        body.clone(),
+                    )
+                }
+            },
+            Duration::from_millis(100),
+        );
+
+        let client = reqwest::Client::new();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let outcome = download(
+            &client,
+            &format!("http://{addr}/movie.bin"),
+            &dest,
+            cancel,
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, DownloadOutcome::Completed { bytes: 30 });
+        let final_len = tokio::fs::metadata(&dest).await.unwrap().len();
+        assert_eq!(final_len, 30, "partial must be discarded before restart");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn progress_never_exceeds_total() {
+        let dir = temp_dir("clamped_progress");
+        let dest = dir.join("movie.bin");
+        // Server claims a 1000-byte range total but delivers 1200 bytes.
+        let body = vec![b'x'; 1200];
+        let addr = spawn_mock_server(
+            move |_request: &str| {
+                (
+                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-999/1000\r\nContent-Length: 1200\r\nConnection: close\r\n\r\n"
+                        .to_string(),
+                    body.clone(),
+                )
+            },
+            Duration::from_millis(300),
+        );
+
+        let client = reqwest::Client::new();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let reporter = reports.clone();
+        let result = download(
+            &client,
+            &format!("http://{addr}/movie.bin"),
+            &dest,
+            cancel,
+            move |progress| reporter.lock().unwrap().push(progress),
+        )
+        .await;
+
+        // Over-delivery must fail the transfer (Incomplete), never report >100%.
+        assert!(result.is_err(), "expected failure, got {result:?}");
+        let reports = reports.lock().unwrap();
+        assert!(!reports.is_empty());
+        for progress in reports.iter() {
+            if let Some(total) = progress.total {
+                assert!(
+                    progress.downloaded <= total,
+                    "reported {} > total {}",
+                    progress.downloaded,
+                    total
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

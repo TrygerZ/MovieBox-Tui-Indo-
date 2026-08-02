@@ -114,17 +114,21 @@ pub fn get_cached_subtitle_path(path: &std::path::Path) -> Option<PathBuf> {
     if !candidate.exists() {
         return None;
     }
-    if let Ok(metadata) = std::fs::metadata(&candidate) {
-        if let Ok(modified) = metadata.modified() {
-            if let Ok(elapsed) = modified.elapsed() {
-                if elapsed.as_secs() <= SUBTITLE_FILE_TTL_SECS {
-                    return Some(candidate);
-                }
-            }
-        }
+    // Only delete when we can positively prove the file is older than the
+    // TTL. If any metadata step errors (unsupported mtime, clock issues),
+    // treat the file as valid rather than sweeping it and forcing a
+    // re-download.
+    let expired = std::fs::metadata(&candidate)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|elapsed| elapsed.as_secs() > SUBTITLE_FILE_TTL_SECS);
+    if expired {
+        let _ = std::fs::remove_file(&candidate);
+        None
+    } else {
+        Some(candidate)
     }
-    let _ = std::fs::remove_file(&candidate);
-    None
 }
 
 pub fn set_subtitle_cache(path: &PathBuf, bytes: &[u8]) -> std::io::Result<()> {
@@ -277,6 +281,24 @@ mod tests {
         assert!(set_subtitle_cache(&file_path, b"1\n00:00:01 -> 00:00:02\nTest\n").is_ok());
         assert!(get_cached_subtitle_path(&file_path).is_some());
         let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_fresh_subtitle_file_not_deleted() {
+        // Regression: a fresh (within-TTL) file must be returned as valid and
+        // must NEVER be deleted, even when age metadata is unavailable.
+        let dir = std::env::temp_dir().join(format!(
+            "mb_test_fresh_{}_{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("fresh.srt");
+        std::fs::write(&path, b"1\n00:00:01,000 --> 00:00:02,000\nTest\n").unwrap();
+
+        assert!(get_cached_subtitle_path(&path).is_some());
+        assert!(path.exists(), "fresh file must not be deleted");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

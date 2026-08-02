@@ -6,7 +6,7 @@
 //! See `RESEARCH-SUBDL-API.md` for the verified API specification.
 //!
 //! Search results are cached through the shared subtitle cache
-//! ([`super::cache`]) with a `subdl:` key prefix so they never collide with
+//! ([`super::cache`]) with a `subdl-` key prefix so they never collide with
 //! the OpenSubtitles entries.
 
 use super::SubtitleContext;
@@ -32,6 +32,10 @@ const ACCEPTED_SUBTITLE_EXTS: [&str; 5] = ["srt", "vtt", "ass", "ssa", "sub"];
 
 /// Maximum number of candidates kept per search (mirrors OpenSubtitles).
 const MAX_CANDIDATES: usize = 5;
+
+/// Maximum bytes buffered for a subtitle download (50 MB). Endpoints answering
+/// larger bodies are rejected instead of exhausting memory.
+const MAX_SUBTITLE_BYTES: u64 = 50 * 1024 * 1024;
 
 #[derive(Debug, Clone, Default)]
 pub struct SubdlConfig {
@@ -81,6 +85,8 @@ pub enum SubdlError {
     NotFound,
     #[error("subtitle archive contains no subtitle file")]
     NoSubtitleInZip,
+    #[error("subtitle archive too large (over {0} MB)")]
+    BodyTooLarge(u64),
     #[error("ZIP error: {0}")]
     Zip(#[from] zip::result::ZipError),
     #[error("IO error: {0}")]
@@ -95,6 +101,15 @@ pub enum SubdlError {
 pub struct SubdlClient {
     http: reqwest::Client,
     config: SubdlConfig,
+}
+
+/// Cache key for a SubDL search. The `subdl-` prefix (dash, NOT the colon
+/// used by the UI marker) namespaces the key and stays a valid Windows file
+/// name: the search cache path is built by appending `.json` to this key, and
+/// `:` is illegal in Windows filenames (which previously silently disabled
+/// SubDL search caching on Windows).
+fn subdl_cache_key(ctx: &SubtitleContext, languages: &str) -> String {
+    format!("subdl-{}", cache::search_query_key(ctx, languages))
 }
 
 impl SubdlClient {
@@ -134,14 +149,33 @@ impl SubdlClient {
         }
     }
 
+    /// Read a response body into memory, rejecting it when `Content-Length`
+    /// exceeds `cap` or the stream grows beyond it (guards against a
+    /// misbehaving CDN serving multi-GB responses).
+    async fn read_body_limited(
+        mut res: reqwest::Response,
+        cap: u64,
+    ) -> Result<Vec<u8>, SubdlError> {
+        if let Some(len) = res.content_length() {
+            if len > cap {
+                return Err(SubdlError::BodyTooLarge(cap / (1024 * 1024)));
+            }
+        }
+        let mut buf = Vec::with_capacity(res.content_length().unwrap_or(0).min(cap) as usize);
+        while let Some(chunk) = res.chunk().await? {
+            if buf.len() as u64 + chunk.len() as u64 > cap {
+                return Err(SubdlError::BodyTooLarge(cap / (1024 * 1024)));
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        Ok(buf)
+    }
+
     /// v2 subtitle search (`GET /api/v2/subtitles/search`). The response is
     /// cached per (imdb_id, title, year, season, episode, languages) so the
     /// small free quota (2.000 search/day) is preserved across runs.
     pub async fn search(&self, ctx: &SubtitleContext) -> Result<SubdlSearchOutcome, SubdlError> {
-        let query_key = format!(
-            "subdl:{}",
-            cache::search_query_key(ctx, &self.config.languages.join(","))
-        );
+        let query_key = subdl_cache_key(ctx, &self.config.languages.join(","));
         if let Some(cached_val) = cache::get_search_cache(&query_key) {
             if let Ok(search_res) = serde_json::from_value::<SubdlSearchResponse>(cached_val) {
                 let candidates = self.parse_and_score_search(search_res, ctx);
@@ -225,7 +259,7 @@ impl SubdlClient {
             let Some(subtitle_id) = item.subtitle_id() else {
                 continue;
             };
-            let language = item.language.clone().unwrap_or_else(|| "id".to_string());
+            let language = item.language.clone().unwrap_or_else(|| "und".to_string());
             let score = score_subdl_candidate(&item, ctx, title_year);
             list.push(SubdlCandidate {
                 subtitle_id,
@@ -252,7 +286,7 @@ impl SubdlClient {
             return Err(SubdlError::NotFound);
         }
         let res = res.error_for_status()?;
-        let bytes = res.bytes().await?.to_vec();
+        let bytes = Self::read_body_limited(res, MAX_SUBTITLE_BYTES).await?;
         extract_first_subtitle_from_zip(&bytes)
     }
 }
@@ -605,6 +639,54 @@ mod tests {
             subdl_download_url("3197651-3213944"),
             "https://dl.subdl.com/subtitle/3197651-3213944.zip"
         );
+    }
+
+    #[test]
+    fn test_subdl_cache_key_is_windows_safe() {
+        // Regression: the cache key becomes part of a filename on disk, so it
+        // must never contain `:` or any other Windows-illegal character
+        // (previously `subdl:<hash>` silently disabled SubDL caching).
+        let ctx = sample_context();
+        let key = subdl_cache_key(&ctx, "id,en");
+        assert!(key.starts_with("subdl-"), "key: {key}");
+        assert!(!key.contains(':'), "key must not contain ':', got: {key}");
+        for ch in ['<', '>', '"', '\\', '|', '?', '*'] {
+            assert!(!key.contains(ch), "key must not contain {ch:?}, got: {key}");
+        }
+        // Stable for the same query.
+        assert_eq!(subdl_cache_key(&ctx, "id,en"), key);
+        // Different languages produce different keys (still Windows-safe).
+        let other = subdl_cache_key(&ctx, "fr");
+        assert_ne!(other, key);
+        assert!(!other.contains(':'));
+    }
+
+    #[test]
+    fn test_subdl_missing_language_defaults_to_und() {
+        // Regression: an API entry without a `language` must NOT be tagged
+        // Indonesian (which would win the +50 bonus and be auto-picked as the
+        // Indonesian fallback).
+        let search_res: SubdlSearchResponse = serde_json::from_value(serde_json::json!({
+            "status": true,
+            "results": [{ "year": 2023 }],
+            "subtitles": [{
+                "url": "/subtitle/3197651-3213944.zip",
+                "download_count": 0,
+                "rating": 0.0
+            }]
+        }))
+        .unwrap();
+        let client = SubdlClient::new(SubdlConfig::default());
+        let cands = client.parse_and_score_search(search_res, &sample_context());
+        assert_eq!(cands.len(), 1);
+        assert_eq!(cands[0].language, "und");
+        assert!(
+            cands[0].score < 50,
+            "missing language must not get the +50 Indonesian bonus, got {}",
+            cands[0].score
+        );
+        let label = build_subdl_label(&cands[0]);
+        assert!(!label.starts_with("Indonesian"), "label: {label}");
     }
 
     #[test]

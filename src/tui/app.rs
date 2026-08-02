@@ -19,6 +19,13 @@ use crate::tui::{
     theme::Theme,
 };
 
+/// Cap a server-controlled episode count before allocating `(1..=max_ep)`.
+/// A malicious `maxEp` (e.g. 1_000_000_000) would otherwise allocate ~8 GB
+/// and OOM the app. 500 is generous — no real season has that many episodes.
+fn capped_episode_count(max_ep: i64) -> usize {
+    max_ep.clamp(1, 500) as usize
+}
+
 pub fn clean_moviebox_title(raw_title: &str) -> String {
     let mut end = raw_title.len();
 
@@ -41,7 +48,7 @@ pub fn clean_moviebox_title(raw_title: &str) -> String {
             end = s_idx;
         }
     }
-    raw_title[..end].trim_end().to_string()
+    crate::tui::text::sanitize_terminal_text(raw_title[..end].trim_end())
 }
 
 /// Parse an OpenSubtitles cache marker (`os:{file_id}:{lang}`) into its parts.
@@ -79,6 +86,25 @@ fn pick_best_os_candidate(candidates: &[OsCandidate]) -> Option<&OsCandidate> {
         .or_else(|| candidates.first())
 }
 
+/// Find the caption URL whose popup label (`lanName`) equals the stored
+/// season-subtitle preference. `ext_captions` is the raw `get-ext-captions`
+/// response object (`{ "extCaptions": [...] }`). Returns `None` when nothing
+/// matches so the episode downloads without a subtitle (existing default).
+fn match_season_subtitle_preference(
+    ext_captions: &serde_json::Value,
+    preference: &str,
+) -> Option<String> {
+    let captions = ext_captions.get("extCaptions").and_then(|c| c.as_array())?;
+    for cap in captions {
+        let name = cap.get("lanName").and_then(|n| n.as_str()).unwrap_or("");
+        let url = cap.get("url").and_then(|u| u.as_str()).unwrap_or("");
+        if !url.is_empty() && name == preference {
+            return Some(url.to_string());
+        }
+    }
+    None
+}
+
 /// Heuristic guard against caching non-subtitle content (e.g. an HTML error
 /// page or a JSON error body from a proxy/CDN) as a 30-day cache entry.
 /// Real SRT/VTT/ASS files start with a line number, `WEBVTT`, or
@@ -103,7 +129,67 @@ fn looks_like_subtitle(bytes: &[u8]) -> bool {
             return false;
         }
     }
+    // Reject ZIP/GZIP bodies: OpenSubtitles `/download` can return zipped
+    // subtitles. Caching those under a `.srt` name would feed garbage to the
+    // player, so let the fallback chain try the next provider instead.
+    if head.starts_with(b"PK\x03\x04") || head.starts_with(&[0x1F, 0x8B]) {
+        return false;
+    }
     true
+}
+
+/// Cap on a poster/cover image body accepted for decoding (~50 MB). Larger
+/// responses (bad content-length, misbehaving CDN) are rejected before the
+/// bytes reach the image decoder, preventing an OOM / decode stall.
+const MAX_IMAGE_BYTES: usize = 50 * 1024 * 1024;
+
+/// Fetch a poster/cover image with a `MAX_IMAGE_BYTES` cap. Returns `None`
+/// when the request fails, the body is too large, or content-length is
+/// absent but the buffered bytes exceed the cap.
+async fn fetch_capped_image(client: &reqwest::Client, url: &str) -> Option<Vec<u8>> {
+    let mut resp = client
+        .get(url)
+        .header("User-Agent", "MovieBox-Tui/1.0")
+        .send()
+        .await
+        .ok()?;
+    if let Some(len) = resp.content_length()
+        && len > MAX_IMAGE_BYTES as u64
+    {
+        return None;
+    }
+    let mut buf = Vec::new();
+    while let Some(chunk) = resp.chunk().await.ok().flatten() {
+        if buf.len() as u64 + chunk.len() as u64 > MAX_IMAGE_BYTES as u64 {
+            return None;
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Some(buf)
+}
+
+/// Cap on a remote subtitle body downloaded to a temp file for VLC/IINA
+/// (~50 MB), mirroring `fetch_capped_image`: chunked, so a misbehaving CDN
+/// cannot stream the whole body into RAM before rejection.
+const MAX_SUBTITLE_BYTES: usize = 50 * 1024 * 1024;
+
+/// Fetch a remote URL with a `MAX_SUBTITLE_BYTES` cap. Returns `None` when
+/// the request fails or the body exceeds the cap.
+async fn fetch_capped_bytes(url: &str) -> Option<Vec<u8>> {
+    let mut resp = reqwest::get(url).await.ok()?;
+    if let Some(len) = resp.content_length()
+        && len > MAX_SUBTITLE_BYTES as u64
+    {
+        return None;
+    }
+    let mut buf = Vec::new();
+    while let Some(chunk) = resp.chunk().await.ok().flatten() {
+        if buf.len() as u64 + chunk.len() as u64 > MAX_SUBTITLE_BYTES as u64 {
+            return None;
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Some(buf)
 }
 
 /// Resolve an OpenSubtitles file to a local cache path (checking the cache
@@ -239,6 +325,9 @@ pub struct App {
     fourk_client: FourKHdHubClient,
     action_sender: mpsc::UnboundedSender<Action>,
     action_receiver: mpsc::UnboundedReceiver<Action>,
+    /// Id of the preview request currently in flight, to coalesce duplicate
+    /// `FetchPreview` dispatches (arrow-key auto-repeat fires one per event).
+    inflight_preview: Option<String>,
 }
 
 impl Default for App {
@@ -283,6 +372,7 @@ impl App {
             fourk_client: FourKHdHubClient::new(),
             action_sender,
             action_receiver,
+            inflight_preview: None,
         }
     }
 
@@ -677,6 +767,7 @@ impl App {
                     } else if let Ok(response) = subtitle_client.get(subtitle_url).send().await
                         && response.status().is_success()
                         && let Ok(bytes) = response.bytes().await
+                        && crate::tui::app::looks_like_subtitle(&bytes)
                     {
                         let _ = tokio::fs::write(subtitle_path, bytes).await;
                     }
@@ -1815,7 +1906,7 @@ impl App {
                         })
                         .map(|c| SearchResult {
                             id: c.stream_url.clone(),
-                            title: c.name.clone(),
+                            title: crate::tui::text::sanitize_terminal_text(&c.name),
                             stype: 3,
                             release_year: c.group.clone(),
                             cover_url: Some(c.logo.clone()),
@@ -1853,26 +1944,20 @@ impl App {
                                     let client = req_client.clone();
                                     tokio::spawn(async move {
                                         let _permit = permit;
-                                        if let Ok(resp) = client
-                                            .get(&url)
-                                            .header("User-Agent", "MovieBox-Tui/1.0")
-                                            .send()
-                                            .await
+                                        if let Some(bytes) =
+                                            fetch_capped_image(&client, &url).await
                                         {
-                                            if let Ok(bytes) = resp.bytes().await {
-                                                let bytes_clone = bytes.clone();
-                                                if let Ok(Ok(img)) =
-                                                    tokio::task::spawn_blocking(move || {
-                                                        image::load_from_memory(&bytes_clone)
-                                                    })
-                                                    .await
-                                                {
-                                                    tx.send(Action::SearchPosterLoaded(
-                                                        id,
-                                                        Some(std::sync::Arc::new(img)),
-                                                    ))
-                                                    .ok();
-                                                }
+                                            if let Ok(Ok(img)) =
+                                                tokio::task::spawn_blocking(move || {
+                                                    image::load_from_memory(&bytes)
+                                                })
+                                                .await
+                                            {
+                                                tx.send(Action::SearchPosterLoaded(
+                                                    id,
+                                                    Some(std::sync::Arc::new(img)),
+                                                ))
+                                                .ok();
                                             }
                                         }
                                     });
@@ -2201,26 +2286,20 @@ impl App {
                                 let client = req_client.clone();
                                 tokio::spawn(async move {
                                     let _permit = permit;
-                                    if let Ok(resp) = client
-                                        .get(&url)
-                                        .header("User-Agent", "MovieBox-Tui/1.0")
-                                        .send()
-                                        .await
+                                    if let Some(bytes) =
+                                        fetch_capped_image(&client, &url).await
                                     {
-                                        if let Ok(bytes) = resp.bytes().await {
-                                            let bytes_clone = bytes.clone();
-                                            if let Ok(Ok(img)) =
-                                                tokio::task::spawn_blocking(move || {
-                                                    image::load_from_memory(&bytes_clone)
-                                                })
-                                                .await
-                                            {
-                                                tx.send(Action::SearchPosterLoaded(
-                                                    id,
-                                                    Some(std::sync::Arc::new(img)),
-                                                ))
-                                                .ok();
-                                            }
+                                        if let Ok(Ok(img)) =
+                                            tokio::task::spawn_blocking(move || {
+                                                image::load_from_memory(&bytes)
+                                            })
+                                            .await
+                                        {
+                                            tx.send(Action::SearchPosterLoaded(
+                                                id,
+                                                Some(std::sync::Arc::new(img)),
+                                            ))
+                                            .ok();
                                         }
                                     }
                                 });
@@ -2260,7 +2339,9 @@ impl App {
                     return None;
                 }
                 self.state.is_loading = false;
-                self.state.status_message = format!("Search failed: {}", err);
+                self.state.status_message = crate::tui::text::sanitize_terminal_text(
+                    &format!("Search failed: {}", err),
+                );
                 self.state.status_timer = 150;
             }
             Action::HomepageSuccess {
@@ -2411,26 +2492,20 @@ impl App {
                                 let client = req_client.clone();
                                 tokio::spawn(async move {
                                     let _permit = permit;
-                                    if let Ok(resp) = client
-                                        .get(&url)
-                                        .header("User-Agent", "MovieBox-Tui/1.0")
-                                        .send()
-                                        .await
+                                    if let Some(bytes) =
+                                        fetch_capped_image(&client, &url).await
                                     {
-                                        if let Ok(bytes) = resp.bytes().await {
-                                            let bytes_clone = bytes.clone();
-                                            if let Ok(Ok(img)) =
-                                                tokio::task::spawn_blocking(move || {
-                                                    image::load_from_memory(&bytes_clone)
-                                                })
-                                                .await
-                                            {
-                                                tx.send(Action::SearchPosterLoaded(
-                                                    id,
-                                                    Some(std::sync::Arc::new(img)),
-                                                ))
-                                                .ok();
-                                            }
+                                        if let Ok(Ok(img)) =
+                                            tokio::task::spawn_blocking(move || {
+                                                image::load_from_memory(&bytes)
+                                            })
+                                            .await
+                                        {
+                                            tx.send(Action::SearchPosterLoaded(
+                                                id,
+                                                Some(std::sync::Arc::new(img)),
+                                            ))
+                                            .ok();
                                         }
                                     }
                                 });
@@ -2456,7 +2531,9 @@ impl App {
             }
             Action::HomepageFailure(err) => {
                 self.state.is_loading = false;
-                self.state.status_message = format!("Discover failed: {}", err);
+                self.state.status_message = crate::tui::text::sanitize_terminal_text(
+                    &format!("Discover failed: {}", err),
+                );
                 self.state.status_timer = 150;
             }
             Action::MoveUp => {
@@ -3030,25 +3107,20 @@ impl App {
                                 let client = self.client.http_client().clone();
                                 let id2 = id.clone();
                                 tokio::spawn(async move {
-                                    if let Ok(resp) = client
-                                        .get(&cover_url)
-                                        .header("User-Agent", "MovieBox-Tui/1.0")
-                                        .send()
-                                        .await
+                                    if let Some(bytes) =
+                                        fetch_capped_image(&client, &cover_url).await
                                     {
-                                        if let Ok(bytes) = resp.bytes().await {
-                                            if let Ok(Ok(img)) =
-                                                tokio::task::spawn_blocking(move || {
-                                                    image::load_from_memory(&bytes)
-                                                })
-                                                .await
-                                            {
-                                                tx.send(Action::SearchPosterLoaded(
-                                                    id2,
-                                                    Some(std::sync::Arc::new(img)),
-                                                ))
-                                                .ok();
-                                            }
+                                        if let Ok(Ok(img)) =
+                                            tokio::task::spawn_blocking(move || {
+                                                image::load_from_memory(&bytes)
+                                            })
+                                            .await
+                                        {
+                                            tx.send(Action::SearchPosterLoaded(
+                                                id2,
+                                                Some(std::sync::Arc::new(img)),
+                                            ))
+                                            .ok();
                                         }
                                     }
                                 });
@@ -3079,30 +3151,30 @@ impl App {
                         let id2 = id.clone();
                         let client = self.client.http_client().clone();
                         tokio::spawn(async move {
-                            if let Ok(resp) = client
-                                .get(&url)
-                                .header("User-Agent", "MovieBox-Tui/1.0")
-                                .send()
+                            if let Some(bytes) = fetch_capped_image(&client, &url).await {
+                                if let Ok(Ok(img)) = tokio::task::spawn_blocking(move || {
+                                    image::load_from_memory(&bytes)
+                                })
                                 .await
-                            {
-                                if let Ok(bytes) = resp.bytes().await {
-                                    if let Ok(Ok(img)) = tokio::task::spawn_blocking(move || {
-                                        image::load_from_memory(&bytes)
-                                    })
-                                    .await
-                                    {
-                                        tx.send(Action::PosterSuccess(
-                                            id2,
-                                            std::sync::Arc::new(img),
-                                        ))
-                                        .ok();
-                                    }
+                                {
+                                    tx.send(Action::PosterSuccess(
+                                        id2,
+                                        std::sync::Arc::new(img),
+                                    ))
+                                    .ok();
                                 }
                             }
                         });
                     }
                     return None;
                 }
+                // Coalesce: skip when an identical preview request for this id
+                // is already in flight (arrow auto-repeat sends one
+                // `FetchPreview` per event; only the first hits the network).
+                if self.inflight_preview.as_deref() == Some(id.as_str()) {
+                    return None;
+                }
+                self.inflight_preview = Some(id.clone());
                 self.state.preview_loading = true;
                 let client = self.client.clone();
                 let sender = self.action_sender.clone();
@@ -3119,6 +3191,13 @@ impl App {
                 });
             }
             Action::PreviewSuccess(id, json) => {
+                if self.inflight_preview.as_deref() == Some(id.as_str()) {
+                    self.inflight_preview = None;
+                }
+                // Cache regardless of whether the user has already navigated
+                // away, so bouncing back to this item reuses the cached
+                // payload instead of re-hitting the network.
+                self.state.preview_cache.put(id.clone(), json.clone());
                 let current_id = if self.state.active_screen == Screen::Details {
                     self.state
                         .selected_details
@@ -3143,7 +3222,6 @@ impl App {
 
                 self.state.preview_loading = false;
 
-                self.state.preview_cache.put(id.clone(), json.clone());
                 self.state.search_preview = Some(json.clone());
                 self.state.poster_image = None;
                 self.state.poster_protocol = None;
@@ -3160,23 +3238,16 @@ impl App {
                             .timeout(std::time::Duration::from_secs(5))
                             .build()
                             .unwrap_or_default();
-                        if let Ok(resp) = client
-                            .get(&url_clone)
-                            .header("User-Agent", "MovieBox-Tui/1.0")
-                            .send()
+                        if let Some(bytes) = fetch_capped_image(&client, &url_clone).await {
+                            if let Ok(Ok(img)) = tokio::task::spawn_blocking(move || {
+                                image::load_from_memory(&bytes)
+                            })
                             .await
-                        {
-                            if let Ok(bytes) = resp.bytes().await {
-                                if let Ok(Ok(img)) = tokio::task::spawn_blocking(move || {
-                                    image::load_from_memory(&bytes)
-                                })
-                                .await
-                                {
-                                    let _ = action_tx.send(Action::PosterSuccess(
-                                        id_clone,
-                                        std::sync::Arc::new(img),
-                                    ));
-                                }
+                            {
+                                let _ = action_tx.send(Action::PosterSuccess(
+                                    id_clone,
+                                    std::sync::Arc::new(img),
+                                ));
                             }
                         }
                     });
@@ -3203,8 +3274,11 @@ impl App {
                 }
             }
             Action::PreviewFailure(err) => {
+                self.inflight_preview = None;
                 self.state.preview_loading = false;
-                self.state.status_message = format!("Preview failed: {}", err);
+                self.state.status_message = crate::tui::text::sanitize_terminal_text(
+                    &format!("Preview failed: {}", err),
+                );
                 self.state.status_timer = 150;
             }
 
@@ -4140,23 +4214,16 @@ impl App {
                         let id_clone = id.clone();
                         tokio::spawn(async move {
                             let client = reqwest::Client::new();
-                            if let Ok(resp) = client
-                                .get(&url_clone)
-                                .header("User-Agent", "MovieBox-Tui/1.0")
-                                .send()
+                            if let Some(bytes) = fetch_capped_image(&client, &url_clone).await {
+                                if let Ok(Ok(img)) = tokio::task::spawn_blocking(move || {
+                                    image::load_from_memory(&bytes)
+                                })
                                 .await
-                            {
-                                if let Ok(bytes) = resp.bytes().await {
-                                    if let Ok(Ok(img)) = tokio::task::spawn_blocking(move || {
-                                        image::load_from_memory(&bytes)
-                                    })
-                                    .await
-                                    {
-                                        let _ = action_tx.send(Action::PosterSuccess(
-                                            id_clone,
-                                            std::sync::Arc::new(img),
-                                        ));
-                                    }
+                                {
+                                    let _ = action_tx.send(Action::PosterSuccess(
+                                        id_clone,
+                                        std::sync::Arc::new(img),
+                                    ));
                                 }
                             }
                         });
@@ -4202,8 +4269,9 @@ impl App {
                             .filter_map(|s| s.trim().parse().ok())
                             .collect()
                     } else {
-                        let max_ep =
-                            season.get("maxEp").and_then(|m| m.as_i64()).unwrap_or(1) as usize;
+                        let max_ep = capped_episode_count(
+                            season.get("maxEp").and_then(|m| m.as_i64()).unwrap_or(1),
+                        );
                         (1..=max_ep).collect()
                     };
                     self.state.available_episode_numbers.push(ep_numbers);
@@ -4814,20 +4882,14 @@ impl App {
                                     if no_pref {
                                         sender.send(Action::ShowDownloadSubtitlePopup(res)).ok();
                                     } else if let Some(pref_lang) = pref {
-                                        let mut sub_url = None;
-                                        if let Some(list) = res.as_array() {
-                                            for sub in list {
-                                                if let (Some(lang), Some(url)) = (
-                                                    sub.get("language").and_then(|l| l.as_str()),
-                                                    sub.get("url").and_then(|u| u.as_str()),
-                                                ) {
-                                                    if lang == pref_lang {
-                                                        sub_url = Some(url.to_string());
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                        }
+                                        // `res` is the `{ extCaptions: [...] }`
+                                        // object; the preference stores the
+                                        // popup label (`lanName`), so match on
+                                        // that instead of the `language` code.
+                                        let sub_url = match_season_subtitle_preference(
+                                            &res,
+                                            &pref_lang,
+                                        );
                                         sender.send(Action::DownloadStream(sub_url)).ok();
                                     }
                                 } else {
@@ -4990,20 +5052,18 @@ impl App {
                             // download remote URLs to a temp file.
                             let is_local = std::path::Path::new(&s_url).is_file();
                             if !is_local {
-                                if let Ok(resp) = reqwest::get(&s_url).await {
-                                    if let Ok(bytes) = resp.bytes().await {
-                                        let temp_path = std::env::temp_dir().join(format!(
-                                            "moviebox_sub_{}.srt",
-                                            std::time::SystemTime::now()
-                                                .duration_since(std::time::UNIX_EPOCH)
-                                                .unwrap_or_default()
-                                                .as_millis()
-                                        ));
-                                        if tokio::fs::write(&temp_path, bytes).await.is_ok() {
-                                            local_sub =
-                                                Some(temp_path.to_string_lossy().to_string());
-                                            sub_temp_path = Some(temp_path);
-                                        }
+                                if let Some(bytes) = fetch_capped_bytes(&s_url).await {
+                                    let temp_path = std::env::temp_dir().join(format!(
+                                        "moviebox_sub_{}.srt",
+                                        std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_millis()
+                                    ));
+                                    if tokio::fs::write(&temp_path, bytes).await.is_ok() {
+                                        local_sub =
+                                            Some(temp_path.to_string_lossy().to_string());
+                                        sub_temp_path = Some(temp_path);
                                     }
                                 }
                             }
@@ -5021,11 +5081,19 @@ impl App {
                         cmd.process_group(0);
                     }
 
-                    let _ = cmd.spawn();
+                    let child = cmd.spawn().ok();
 
                     if let Some(path) = sub_temp_path {
                         tokio::spawn(async move {
-                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                            if let Some(mut child) = child {
+                                // Delete only after the player process exits so
+                                // a slow player start (e.g. Windows cold start)
+                                // still finds the temp subtitle on disk.
+                                let _ =
+                                    tokio::task::spawn_blocking(move || child.wait()).await;
+                            } else {
+                                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                            }
                             let _ = tokio::fs::remove_file(path).await;
                         });
                     }
@@ -5052,20 +5120,18 @@ impl App {
                             // download remote URLs to a temp file.
                             let is_local = std::path::Path::new(s_url).is_file();
                             if !is_local {
-                                if let Ok(resp) = reqwest::get(s_url).await {
-                                    if let Ok(bytes) = resp.bytes().await {
-                                        let temp_path = std::env::temp_dir().join(format!(
-                                            "moviebox_sub_{}.srt",
-                                            std::time::SystemTime::now()
-                                                .duration_since(std::time::UNIX_EPOCH)
-                                                .unwrap_or_default()
-                                                .as_millis()
-                                        ));
-                                        if tokio::fs::write(&temp_path, bytes).await.is_ok() {
-                                            local_sub =
-                                                Some(temp_path.to_string_lossy().to_string());
-                                            sub_temp_path = Some(temp_path);
-                                        }
+                                if let Some(bytes) = fetch_capped_bytes(s_url).await {
+                                    let temp_path = std::env::temp_dir().join(format!(
+                                        "moviebox_sub_{}.srt",
+                                        std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_millis()
+                                    ));
+                                    if tokio::fs::write(&temp_path, bytes).await.is_ok() {
+                                        local_sub =
+                                            Some(temp_path.to_string_lossy().to_string());
+                                        sub_temp_path = Some(temp_path);
                                     }
                                 }
                             }
@@ -5085,11 +5151,21 @@ impl App {
                         use std::os::unix::process::CommandExt;
                         cmd.process_group(0);
                     }
-                    let _ = cmd.spawn();
+                    let child = cmd.spawn().ok();
 
                     if let Some(path) = sub_temp_path {
-                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                        let _ = tokio::fs::remove_file(path).await;
+                        tokio::spawn(async move {
+                            if let Some(mut child) = child {
+                                // Delete only after the player process exits so
+                                // a slow player start (e.g. Windows cold start)
+                                // still finds the temp subtitle on disk.
+                                let _ =
+                                    tokio::task::spawn_blocking(move || child.wait()).await;
+                            } else {
+                                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                            }
+                            let _ = tokio::fs::remove_file(path).await;
+                        });
                     }
                 });
             }
@@ -5434,5 +5510,64 @@ mod tests {
         ));
         assert!(!looks_like_subtitle(b"{\"error\":\"rate limit exceeded\"}"));
         assert!(!looks_like_subtitle(b"  {\"error\":\"forbidden\"}"));
+        // ZIP and GZIP archives (OpenSubtitles can return zipped subtitles)
+        // must not be cached as `.srt` garbage.
+        assert!(!looks_like_subtitle(b"PK\x03\x04\x14\x00\x00\x00\x08\x00"));
+        assert!(!looks_like_subtitle(b"PK\x03\x04rest of zip archive..."));
+        assert!(!looks_like_subtitle(b"\x1f\x8b\x08\x00\x00\x00\x00\x00"));
+        // ASCII text with "PK" later in the body is still a valid subtitle.
+        assert!(looks_like_subtitle(b"1\n00:00:01,000 --> 00:00:04,000\nPK zip-like text\n"));
+    }
+
+    #[test]
+    fn test_match_season_subtitle_preference() {
+        let ext = serde_json::json!({
+            "extCaptions": [
+                { "lanName": "English", "url": "https://cdn/x/en.vtt" },
+                { "lanName": "Bahasa Indonesia", "url": "https://cdn/x/id.vtt" },
+                { "lanName": "Chinese", "url": "" }
+            ]
+        });
+
+        // Matches on the popup label (`lanName`), not the language code.
+        assert_eq!(
+            match_season_subtitle_preference(&ext, "Bahasa Indonesia"),
+            Some("https://cdn/x/id.vtt".to_string())
+        );
+        // Language code "id" must NOT match the label.
+        assert_eq!(match_season_subtitle_preference(&ext, "id"), None);
+        // Caption without a url never matches.
+        assert_eq!(match_season_subtitle_preference(&ext, "Chinese"), None);
+        // Unknown preference / empty object / missing extCaptions -> None.
+        assert_eq!(match_season_subtitle_preference(&ext, "Korean"), None);
+        assert_eq!(
+            match_season_subtitle_preference(&serde_json::json!({}), "English"),
+            None
+        );
+        assert_eq!(
+            match_season_subtitle_preference(
+                &serde_json::json!({ "extCaptions": [] }),
+                "English"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_capped_episode_count() {
+        assert_eq!(capped_episode_count(1_000_000_000), 500);
+        assert_eq!(capped_episode_count(501), 500);
+        assert_eq!(capped_episode_count(500), 500);
+        assert_eq!(capped_episode_count(24), 24);
+        assert_eq!(capped_episode_count(0), 1);
+        assert_eq!(capped_episode_count(-5), 1);
+    }
+
+    #[test]
+    fn test_clean_moviebox_title_strips_terminal_escapes() {
+        assert_eq!(
+            clean_moviebox_title("Attack on Titan\x1b[2J [Dub]"),
+            "Attack on Titan[2J"
+        );
     }
 }

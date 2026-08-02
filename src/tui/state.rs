@@ -305,6 +305,11 @@ impl AppState {
                 .unwrap_or(0);
             self.notifications.remove(removable);
         }
+        // Sanitize at the ingest boundary: notification title/message are
+        // network-derived and rendered raw; strip ESC/control bytes here so
+        // no notification can ever emit terminal escape sequences.
+        let title = crate::tui::text::sanitize_terminal_text(&title.into());
+        let message = crate::tui::text::sanitize_terminal_text(&message.into());
         self.notifications
             .push_back(crate::tui::overlay::Notification::new(kind, title, message));
     }

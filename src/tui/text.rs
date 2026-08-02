@@ -11,6 +11,22 @@ pub fn remove_last_grapheme(value: &mut String) {
     }
 }
 
+/// Strip C0/C1 control bytes and ESC sequences that a terminal would
+/// interpret as commands (clear screen, OSC-52 clipboard, cursor moves).
+/// Keeps `\n`, `\t`, `\r` so multiline layout still works. Applied to all
+/// network-derived strings before they enter the render pipeline.
+pub fn sanitize_terminal_text(value: &str) -> String {
+    value
+        .chars()
+        .filter(|&c| {
+            let cp = c as u32;
+            // Drop C0 (except \t 0x09, \n 0x0a, \r 0x0d) — covers ESC (0x1b),
+            // BEL (0x07) — and the C1 range (CSI 0x9b, OSC 0x9d, ...).
+            (cp > 0x1f || matches!(cp, 0x09 | 0x0a | 0x0d)) && !(0x80..=0x9f).contains(&cp)
+        })
+        .collect()
+}
+
 pub fn truncate_width(value: &str, max_width: usize) -> String {
     if width(value) <= max_width {
         return value.to_string();
@@ -73,4 +89,30 @@ pub fn truncate_middle_width(value: &str, max_width: usize) -> String {
     end.reverse();
 
     format!("{start}…{}", end.concat())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_strips_esc_and_control_bytes() {
+        // ESC (0x1b), BEL (0x07), CSI (0x9b), OSC (0x9d), other C0 and C1.
+        assert_eq!(sanitize_terminal_text("a\x1bb"), "ab");
+        assert_eq!(sanitize_terminal_text("a\x07b"), "ab");
+        assert_eq!(sanitize_terminal_text("a\u{9b}b"), "ab");
+        assert_eq!(sanitize_terminal_text("a\u{9d}b"), "ab");
+        assert_eq!(sanitize_terminal_text("a\x00b\x08c\x0cd\x1fe"), "abcde");
+        assert_eq!(sanitize_terminal_text("a\u{80}b\u{9f}c"), "abc");
+        assert_eq!(
+            sanitize_terminal_text("\x1b[2J\x1b]52;c;test\x07"),
+            "[2J]52;c;test"
+        );
+    }
+
+    #[test]
+    fn sanitize_keeps_newline_tab_cr_and_unicode() {
+        assert_eq!(sanitize_terminal_text("a\nb\tc\rd"), "a\nb\tc\rd");
+        assert_eq!(sanitize_terminal_text("ドラゴン (2024)"), "ドラゴン (2024)");
+    }
 }

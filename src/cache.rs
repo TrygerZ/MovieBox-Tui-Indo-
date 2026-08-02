@@ -271,22 +271,35 @@ pub fn clean_old_cache_background() {
         if !path.exists() {
             return;
         }
+        clean_dir_old_files(&path, 7 * 24 * 60 * 60, &["subtitles"]);
+    });
+}
 
-        let max_age = 7 * 24 * 60 * 60;
-
-        let mut dirs_to_check = vec![path];
-        while let Some(dir) = dirs_to_check.pop() {
-            if let Ok(entries) = std::fs::read_dir(&dir) {
-                for entry in entries.flatten() {
-                    if let Ok(metadata) = entry.metadata() {
-                        if metadata.is_dir() {
-                            dirs_to_check.push(entry.path());
-                        } else if metadata.is_file() {
-                            if let Ok(modified) = metadata.modified() {
-                                if let Ok(elapsed) = modified.elapsed() {
-                                    if elapsed.as_secs() > max_age {
-                                        let _ = fs::remove_file(entry.path());
-                                    }
+/// Recursively remove files older than `max_age_secs` under `root`, skipping
+/// whole subdirectories named in `skip_dir_names`. The `subtitles/` dir is
+/// skipped because its files intentionally have their own 30-day TTL (see
+/// `src/providers/subtitles/cache.rs`); a 7-day sweep would force
+/// re-downloads and burn the subtitle provider quota.
+fn clean_dir_old_files(root: &std::path::Path, max_age_secs: u64, skip_dir_names: &[&str]) {
+    let mut dirs_to_check = vec![root.to_path_buf()];
+    while let Some(dir) = dirs_to_check.pop() {
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                if let Ok(metadata) = entry.metadata() {
+                    if metadata.is_dir() {
+                        if entry
+                            .file_name()
+                            .to_str()
+                            .is_some_and(|n| skip_dir_names.contains(&n))
+                        {
+                            continue;
+                        }
+                        dirs_to_check.push(entry.path());
+                    } else if metadata.is_file() {
+                        if let Ok(modified) = metadata.modified() {
+                            if let Ok(elapsed) = modified.elapsed() {
+                                if elapsed.as_secs() > max_age_secs {
+                                    let _ = fs::remove_file(entry.path());
                                 }
                             }
                         }
@@ -294,7 +307,7 @@ pub fn clean_old_cache_background() {
                 }
             }
         }
-    });
+    }
 }
 
 fn get_homepage_path(tab_id: &str, page: usize) -> PathBuf {
@@ -310,4 +323,51 @@ pub fn get_homepage_cache(tab_id: &str, page: usize) -> Option<serde_json::Value
 pub fn set_homepage_cache(tab_id: &str, page: usize, data: &serde_json::Value) {
     let path = get_homepage_path(tab_id, page);
     write_json_cache(&path, data);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Write `name` under `dir` with an mtime older than 7 days.
+    fn write_old_file(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        use std::io::Write;
+        let path = dir.join(name);
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(10 * 24 * 60 * 60);
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        f.write_all(b"{}").unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        path
+    }
+
+    #[test]
+    fn test_clean_dir_old_files_skips_subtitles() {
+        let dir = std::env::temp_dir().join(format!(
+            "mb_test_cleaner_{}_{}",
+            std::process::id(),
+            line!()
+        ));
+        let sub = dir.join("subtitles");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        // >7d old; the 30-day subtitle TTL must protect it from the 7-day sweep.
+        let sub_file = write_old_file(&sub, "abc.srt");
+        // >7d old outside subtitles/; must still be swept.
+        let root_file = write_old_file(&dir, "old.json");
+
+        clean_dir_old_files(&dir, 7 * 24 * 60 * 60, &["subtitles"]);
+
+        assert!(
+            sub_file.exists(),
+            "subtitles/ files must survive the 7-day cleaner"
+        );
+        assert!(!root_file.exists(), "old non-subtitle file must be swept");
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
