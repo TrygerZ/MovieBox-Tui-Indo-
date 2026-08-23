@@ -780,7 +780,9 @@ mod tests {
                     }
                 };
                 let mut buf = [0u8; 8192];
-                let Ok(n) = stream.read(&mut buf) else { continue };
+                let Ok(n) = stream.read(&mut buf) else {
+                    continue;
+                };
                 let request = String::from_utf8_lossy(&buf[..n]).to_string();
                 let (head, body) = responder(&request);
                 let _ = stream.write_all(head.as_bytes());

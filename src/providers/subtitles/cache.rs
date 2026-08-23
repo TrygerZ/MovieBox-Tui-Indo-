@@ -287,11 +287,8 @@ mod tests {
     fn test_fresh_subtitle_file_not_deleted() {
         // Regression: a fresh (within-TTL) file must be returned as valid and
         // must NEVER be deleted, even when age metadata is unavailable.
-        let dir = std::env::temp_dir().join(format!(
-            "mb_test_fresh_{}_{}",
-            std::process::id(),
-            line!()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("mb_test_fresh_{}_{}", std::process::id(), line!()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("fresh.srt");
         std::fs::write(&path, b"1\n00:00:01,000 --> 00:00:02,000\nTest\n").unwrap();

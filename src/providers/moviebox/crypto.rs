@@ -164,7 +164,8 @@ pub fn build_signed_headers(
     let content_type = "application/json";
 
     let client_token = generate_x_client_token(ts);
-    let signature = generate_x_tr_signature(method, Some(accept), Some(content_type), url, body, ts)?;
+    let signature =
+        generate_x_tr_signature(method, Some(accept), Some(content_type), url, body, ts)?;
 
     let mut headers = reqwest::header::HeaderMap::new();
 

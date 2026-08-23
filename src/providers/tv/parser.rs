@@ -81,7 +81,10 @@ impl M3UParser {
         };
 
         // Fork hardening: strip UTF-8 BOM if present (some M3U files start with FEFF)
-        let content = content.strip_prefix('\u{FEFF}').unwrap_or(&content).to_string();
+        let content = content
+            .strip_prefix('\u{FEFF}')
+            .unwrap_or(&content)
+            .to_string();
         let channels = self.parse_m3u(&content);
         if is_remote && channels.is_empty() {
             let file_path = self.cache_dir.join(cache_filename(trimmed));
