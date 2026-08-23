@@ -35,6 +35,21 @@ fn b64_encode(data: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(data)
 }
 
+fn insert_header(
+    headers: &mut reqwest::header::HeaderMap,
+    name: reqwest::header::HeaderName,
+    value: &str,
+) {
+    match value.parse() {
+        Ok(parsed) => {
+            headers.insert(name, parsed);
+        }
+        Err(error) => {
+            log::warn!("moviebox signing header skipped: {error}");
+        }
+    }
+}
+
 pub fn generate_x_client_token(ts: u64) -> String {
     let ts_str = ts.to_string();
     let reversed_ts: String = ts_str.chars().rev().collect();
@@ -121,7 +136,10 @@ pub fn generate_x_tr_signature(
     let canonical = build_canonical_string(method, accept, content_type, url, body, timestamp_ms)?;
     let secret_bytes = b64_decode(SECRET_KEY_DEFAULT);
 
-    let mut mac = HmacMd5::new_from_slice(&secret_bytes).expect("HMAC can take key of any size");
+    let Ok(mut mac) = HmacMd5::new_from_slice(&secret_bytes) else {
+        log::warn!("moviebox signature fallback: invalid HMAC key material");
+        return Ok(format!("{}|2|", timestamp_ms));
+    };
     mac.update(canonical.as_bytes());
     let sig_b64 = b64_encode(&mac.finalize().into_bytes());
 
@@ -139,30 +157,47 @@ pub fn build_signed_headers(
 ) -> Result<reqwest::header::HeaderMap, ScraperError> {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("System time is after UNIX EPOCH")
+        .unwrap_or_default()
         .as_millis() as u64;
 
     let accept = "application/json";
     let content_type = "application/json";
 
     let client_token = generate_x_client_token(ts);
-    let signature = generate_x_tr_signature(method, Some(accept), Some(content_type), url, body, ts)?;
+    let signature =
+        generate_x_tr_signature(method, Some(accept), Some(content_type), url, body, ts)?;
 
     let mut headers = reqwest::header::HeaderMap::new();
 
-    headers.insert(
-        reqwest::header::USER_AGENT,
-        user_agent.parse().expect("Valid ASCII"),
+    insert_header(&mut headers, reqwest::header::USER_AGENT, user_agent);
+    insert_header(&mut headers, reqwest::header::ACCEPT, accept);
+    insert_header(&mut headers, reqwest::header::CONTENT_TYPE, content_type);
+    insert_header(&mut headers, reqwest::header::CONNECTION, "keep-alive");
+    insert_header(
+        &mut headers,
+        reqwest::header::HeaderName::from_static("x-client-token"),
+        &client_token,
     );
-    headers.insert("Accept", accept.parse().expect("Valid ASCII"));
-    headers.insert("Content-Type", content_type.parse().expect("Valid ASCII"));
-    headers.insert("Connection", "keep-alive".parse().expect("Valid ASCII"));
-    headers.insert("X-Client-Token", client_token.parse().expect("Valid ASCII"));
-    headers.insert("x-tr-signature", signature.parse().expect("Valid ASCII"));
-    headers.insert("X-Client-Info", client_info.parse().expect("Valid ASCII"));
-    headers.insert("X-Client-Status", "0".parse().expect("Valid ASCII"));
-
-    headers.insert("X-Forwarded-For", spoofed_ip.parse().expect("Valid ASCII"));
+    insert_header(
+        &mut headers,
+        reqwest::header::HeaderName::from_static("x-tr-signature"),
+        &signature,
+    );
+    insert_header(
+        &mut headers,
+        reqwest::header::HeaderName::from_static("x-client-info"),
+        client_info,
+    );
+    insert_header(
+        &mut headers,
+        reqwest::header::HeaderName::from_static("x-client-status"),
+        "0",
+    );
+    insert_header(
+        &mut headers,
+        reqwest::header::HeaderName::from_static("x-forwarded-for"),
+        spoofed_ip,
+    );
 
     if let Some(token) = auth_token {
         let auth_value = format!("Bearer {}", token);
@@ -293,5 +328,41 @@ mod tests {
             1,
         );
         assert!(matches!(result, Err(ScraperError::InvalidUrl(_))));
+    }
+
+    #[test]
+    fn test_sorted_query_string() {
+        let url = "https://api.example.com/endpoint?b=2&a=1&c=3";
+        assert_eq!(sorted_query_string(url), "a=1&b=2&c=3");
+
+        let no_query = "https://api.example.com/endpoint";
+        assert_eq!(sorted_query_string(no_query), "");
+    }
+
+    #[test]
+    fn test_generate_x_client_token() {
+        let token = generate_x_client_token(1700000000000);
+        let parts: Vec<&str> = token.split(',').collect();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0], "1700000000000");
+        assert_eq!(parts[1].len(), 32);
+    }
+
+    #[test]
+    fn test_generate_x_tr_signature() {
+        let sig = generate_x_tr_signature(
+            "GET",
+            Some("application/json"),
+            Some("application/json"),
+            "https://api.example.com/path?tab=1&page=2",
+            None,
+            1700000000000,
+        )
+        .unwrap();
+        let parts: Vec<&str> = sig.split('|').collect();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0], "1700000000000");
+        assert_eq!(parts[1], "2");
+        assert!(!parts[2].is_empty());
     }
 }

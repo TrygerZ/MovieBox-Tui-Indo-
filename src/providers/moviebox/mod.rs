@@ -1,5 +1,40 @@
+pub mod adapt;
 pub mod client;
 pub mod crypto;
+pub mod title;
+
+pub use title::clean_moviebox_title;
+
+use crate::providers::models::ProviderKind;
+use crate::providers::{Provider, ProviderCapabilities};
+
+impl Provider for client::MovieBoxClient {
+    fn id(&self) -> ProviderKind {
+        ProviderKind::MovieBox
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            supports_search: true,
+            supports_pagination: true,
+            supports_series: true,
+            supports_subtitles: true,
+            supports_homepage: true,
+        }
+    }
+
+    async fn search(&self, query: &str, page: usize) -> Result<serde_json::Value, String> {
+        self.search(query, page)
+            .await
+            .map_err(|error| format!("{error:?}"))
+    }
+
+    async fn details(&self, id: &str) -> Result<serde_json::Value, String> {
+        self.get_details(id)
+            .await
+            .map_err(|error| format!("{error:?}"))
+    }
+}
 
 use client::{MovieBoxClient, ScraperError};
 use serde_json::{Value, json};
@@ -24,15 +59,7 @@ impl MovieBoxClient {
     }
 
     pub async fn suggest(&self, query: &str) -> Result<Value, ScraperError> {
-        let payload = json!({
-            "keyword": query,
-            "page": 1,
-            "perPage": 20,
-            "subjectType": "All",
-            "tabId": "All"
-        });
-        self.post("/wefeed-mobile-bff/subject-api/search/v2", &payload)
-            .await
+        self.search(query, 1).await
     }
 
     pub async fn get_details(&self, subject_id: &str) -> Result<Value, ScraperError> {

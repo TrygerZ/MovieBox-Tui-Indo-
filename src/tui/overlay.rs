@@ -1,5 +1,3 @@
-use std::time::{Duration, Instant};
-
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Layout, Rect},
@@ -7,7 +5,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{
         Block, BorderType, Borders, List, ListItem, ListState, Paragraph, Scrollbar,
-        ScrollbarOrientation, ScrollbarState, Wrap,
+        ScrollbarOrientation, ScrollbarState,
     },
 };
 
@@ -15,46 +13,7 @@ use crate::tui::theme::Theme;
 
 const MAX_PICKER_ROWS: usize = 8;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NotificationKind {
-    Info,
-    Success,
-    Warning,
-    Error,
-}
-
-#[derive(Debug, Clone)]
-pub struct Notification {
-    pub kind: NotificationKind,
-    pub title: String,
-    pub message: String,
-    expires_at: Instant,
-}
-
-impl Notification {
-    pub fn new(
-        kind: NotificationKind,
-        title: impl Into<String>,
-        message: impl Into<String>,
-    ) -> Self {
-        let duration = match kind {
-            NotificationKind::Info => Duration::from_secs(4),
-            NotificationKind::Success => Duration::from_secs(5),
-            NotificationKind::Warning => Duration::from_secs(7),
-            NotificationKind::Error => Duration::from_secs(10),
-        };
-        Self {
-            kind,
-            title: title.into(),
-            message: message.into(),
-            expires_at: Instant::now() + duration,
-        }
-    }
-
-    pub fn expired(&self) -> bool {
-        Instant::now() >= self.expires_at
-    }
-}
+pub use crate::models::{Notification, NotificationKind};
 
 pub struct PickerSpec<'a> {
     pub title: &'a str,
@@ -76,7 +35,8 @@ pub fn picker(
         .unwrap_or(0)
         .min(items.len().saturating_sub(1));
     let visible_rows = items.len().clamp(1, MAX_PICKER_ROWS);
-    let footer_width = crate::tui::text::width("[↑↓] Move  [Enter] Download  [Esc] Back");
+    let footer_str = format!("[↑↓] Move  [Enter] {}  [Esc] Back", spec.confirm_label);
+    let footer_width = crate::tui::text::width(&footer_str);
     let content_width = items
         .iter()
         .map(|item| crate::tui::text::width(item))
@@ -103,19 +63,22 @@ pub fn picker(
         .title(title)
         .title_style(theme.title)
         .borders(Borders::ALL)
-        .border_type(if basic_terminal {
-            BorderType::Plain
-        } else {
-            BorderType::Rounded
-        })
+        .border_type(border_type(basic_terminal))
         .border_style(theme.lavender);
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
     let sections = Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).split(inner);
+    let max_item_w = sections[0]
+        .width
+        .saturating_sub(if items.len() > visible_rows { 3 } else { 1 })
+        as usize;
     let list_items = items
         .iter()
-        .map(|item| ListItem::new(item.clone()).style(theme.text))
+        .map(|item| {
+            let truncated = crate::tui::text::truncate_width(item, max_item_w);
+            ListItem::new(truncated).style(theme.text)
+        })
         .collect::<Vec<_>>();
     let list = List::new(list_items)
         .highlight_style(selection_style(theme, basic_terminal))
@@ -179,11 +142,7 @@ pub fn confirmation(
         .title(format!(" {title} "))
         .title_style(theme.title)
         .borders(Borders::ALL)
-        .border_type(if basic_terminal {
-            BorderType::Plain
-        } else {
-            BorderType::Rounded
-        })
+        .border_type(border_type(basic_terminal))
         .border_style(theme.lavender);
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
@@ -252,51 +211,83 @@ pub fn notifications(
     theme: &Theme,
     basic_terminal: bool,
 ) {
-    let mut y = area.y.saturating_add(1);
+    let mut y = area.bottom().saturating_sub(2);
+
     for notification in notifications.iter().rev().take(3) {
-        let message = middle_truncate(&notification.message, 48);
-        let title_width = crate::tui::text::width(&notification.title).saturating_add(6);
-        let message_width = crate::tui::text::width(&message);
-        let width = title_width
-            .max(message_width.saturating_add(4))
-            .clamp(24, 52)
-            .min(area.width.saturating_sub(4) as usize) as u16;
-        if width < 4 || y.saturating_add(3) > area.bottom() {
+        let (badge, badge_style) = notification_style(notification.kind, theme, basic_terminal);
+        let has_message =
+            !notification.message.is_empty() && notification.message != notification.title;
+
+        let max_card_width = (area.width.saturating_sub(4) as usize).min(72);
+        let title_w = crate::tui::text::width(&notification.title).saturating_add(6);
+        let badge_w = badge.len().saturating_add(6);
+        let raw_msg_w = if has_message {
+            crate::tui::text::width(&notification.message).saturating_add(6)
+        } else {
+            0
+        };
+
+        let target_card_width = title_w
+            .max(badge_w)
+            .max(raw_msg_w)
+            .clamp(36, max_card_width) as u16;
+
+        let inner_width = (target_card_width.saturating_sub(4) as usize).max(1);
+
+        let msg_lines: Vec<String> = if has_message {
+            crate::tui::text::wrap_text(&notification.message, inner_width)
+                .into_iter()
+                .take(4)
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let height = 2 + 1 + msg_lines.len() as u16;
+
+        if target_card_width < 10 || y < area.y.saturating_add(height) {
             break;
         }
+
+        y = y.saturating_sub(height);
+
         let toast_area = Rect::new(
-            area.right().saturating_sub(width).saturating_sub(2),
+            area.right()
+                .saturating_sub(target_card_width)
+                .saturating_sub(2),
             y,
-            width,
-            3,
+            target_card_width,
+            height,
         );
+
         crate::tui::clear_area(frame, toast_area, theme);
-        let (symbol, style) = notification_style(notification.kind, theme, basic_terminal);
+
+        let mut lines = Vec::new();
+        lines.push(Line::from(vec![Span::styled(
+            crate::tui::text::truncate_width(&notification.title, inner_width),
+            theme.text.add_modifier(Modifier::BOLD),
+        )]));
+
+        for line in &msg_lines {
+            lines.push(Line::from(vec![Span::styled(
+                crate::tui::text::truncate_width(line, inner_width),
+                theme.subtext1,
+            )]));
+        }
+
         let block = Block::default()
-            .title(Line::from(vec![
-                Span::styled(format!(" {symbol} "), style),
-                Span::styled(
-                    notification.title.clone(),
-                    style.add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(" "),
-            ]))
+            .title(Line::from(vec![Span::styled(
+                format!(" {badge} "),
+                badge_style.add_modifier(Modifier::BOLD),
+            )]))
             .borders(Borders::ALL)
-            .border_type(if basic_terminal {
-                BorderType::Plain
-            } else {
-                BorderType::Rounded
-            })
-            .border_style(style)
+            .border_type(border_type(basic_terminal))
+            .border_style(badge_style)
             .padding(ratatui::widgets::Padding::horizontal(1));
-        frame.render_widget(
-            Paragraph::new(message)
-                .style(theme.text)
-                .wrap(Wrap { trim: true })
-                .block(block),
-            toast_area,
-        );
-        y = y.saturating_add(3);
+
+        frame.render_widget(Paragraph::new(lines).block(block), toast_area);
+
+        y = y.saturating_sub(1);
     }
 }
 
@@ -343,6 +334,14 @@ pub fn clear_modal_area(frame: &mut Frame, bounds: Rect, popup: Rect, theme: &Th
     );
 }
 
+pub fn border_type(basic_terminal: bool) -> BorderType {
+    if basic_terminal {
+        BorderType::Plain
+    } else {
+        BorderType::Rounded
+    }
+}
+
 pub(crate) fn key_hint(key: &str, action: &str, theme: &Theme) -> Span<'static> {
     Span::styled(format!("[{key}] {action}"), theme.text_dim)
 }
@@ -359,16 +358,143 @@ pub(crate) fn selection_style(theme: &Theme, basic_terminal: bool) -> Style {
 fn notification_style(
     kind: NotificationKind,
     theme: &Theme,
-    basic_terminal: bool,
+    _basic_terminal: bool,
 ) -> (&'static str, Style) {
     match kind {
-        NotificationKind::Info => ("i", theme.sapphire),
-        NotificationKind::Success => (if basic_terminal { "+" } else { "✓" }, theme.success),
-        NotificationKind::Warning => ("!", theme.rating),
-        NotificationKind::Error => (if basic_terminal { "x" } else { "×" }, theme.error),
+        NotificationKind::Info => ("INFO", theme.sapphire),
+        NotificationKind::Success => ("SUCCESS", theme.success),
+        NotificationKind::Warning => ("WARNING", theme.rating),
+        NotificationKind::Error => ("ERROR", theme.error),
     }
 }
 
-fn middle_truncate(value: &str, maximum_width: usize) -> String {
-    crate::tui::text::truncate_middle_width(value, maximum_width)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UpdateModalLayout {
+    pub popup_area: Rect,
+    pub display_count: usize,
+    pub has_more: bool,
+    pub button_row_y: u16,
+    pub update_btn_end_x: u16,
+    pub open_btn_end_x: u16,
+    pub open_button_midpoint_x: u16,
+}
+
+pub fn update_modal_layout(area: Rect, notes: &str) -> UpdateModalLayout {
+    let note_lines_count = notes
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .count();
+
+    let min_w: u16 = 46;
+    let max_w: u16 = 72;
+    let desired_w = max_w.min(area.width.saturating_sub(4)).max(min_w);
+
+    let header_rows: u16 = 5;
+    let footer_rows: u16 = 3;
+    let available_height = area.height.saturating_sub(4);
+    let available_note_rows =
+        (available_height.saturating_sub(header_rows + footer_rows) as usize).clamp(2, 10);
+
+    let display_count = note_lines_count.min(available_note_rows);
+    let has_more = note_lines_count > display_count;
+    let total_rows =
+        header_rows + (display_count as u16) + (if has_more { 1 } else { 0 }) + footer_rows;
+    let desired_h = total_rows.clamp(10, available_height.max(10));
+
+    let popup_area = centered(area, desired_w, desired_h, min_w, max_w);
+    let button_row_y = popup_area.y + popup_area.height.saturating_sub(2);
+    let update_btn_end_x = popup_area.x + popup_area.width / 3;
+    let open_btn_end_x = popup_area.x + (popup_area.width * 2) / 3;
+    let open_button_midpoint_x = popup_area.x + popup_area.width / 2;
+
+    UpdateModalLayout {
+        popup_area,
+        display_count,
+        has_more,
+        button_row_y,
+        update_btn_end_x,
+        open_btn_end_x,
+        open_button_midpoint_x,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_update_modal_mouse_hitbox_matches_rendered_geometry() {
+        let area = Rect::new(0, 0, 80, 24);
+        let notes = "Line 1\nLine 2\nLine 3\nLine 4";
+        let layout = update_modal_layout(area, notes);
+
+        assert_eq!(layout.popup_area.width, 72);
+        assert_eq!(layout.display_count, 4);
+        assert!(!layout.has_more);
+        assert_eq!(layout.popup_area.height, 12);
+        assert_eq!(layout.popup_area.x, (80 - 72) / 2);
+        assert_eq!(layout.popup_area.y, (24 - 12) / 2);
+        assert_eq!(layout.button_row_y, layout.popup_area.y + 10);
+        assert_eq!(layout.open_button_midpoint_x, layout.popup_area.x + 36);
+    }
+
+    #[test]
+    fn test_update_modal_open_release_click() {
+        let area = Rect::new(0, 0, 80, 24);
+        let notes = "### Highlights\n- Feature A\n- Feature B";
+        let layout = update_modal_layout(area, notes);
+
+        let click_x = layout.popup_area.x + 5;
+        let click_y = layout.button_row_y;
+
+        assert!(
+            layout
+                .popup_area
+                .contains(ratatui::layout::Position::new(click_x, click_y))
+        );
+        assert_eq!(click_y, layout.button_row_y);
+        assert!(click_x < layout.open_button_midpoint_x);
+    }
+
+    #[test]
+    fn test_update_modal_dismiss_click() {
+        let area = Rect::new(0, 0, 80, 24);
+        let notes = "Feature A";
+        let layout = update_modal_layout(area, notes);
+
+        let dismiss_x = layout.open_button_midpoint_x + 5;
+        let dismiss_y = layout.button_row_y;
+
+        assert!(
+            layout
+                .popup_area
+                .contains(ratatui::layout::Position::new(dismiss_x, dismiss_y))
+        );
+        assert_eq!(dismiss_y, layout.button_row_y);
+        assert!(dismiss_x >= layout.open_button_midpoint_x);
+
+        let outside_x = layout.popup_area.x.saturating_sub(2);
+        let outside_y = layout.popup_area.y.saturating_sub(2);
+        assert!(
+            !layout
+                .popup_area
+                .contains(ratatui::layout::Position::new(outside_x, outside_y))
+        );
+    }
+
+    #[test]
+    fn test_update_modal_geometry_bounds_various_screens() {
+        let notes = "Line 1\nLine 2\nLine 3\nLine 4\nLine 5\nLine 6\nLine 7\nLine 8\nLine 9\nLine 10\nLine 11";
+
+        let compact = update_modal_layout(Rect::new(0, 0, 40, 15), notes);
+        assert!(compact.popup_area.width <= 38);
+        assert!(compact.popup_area.height <= 13);
+        assert!(compact.has_more);
+
+        let large = update_modal_layout(Rect::new(0, 0, 160, 50), notes);
+        assert_eq!(large.popup_area.width, 72);
+        assert_eq!(large.display_count, 10);
+        assert!(large.has_more);
+    }
 }

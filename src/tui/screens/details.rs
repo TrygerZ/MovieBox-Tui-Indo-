@@ -11,7 +11,7 @@ use ratatui::{
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DetailsLayoutTier {
+pub(crate) enum DetailsLayoutTier {
     Wide,
     Medium,
     Narrow,
@@ -19,7 +19,7 @@ enum DetailsLayoutTier {
 }
 
 impl DetailsLayoutTier {
-    fn for_area(area: Rect) -> Self {
+    pub(crate) fn for_area(area: Rect) -> Self {
         if area.width < 60 || area.height < 24 {
             Self::Tiny
         } else if area.width < 80 {
@@ -31,7 +31,7 @@ impl DetailsLayoutTier {
         }
     }
 
-    fn header_height(self, area: Rect, details: Option<&serde_json::Value>) -> u16 {
+    pub(crate) fn header_height(self, area: Rect, details: Option<&serde_json::Value>) -> u16 {
         let (minimum, maximum, synopsis_limit, reserved_width) = match self {
             Self::Wide => (9, 12, 3, 30),
             Self::Medium => (8, 11, 2, 24),
@@ -74,15 +74,24 @@ impl DetailsLayoutTier {
         (content_rows as u16 + 2).clamp(minimum, maximum)
     }
 
-    fn footer_height(self) -> u16 {
-        if matches!(self, Self::Wide) { 1 } else { 2 }
+    pub(crate) fn footer_height(self, width: u16) -> u16 {
+        if width >= 70 { 1 } else { 2 }
     }
+}
+
+fn subject_provider(state: &AppState, subject_id: &str) -> crate::providers::models::ProviderKind {
+    state
+        .search_results
+        .iter()
+        .find(|result| result.id == subject_id)
+        .map(|result| result.provider)
+        .unwrap_or(state.active_provider)
 }
 
 pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
     let tier = DetailsLayoutTier::for_area(area);
     let header_height = tier.header_height(area, state.selected_details.as_ref());
-    let footer_height = tier.footer_height();
+    let footer_height = tier.footer_height(area.width);
     let chunks = Layout::vertical([
         Constraint::Length(header_height),
         Constraint::Length(1),
@@ -96,12 +105,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
     let details_json = match &state.selected_details {
         Some(d) => d,
         None => {
-            let dots = match (state.tick_count / 4) % 4 {
-                0 => "",
-                1 => ".",
-                2 => "..",
-                _ => "...",
-            };
+            let dots = state.loading_dots();
 
             let vertical_chunks = Layout::default()
                 .direction(Direction::Vertical)
@@ -123,28 +127,66 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
 
     let raw_title = details_json
         .get("title")
+        .or_else(|| details_json.get("name"))
         .and_then(|t| t.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            state
+                .search_results
+                .iter()
+                .find(|r| {
+                    if let Some(act_id) = state.active_subject_id.as_deref() {
+                        r.id == act_id
+                    } else {
+                        false
+                    }
+                })
+                .map(|r| r.title.as_str())
+        })
         .unwrap_or("Unknown Title");
-    let title = crate::tui::app::clean_moviebox_title(raw_title);
+    let title = crate::providers::moviebox::clean_moviebox_title(raw_title);
     let intro = details_json
         .get("description")
+        .or_else(|| details_json.get("intro"))
+        .or_else(|| details_json.get("synopsis"))
+        .or_else(|| details_json.get("overview"))
         .and_then(|d| d.as_str())
-        .or_else(|| details_json.get("intro").and_then(|i| i.as_str()))
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            state.search_preview.as_ref().and_then(|p| {
+                p.get("description")
+                    .or_else(|| p.get("intro"))
+                    .or_else(|| p.get("synopsis"))
+                    .and_then(|s| s.as_str())
+            })
+        })
         .unwrap_or("No description available.");
     let year = details_json
         .get("releaseDate")
+        .or_else(|| details_json.get("year"))
+        .or_else(|| details_json.get("releaseInfo"))
         .and_then(|y| y.as_str())
-        .or_else(|| details_json.get("year").and_then(|y| y.as_str()))
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            state
+                .search_results
+                .iter()
+                .find(|r| {
+                    if let Some(act_id) = state.active_subject_id.as_deref() {
+                        r.id == act_id
+                    } else {
+                        false
+                    }
+                })
+                .map(|r| r.release_year.as_str())
+        })
         .unwrap_or("N/A");
-    let type_val = details_json
-        .get("subjectType")
-        .and_then(|s| s.as_i64())
-        .or_else(|| details_json.get("stype").and_then(|s| s.as_i64()))
-        .unwrap_or(1);
+    let type_val = crate::tui::state::stype(details_json);
     let type_str = if type_val == 2 { "Series" } else { "Movie" };
 
     let genres = details_json
         .get("genre")
+        .or_else(|| details_json.get("genres"))
         .and_then(|g| {
             if let Some(a) = g.as_array() {
                 let joined = a
@@ -196,11 +238,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
 
     let details_block = Block::default()
         .borders(Borders::ALL)
-        .border_type(if state.basic_terminal {
-            ratatui::widgets::BorderType::Plain
-        } else {
-            ratatui::widgets::BorderType::Rounded
-        })
+        .border_type(crate::tui::overlay::border_type(state.basic_terminal))
         .border_style(theme.surface1)
         .padding(ratatui::widgets::Padding::new(
             if matches!(tier, DetailsLayoutTier::Wide) {
@@ -283,7 +321,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
 
             let (pad, msg) = if state.is_loading {
                 let p = "\n".repeat((inner.height.saturating_sub(1) / 2) as usize);
-                (p, format!("Loading Art{dots}"))
+                (p, format!("Loading{dots}"))
             } else {
                 let p = "\n".repeat((inner.height.saturating_sub(1) / 2) as usize);
                 (p, title.to_string())
@@ -302,12 +340,8 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
             .border_style(theme.muted);
 
         let inner = placeholder_block.inner(poster_area);
-        let lines = if inner.height >= 5 {
-            let pad_top = "\n".repeat((inner.height.saturating_sub(5) / 2) as usize);
-            format!("{pad_top}Poster preview\nunsupported\n\nUse a graphics-\ncapable terminal")
-        } else {
-            "Poster\nunsupported".to_string()
-        };
+        let pad_top = "\n".repeat((inner.height.saturating_sub(2) / 2) as usize);
+        let lines = format!("{pad_top}No\nPoster");
 
         let placeholder = Paragraph::new(lines)
             .style(theme.text_dim)
@@ -317,9 +351,11 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
         frame.render_widget(placeholder, poster_area);
     }
 
+    let display_title = title.to_string();
+
     let title_line = Line::from(vec![
         Span::styled(
-            title.to_string(),
+            display_title,
             theme.text.add_modifier(ratatui::style::Modifier::BOLD),
         ),
         Span::styled("   ", theme.text),
@@ -342,6 +378,30 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
     if !duration_str.is_empty() {
         metadata.push(duration.to_string());
     }
+    let subject_id = state.active_subject_id.as_deref().unwrap_or("");
+    let provider = subject_provider(state, subject_id).cache_key();
+    if type_val == 1 {
+        if let Some(hist) = state
+            .history
+            .get_item(provider, subject_id, 0, 0, Some(&title))
+        {
+            if hist.is_in_progress() {
+                let p_bar = hist.progress_bar(8);
+                let pct = hist
+                    .progress_percentage()
+                    .map(|p| format!("{:.0}%", p))
+                    .unwrap_or_default();
+                let rem = hist
+                    .formatted_remaining()
+                    .map(|r| format!(" • {r}"))
+                    .unwrap_or_default();
+                metadata.push(format!("{p_bar} {pct}{rem}"));
+            } else if hist.completed {
+                metadata.push("[✓ Watched]".to_string());
+            }
+        }
+    }
+    metadata.retain(|s| !s.trim().is_empty());
     let meta_line = Line::from(vec![Span::styled(
         metadata.join(" • "),
         metadata_style(theme),
@@ -425,16 +485,15 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
         available_selector_panes.push(crate::tui::state::DetailsPane::Episodes);
     }
 
-    let visible_selector_panes =
-        if matches!(tier, DetailsLayoutTier::Narrow | DetailsLayoutTier::Tiny) {
-            available_selector_panes
-                .iter()
-                .copied()
-                .filter(|pane| *pane == state.details_pane)
-                .collect::<Vec<_>>()
-        } else {
-            available_selector_panes
-        };
+    let visible_selector_panes = if matches!(tier, DetailsLayoutTier::Tiny) {
+        available_selector_panes
+            .iter()
+            .copied()
+            .filter(|pane| *pane == state.details_pane)
+            .collect::<Vec<_>>()
+    } else {
+        available_selector_panes
+    };
 
     let selector_height = if visible_selector_panes.is_empty() {
         0
@@ -495,17 +554,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
         if let Some(dubs) = details_json.get("dubs").and_then(|d| d.as_array()) {
             for dub in dubs {
                 if let Some(lang) = dub.get("lanName").and_then(|n| n.as_str()) {
-                    let mut name = if lang.to_lowercase().starts_with("original") {
-                        "Original".to_string()
-                    } else {
-                        lang.replace("dub", "")
-                            .replace("Dub", "")
-                            .trim()
-                            .to_string()
-                    };
-                    if name.to_lowercase() == "ptbr" {
-                        name = "Portuguese (BR)".to_string();
-                    }
+                    let name = clean_language_name(lang);
                     lang_items.push(ListItem::new(name).style(theme.text));
                 }
             }
@@ -522,11 +571,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_type(if state.basic_terminal {
-                        ratatui::widgets::BorderType::Plain
-                    } else {
-                        ratatui::widgets::BorderType::Rounded
-                    })
+                    .border_type(crate::tui::overlay::border_type(state.basic_terminal))
                     .title(pane_title(
                         "Audio",
                         language_count,
@@ -582,11 +627,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_type(if state.basic_terminal {
-                        ratatui::widgets::BorderType::Plain
-                    } else {
-                        ratatui::widgets::BorderType::Rounded
-                    })
+                    .border_type(crate::tui::overlay::border_type(state.basic_terminal))
                     .title(pane_title(
                         "Seasons",
                         state.available_seasons.len(),
@@ -624,9 +665,46 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
             .available_episode_numbers
             .get(state.season_list_state.selected().unwrap_or(0))
         {
+            let season_idx = state.season_list_state.selected().unwrap_or(0);
+            let se_num = state
+                .available_seasons
+                .get(season_idx)
+                .and_then(|s| s.get("se"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(1) as usize;
+            let subject_id = state.active_subject_id.as_deref().unwrap_or("");
+            let provider = subject_provider(state, subject_id).cache_key();
+
             ep_numbers
                 .iter()
-                .map(|&ep| ListItem::new(format!("Episode {}", ep)).style(theme.text))
+                .map(|&ep| {
+                    if let Some(hist) =
+                        state
+                            .history
+                            .get_item(provider, subject_id, se_num, ep, Some(&title))
+                    {
+                        if hist.completed {
+                            ListItem::new(format!("✓ Episode {}", ep)).style(theme.text_dim)
+                        } else if hist.is_in_progress() {
+                            let pct = hist
+                                .progress_percentage()
+                                .map(|p| format!(" ({:.0}%)", p))
+                                .unwrap_or_default();
+                            let remaining = hist
+                                .formatted_remaining()
+                                .map(|r| format!(" • {r}"))
+                                .unwrap_or_default();
+                            ListItem::new(format!("▶ Episode {}{pct}{remaining}", ep))
+                                .style(theme.accent)
+                        } else {
+                            ListItem::new(format!("  Episode {}", ep)).style(theme.text)
+                        }
+                    } else if state.history.is_watched(provider, subject_id, se_num, ep) {
+                        ListItem::new(format!("✓ Episode {}", ep)).style(theme.text_dim)
+                    } else {
+                        ListItem::new(format!("  Episode {}", ep)).style(theme.text)
+                    }
+                })
                 .collect()
         } else {
             vec![]
@@ -643,11 +721,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_type(if state.basic_terminal {
-                        ratatui::widgets::BorderType::Plain
-                    } else {
-                        ratatui::widgets::BorderType::Rounded
-                    })
+                    .border_type(crate::tui::overlay::border_type(state.basic_terminal))
                     .title(pane_title(
                         "Episodes",
                         episode_count,
@@ -718,11 +792,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
 
     let streams_block = Block::default()
         .borders(Borders::ALL)
-        .border_type(if state.basic_terminal {
-            ratatui::widgets::BorderType::Plain
-        } else {
-            ratatui::widgets::BorderType::Rounded
-        })
+        .border_type(crate::tui::overlay::border_type(state.basic_terminal))
         .title(ratatui::text::Line::from(streams_title).alignment(Alignment::Left))
         .title_style(if streams_focused {
             focused_title_style(theme)
@@ -761,36 +831,20 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
                             .get("codecName")
                             .and_then(|c| c.as_str())
                             .unwrap_or("None");
-                        let upload_by = file
-                            .get("uploadBy")
-                            .and_then(|u| u.as_str())
-                            .unwrap_or("Unknown");
-                        let size_str = file.get("size").and_then(|s| s.as_str()).unwrap_or("0");
 
                         let duration = file.get("duration").and_then(|d| d.as_u64()).unwrap_or(0);
                         let duration_str = if duration > 0 {
-                            let hours = duration / 3600;
-                            let mins = (duration % 3600) / 60;
-                            let secs = duration % 60;
-                            if hours > 0 {
-                                format!("{:02}:{:02}:{:02}", hours, mins, secs)
-                            } else {
-                                format!("{:02}:{:02}", mins, secs)
-                            }
+                            crate::tui::text::format_duration(duration)
                         } else {
                             "--:--".to_string()
                         };
 
-                        let size_formatted = if let Ok(bytes) = size_str.parse::<f64>() {
-                            let mb = bytes / 1024.0 / 1024.0;
-                            if mb > 1024.0 {
-                                format!("{:.1}GB", mb / 1024.0)
-                            } else {
-                                format!("{:.0}MB", mb)
-                            }
-                        } else {
-                            "Unknown".to_string()
-                        };
+                        let size_formatted = file
+                            .get("size")
+                            .and_then(|s| s.as_str())
+                            .and_then(|s| s.parse::<f64>().ok())
+                            .map(crate::tui::text::format_file_size)
+                            .unwrap_or_else(|| "--".to_string());
 
                         let is_selected = Some(i) == selected_idx;
                         let pointer = if is_selected {
@@ -829,10 +883,23 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
                         };
 
                         let is_fourk = file.get("_fourk_release").is_some();
-                        let language = file
+                        let is_addon = file.get("_addon_release").is_some();
+                        let raw_release_title = file
+                            .get("fileName")
+                            .or_else(|| file.get("title"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let release_title = crate::tui::text::clean_stream_text(raw_release_title);
+                        let raw_upload_by = file
+                            .get("uploadBy")
+                            .and_then(|u| u.as_str())
+                            .unwrap_or("Unknown");
+                        let upload_by = crate::tui::text::clean_stream_text(raw_upload_by);
+                        let raw_language = file
                             .get("language")
                             .and_then(|value| value.as_str())
                             .unwrap_or("Unknown");
+                        let language = crate::tui::text::clean_stream_text(raw_language);
                         let source_count = file
                             .get("sourceCount")
                             .and_then(|value| value.as_u64())
@@ -841,25 +908,76 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
                         let codec = codec.to_uppercase();
                         let mut stream_spans = vec![
                             Span::styled(pointer, marker_style),
-                            Span::styled(format!("{size_formatted:<9}"), primary_style),
-                            Span::styled(format!("{codec:<8}"), secondary_style),
+                            Span::styled(format!("{size_formatted:<9} "), primary_style),
+                            Span::styled(format!("{codec:<11} "), secondary_style),
                         ];
-                        if is_fourk && stream_width >= 58 {
-                            stream_spans
-                                .push(Span::styled(format!("{language:<16}"), secondary_style));
+                        if is_addon {
+                            let fixed = 10 + 12;
+                            let remaining = stream_width.saturating_sub(fixed);
+                            let has_lang = language != "Unknown" && !language.is_empty();
+                            let lang_str = if has_lang {
+                                format!("{language:<15} ")
+                            } else {
+                                "".to_string()
+                            };
+                            let lang_len = lang_str.len();
+
+                            if remaining >= 45 {
+                                let title_avail =
+                                    remaining.saturating_sub(lang_len + upload_by.len() + 3);
+                                let display_title = crate::tui::text::truncate_width(
+                                    &release_title,
+                                    title_avail.max(12),
+                                );
+                                if has_lang {
+                                    stream_spans.push(Span::styled(lang_str, secondary_style));
+                                }
+                                stream_spans.push(Span::styled(
+                                    format!("{display_title}  "),
+                                    primary_style,
+                                ));
+                                stream_spans
+                                    .push(Span::styled(upload_by.to_string(), secondary_style));
+                            } else if remaining >= 25 {
+                                let title_avail = remaining.saturating_sub(upload_by.len() + 2);
+                                let display_title = crate::tui::text::truncate_width(
+                                    &release_title,
+                                    title_avail.max(8),
+                                );
+                                stream_spans.push(Span::styled(
+                                    format!("{display_title}  "),
+                                    primary_style,
+                                ));
+                                stream_spans
+                                    .push(Span::styled(upload_by.to_string(), secondary_style));
+                            } else {
+                                stream_spans
+                                    .push(Span::styled(upload_by.to_string(), secondary_style));
+                            }
+                        } else if is_fourk && stream_width >= 58 {
+                            let mirror_str = format!(
+                                "{source_count} mirror{}",
+                                if source_count == 1 { "" } else { "s" }
+                            );
+                            let mirror_width = mirror_str.len() + 2;
+                            let max_lang_width = stream_width.saturating_sub(9 + 8 + mirror_width);
+                            let display_lang =
+                                crate::tui::text::truncate_width(&language, max_lang_width);
                             stream_spans.push(Span::styled(
-                                format!(
-                                    "{source_count} mirror{}",
-                                    if source_count == 1 { "" } else { "s" }
-                                ),
+                                format!("{display_lang:<16}  "),
                                 secondary_style,
                             ));
+                            stream_spans.push(Span::styled(mirror_str, secondary_style));
                         } else if is_fourk && stream_width >= 38 {
-                            stream_spans.push(Span::styled(language.to_string(), secondary_style));
+                            let max_lang_width = stream_width.saturating_sub(9 + 8 + 2);
+                            let display_lang =
+                                crate::tui::text::truncate_width(&language, max_lang_width);
+                            stream_spans
+                                .push(Span::styled(display_lang.to_string(), secondary_style));
                         } else if !is_fourk && stream_width >= 64 {
                             let fixed_width = 9 + 8 + 12;
                             let uploader = crate::tui::text::truncate_width(
-                                upload_by,
+                                &upload_by,
                                 stream_width.saturating_sub(fixed_width).max(4),
                             );
                             stream_spans
@@ -939,10 +1057,18 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
                     .and_then(|d| d.get("dubs"))
                     .and_then(|d| d.as_array())
                     .is_some_and(|a| a.len() > 1);
+                let provider_label = state
+                    .active_subject_id
+                    .as_deref()
+                    .map(|id| subject_provider(state, id).label())
+                    .unwrap_or_else(|| state.active_provider.label());
+
                 let msg = if has_multiple_dubs && !state.language_chosen {
-                    "Choose an audio track to load streams."
+                    "Choose an audio track to load streams.".to_string()
                 } else {
-                    "No streams found — press r to retry."
+                    format!(
+                        "No stream sources found on {provider_label} — press Ctrl+P to try another provider, or r to retry."
+                    )
                 };
 
                 let inner = streams_block.inner(streams_area);
@@ -969,7 +1095,13 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
             let msg = if waiting_for_language {
                 "Choose an audio track to load streams.".to_string()
             } else if let Some(error) = &state.stream_error {
-                format!("{error} — press r to retry.")
+                if state.is_addon_mode {
+                    error.clone()
+                } else if error.contains("No stream sources") || error.contains("not listed") {
+                    format!("{error}.\nPress Ctrl+P to try another provider, or r to refresh.")
+                } else {
+                    format!("{error} — press r to retry or Ctrl+P to switch provider.")
+                }
             } else {
                 let dots = match (state.tick_count / 4) % 4 {
                     0 => "",
@@ -1003,6 +1135,20 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
     if state.selected_resources.is_none() {
         frame.render_widget(streams_block, streams_area);
     }
+
+    let (mut primary_footer, secondary_footer) = details_footer(state, theme, area.width);
+    let footer_p = if area.width >= 70 {
+        primary_footer.extend(secondary_footer);
+        Paragraph::new(Line::from(primary_footer))
+    } else {
+        Paragraph::new(vec![
+            Line::from(primary_footer),
+            Line::from(secondary_footer),
+        ])
+    }
+    .alignment(Alignment::Center);
+    frame.render_widget(footer_p, chunks[3]);
+
     if state.subtitle_popup || state.is_download_subtitle_popup {
         let items = state
             .subtitle_list
@@ -1011,7 +1157,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
                 if name == "None" {
                     "No subtitles".to_string()
                 } else {
-                    name.clone()
+                    crate::tui::text::sanitize_language_label(name)
                 }
             })
             .collect::<Vec<_>>();
@@ -1044,14 +1190,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
         let items = state
             .available_players
             .iter()
-            .map(|k| {
-                match k {
-                    crate::tui::state::PlayerKind::Mpv => "mpv",
-                    crate::tui::state::PlayerKind::Iina => "IINA",
-                    crate::tui::state::PlayerKind::Vlc => "VLC",
-                }
-                .to_string()
-            })
+            .map(|k| k.label().to_string())
             .collect::<Vec<_>>();
         crate::tui::overlay::picker(
             frame,
@@ -1067,19 +1206,6 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
             state.basic_terminal,
         );
     }
-
-    let (mut primary_footer, secondary_footer) = details_footer(state, theme, area.width);
-    let footer_p = if matches!(tier, DetailsLayoutTier::Wide) {
-        primary_footer.extend(secondary_footer);
-        Paragraph::new(Line::from(primary_footer))
-    } else {
-        Paragraph::new(vec![
-            Line::from(primary_footer),
-            Line::from(secondary_footer),
-        ])
-    }
-    .alignment(Alignment::Center);
-    frame.render_widget(footer_p, chunks[3]);
 
     if state.show_season_download_confirm {
         let season_idx = state.selected_season;
@@ -1150,14 +1276,7 @@ fn selected_stream_summary(state: &AppState) -> Option<String> {
         .get("size")
         .and_then(|value| value.as_str())
         .and_then(|value| value.parse::<f64>().ok())
-        .map(|bytes| {
-            let megabytes = bytes / 1024.0 / 1024.0;
-            if megabytes > 1024.0 {
-                format!("{:.1} GB", megabytes / 1024.0)
-            } else {
-                format!("{megabytes:.0} MB")
-            }
-        });
+        .map(crate::tui::text::format_file_size);
     let fields = [size, resolution, codec]
         .into_iter()
         .flatten()
@@ -1315,10 +1434,24 @@ fn render_workflow(
     let mut steps = Vec::new();
 
     if has_languages {
+        let active_idx = details
+            .get("dubs")
+            .and_then(|dubs| dubs.as_array())
+            .and_then(|dubs| {
+                dubs.iter().position(|dub| {
+                    dub.get("subjectId")
+                        .and_then(crate::tui::state::subject_id)
+                        .as_deref()
+                        == state.active_subject_id.as_deref()
+                })
+            })
+            .or_else(|| state.language_list_state.selected())
+            .unwrap_or(0);
+
         let language = details
             .get("dubs")
             .and_then(|dubs| dubs.as_array())
-            .and_then(|dubs| dubs.get(state.language_list_state.selected().unwrap_or(0)))
+            .and_then(|dubs| dubs.get(active_idx))
             .and_then(|dub| dub.get("lanName"))
             .and_then(|name| name.as_str())
             .map(clean_language_name)
@@ -1337,14 +1470,14 @@ fn render_workflow(
                 format!("Season {}", state.selected_season)
             },
         ));
-        steps.push((
-            crate::tui::state::DetailsPane::Episodes,
-            if compact {
-                format!("E{}", state.selected_episode)
-            } else {
-                format!("Episode {}", state.selected_episode)
-            },
-        ));
+
+        let ep_label = if compact {
+            format!("E{}", state.selected_episode)
+        } else {
+            format!("Episode {}", state.selected_episode)
+        };
+
+        steps.push((crate::tui::state::DetailsPane::Episodes, ep_label));
     }
     steps.push((
         crate::tui::state::DetailsPane::Streams,

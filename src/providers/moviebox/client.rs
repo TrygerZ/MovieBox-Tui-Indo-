@@ -82,9 +82,13 @@ impl MovieBoxClient {
 
     pub async fn init(&self) -> Result<(), ScraperError> {
         let path = "/wefeed-mobile-bff/tab-operating?page=1&tabId=0&version=";
-        let _ = self.get(path).await?;
+        let _ = self.request_hosts("GET", path, None).await?;
 
-        let has_token = self.runtime_token.read().unwrap_or_else(|e| e.into_inner()).is_some();
+        let has_token = self
+            .runtime_token
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some();
         if !has_token {
             return Err(ScraperError::MissingToken);
         }
@@ -128,11 +132,36 @@ impl MovieBoxClient {
         path_and_query: &str,
         body: Option<&str>,
     ) -> Result<Value, ScraperError> {
+        match self.request_hosts(method, path_and_query, body).await {
+            Err(ScraperError::HostsExhausted) => {
+                let has_token = self
+                    .runtime_token
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_some();
+                if has_token {
+                    return Err(ScraperError::HostsExhausted);
+                }
+                let _ = self.init().await;
+                self.request_hosts(method, path_and_query, body).await
+            }
+            result => result,
+        }
+    }
+
+    async fn request_hosts(
+        &self,
+        method: &str,
+        path_and_query: &str,
+        body: Option<&str>,
+    ) -> Result<Value, ScraperError> {
         let start_idx = self.active_base_idx.load(Ordering::Relaxed);
+        let mut backoff_ms: u64 = 50;
 
         for i in 0..HOST_POOL.len() {
             if i > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                backoff_ms = 50;
             }
             let idx = (start_idx + i) % HOST_POOL.len();
             let base = HOST_POOL[idx];
@@ -169,6 +198,19 @@ impl MovieBoxClient {
                     let status = resp.status().as_u16();
 
                     if RETRY_STATUS_CODES.contains(&status) {
+                        log::warn!(
+                            "moviebox host {idx} returned retryable status {status}: {}",
+                            crate::logging::sanitize_url(&url)
+                        );
+                        if status == 429 {
+                            backoff_ms = resp
+                                .headers()
+                                .get(reqwest::header::RETRY_AFTER)
+                                .and_then(|v| v.to_str().ok())
+                                .and_then(|v| v.parse::<u64>().ok())
+                                .map(|secs| secs.saturating_mul(1000).min(3000))
+                                .unwrap_or(400);
+                        }
                         continue;
                     }
 
@@ -176,13 +218,26 @@ impl MovieBoxClient {
 
                     match self.parse_response(resp).await {
                         Ok(val) => return Ok(val),
-                        Err(_) => continue,
+                        Err(error) => {
+                            log::warn!(
+                                "moviebox host {idx} parse failed: {error} [{}]",
+                                crate::logging::sanitize_url(&url)
+                            );
+                            continue;
+                        }
                     }
                 }
-                Err(_) => continue,
+                Err(error) => {
+                    log::warn!(
+                        "moviebox host {idx} request failed: {error} [{}]",
+                        crate::logging::sanitize_url(&url)
+                    );
+                    continue;
+                }
             }
         }
 
+        log::error!("moviebox: all hosts exhausted for [redacted]");
         Err(ScraperError::HostsExhausted)
     }
 
@@ -198,9 +253,12 @@ impl MovieBoxClient {
         };
 
         let body_val: Value =
-            match tokio::task::spawn_blocking(move || serde_json::from_str(&raw_text)).await? {
-                Ok(v) => v,
-                Err(e) => return Err(ScraperError::Json(e)),
+            match tokio::task::spawn_blocking(move || serde_json::from_str(&raw_text)).await {
+                Ok(Ok(v)) => v,
+                Ok(Err(e)) => return Err(ScraperError::Json(e)),
+                Err(_) => {
+                    return Err(ScraperError::HostsExhausted);
+                }
             };
 
         if let Some(data) = body_val.get("data") {

@@ -109,6 +109,7 @@ pub fn parse_details(id: &str, html: &str) -> Result<MediaDetails, FourKHdHubErr
         prints: find_metadata(&document, "Prints:").or_else(|| find_metadata(&document, "Print:")),
         audios: find_metadata(&document, "Audios:"),
         poster_url,
+        duration: None,
         genres,
         seasons,
     })
@@ -265,6 +266,7 @@ pub fn details_to_moviebox_json(details: &MediaDetails) -> serde_json::Value {
         "stars": details.stars,
         "prints": details.prints,
         "audios": details.audios,
+        "duration": details.duration,
         "cover": { "url": details.poster_url },
         "genre": details.genres,
         "seasons": { "seasons": seasons }
@@ -473,21 +475,97 @@ fn detect_codec(value: &str) -> Option<String> {
 
 fn detect_language(value: &str) -> Option<String> {
     let lower = value.to_ascii_lowercase();
-    match (lower.contains("hindi"), lower.contains("english")) {
-        (true, true) => Some("Hindi, English".into()),
-        (true, false) => Some("Hindi".into()),
-        (false, true) => Some("English".into()),
-        _ if lower.contains("dual audio") => Some("Dual Audio".into()),
-        _ if lower.contains("multi audio") || lower.contains("multi-audio") => {
-            Some("Multi Audio".into())
+
+    let lang_patterns: &[(&[&str], &str)] = &[
+        (&["hindi", "hin"], "Hindi"),
+        (&["english", "eng"], "English"),
+        (&["tamil", "tam"], "Tamil"),
+        (&["telugu", "tel"], "Telugu"),
+        (&["kannada", "kan"], "Kannada"),
+        (&["malayalam", "mal"], "Malayalam"),
+        (&["bengali", "ben", "bangla"], "Bengali"),
+        (&["marathi", "mar"], "Marathi"),
+        (&["punjabi", "pan", "pun"], "Punjabi"),
+        (&["gujarati", "guj"], "Gujarati"),
+        (&["urdu", "urd"], "Urdu"),
+        (&["japanese", "jap", "jpn"], "Japanese"),
+        (&["korean", "kor"], "Korean"),
+        (&["chinese", "chi", "mandarin", "cantonese"], "Chinese"),
+        (&["spanish", "spa", "esp", "castilian"], "Spanish"),
+        (&["french", "fre", "fra"], "French"),
+        (&["german", "ger", "deu"], "German"),
+        (&["italian", "ita"], "Italian"),
+        (&["portuguese", "por"], "Portuguese"),
+        (&["russian", "rus"], "Russian"),
+        (&["arabic", "ara"], "Arabic"),
+        (&["turkish", "tur"], "Turkish"),
+        (&["thai"], "Thai"),
+        (&["indonesian", "ind"], "Indonesian"),
+        (&["vietnamese", "vie"], "Vietnamese"),
+        (&["polish", "pol"], "Polish"),
+        (&["dutch", "dut", "nld"], "Dutch"),
+        (&["swedish", "swe"], "Swedish"),
+        (&["danish", "dan"], "Danish"),
+        (&["norwegian", "nor"], "Norwegian"),
+        (&["finnish", "fin"], "Finnish"),
+    ];
+
+    let mut found_langs: Vec<(usize, &str)> = Vec::new();
+
+    for (patterns, lang_name) in lang_patterns {
+        for pattern in *patterns {
+            let mut search_idx = 0;
+            while let Some(pos) = lower[search_idx..].find(pattern) {
+                let actual_pos = search_idx + pos;
+                let end_pos = actual_pos + pattern.len();
+
+                let prev_ok = actual_pos == 0
+                    || lower
+                        .get(..actual_pos)
+                        .and_then(|s| s.chars().last())
+                        .is_none_or(|c| !c.is_alphabetic());
+                let next_ok = end_pos >= lower.len()
+                    || lower
+                        .get(end_pos..)
+                        .and_then(|s| s.chars().next())
+                        .is_none_or(|c| !c.is_alphabetic());
+
+                if prev_ok && next_ok {
+                    if !found_langs.iter().any(|(_, name)| *name == *lang_name) {
+                        found_langs.push((actual_pos, lang_name));
+                    }
+                    break;
+                }
+                search_idx = actual_pos + 1;
+            }
         }
-        _ => None,
+    }
+
+    if !found_langs.is_empty() {
+        found_langs.sort_by_key(|(pos, _)| *pos);
+        let joined = found_langs
+            .into_iter()
+            .map(|(_, name)| name)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Some(joined);
+    }
+
+    if lower.contains("multi audio") || lower.contains("multi-audio") {
+        Some("Multi Audio".into())
+    } else if lower.contains("dual audio") || lower.contains("dual-audio") {
+        Some("Dual Audio".into())
+    } else {
+        None
     }
 }
 
 fn normalize_language_label(value: &str) -> Option<String> {
+    if let Some(detected) = detect_language(value) {
+        return Some(detected);
+    }
     let value = value
-        .split(['|', '/', '+'])
+        .split(['|', '/', '+', ','])
         .map(str::trim)
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()

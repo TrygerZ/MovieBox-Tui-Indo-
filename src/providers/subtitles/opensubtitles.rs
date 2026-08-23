@@ -992,16 +992,14 @@ mod tests {
                     }
                     req.extend_from_slice(&chunk[..n]);
                     if need.is_none()
-                        && let Some(pos) =
-                            req.windows(4).position(|w| w == b"\r\n\r\n")
+                        && let Some(pos) = req.windows(4).position(|w| w == b"\r\n\r\n")
                     {
                         let content_length = String::from_utf8_lossy(&req[..pos])
                             .lines()
                             .find_map(|line| {
                                 let (k, v) = line.split_once(':')?;
-                                k.eq_ignore_ascii_case("content-length").then(|| {
-                                    v.trim().parse::<usize>().ok()
-                                })?
+                                k.eq_ignore_ascii_case("content-length")
+                                    .then(|| v.trim().parse::<usize>().ok())?
                             })
                             .unwrap_or(0);
                         need = Some(pos + 4 + content_length);

@@ -25,7 +25,7 @@ body:
     id: version
     attributes:
       label: Version
-      description: Find it with `cargo install --list`.
+      description: Find it with `moviebox-tui --version`.
       placeholder: "0.1.2"
     validations:
       required: true

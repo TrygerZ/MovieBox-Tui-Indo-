@@ -17,6 +17,7 @@ use tokio::io::AsyncWriteExt;
 const MAX_ATTEMPTS: usize = 4;
 const SEGMENT_THRESHOLD: u64 = 32 * 1024 * 1024;
 const MAX_SEGMENTS: usize = 8;
+pub const DEFAULT_STREAM_NAME: &str = "MovieBox-Tui_Stream";
 
 pub fn safe_file_stem(value: &str) -> String {
     let mut stem = value
@@ -24,7 +25,6 @@ pub fn safe_file_stem(value: &str) -> String {
         .take(120)
         .map(|character| {
             if character.is_control()
-                || character.is_whitespace()
                 || matches!(
                     character,
                     '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'
@@ -38,7 +38,7 @@ pub fn safe_file_stem(value: &str) -> String {
         .collect::<String>();
     stem = stem.trim_matches(['.', ' ', '_']).to_string();
     if stem.is_empty() {
-        return "MovieBox-Tui_Stream".into();
+        return DEFAULT_STREAM_NAME.into();
     }
     let upper = stem.to_ascii_uppercase();
     let reserved = matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
@@ -271,8 +271,8 @@ where
                 return Ok(DownloadOutcome::Paused { bytes: downloaded });
             }
 
-            match response.chunk().await {
-                Ok(Some(chunk)) => {
+            match tokio::time::timeout(Duration::from_secs(30), response.chunk()).await {
+                Ok(Ok(Some(chunk))) => {
                     file.write_all(&chunk).await?;
                     downloaded += chunk.len() as u64;
                     if last_report.elapsed() >= Duration::from_millis(200) {
@@ -292,7 +292,7 @@ where
                         last_report = Instant::now();
                     }
                 }
-                Ok(None) => {
+                Ok(Ok(None)) => {
                     file.flush().await?;
                     file.sync_data().await?;
                     if let Some(expected) = metadata.total
@@ -319,9 +319,14 @@ where
                     finalize(&partial, &metadata_path, destination).await?;
                     return Ok(DownloadOutcome::Completed { bytes: downloaded });
                 }
-                Err(error) => {
+                Ok(Err(error)) => {
                     file.flush().await?;
                     last_error = Some(DownloadError::Network(error));
+                    break;
+                }
+                Err(_) => {
+                    file.flush().await?;
+                    last_error = Some(DownloadError::InvalidRange("read timeout".into()));
                     break;
                 }
             }
@@ -366,8 +371,7 @@ where
     }
 
     let downloaded = Arc::new(AtomicU64::new(initial));
-    let (progress_sender, mut progress_receiver) =
-        tokio::sync::mpsc::unbounded_channel::<(u64, usize)>();
+    let (progress_sender, mut progress_receiver) = tokio::sync::mpsc::channel::<(u64, usize)>(64);
     let mut tasks = tokio::task::JoinSet::new();
     let validator = metadata.etag.clone().or(metadata.last_modified.clone());
 
@@ -495,7 +499,7 @@ async fn download_segment(
     total: u64,
     validator: Option<String>,
     cancel: Arc<AtomicBool>,
-    progress: tokio::sync::mpsc::UnboundedSender<(u64, usize)>,
+    progress: tokio::sync::mpsc::Sender<(u64, usize)>,
 ) -> Result<(), DownloadError> {
     let expected = end - start + 1;
     let mut last_error = None;
@@ -555,20 +559,20 @@ async fn download_segment(
                 file.flush().await?;
                 return Err(DownloadError::Paused);
             }
-            match response.chunk().await {
-                Ok(Some(chunk)) => {
+            match tokio::time::timeout(Duration::from_secs(30), response.chunk()).await {
+                Ok(Ok(Some(chunk))) => {
                     let remaining = expected - written;
                     let bytes = chunk.len().min(remaining as usize);
                     file.write_all(&chunk[..bytes]).await?;
                     written += bytes as u64;
-                    progress.send((bytes as u64, attempt)).ok();
+                    let _ = progress.send((bytes as u64, attempt)).await;
                     if written == expected {
                         file.flush().await?;
                         file.sync_data().await?;
                         return Ok(());
                     }
                 }
-                Ok(None) => {
+                Ok(Ok(None)) => {
                     file.flush().await?;
                     last_error = Some(DownloadError::Incomplete {
                         downloaded: written,
@@ -576,9 +580,14 @@ async fn download_segment(
                     });
                     break;
                 }
-                Err(error) => {
+                Ok(Err(error)) => {
                     file.flush().await?;
                     last_error = Some(DownloadError::Network(error));
+                    break;
+                }
+                Err(_) => {
+                    file.flush().await?;
+                    last_error = Some(DownloadError::InvalidRange("read timeout".into()));
                     break;
                 }
             }
@@ -622,15 +631,18 @@ fn segment_path(destination: &Path, index: usize) -> PathBuf {
 }
 
 fn metadata_matches(previous: &ResumeMetadata, current: &ResumeMetadata) -> bool {
-    previous.total == current.total
-        && previous.segments == current.segments
-        && match (&previous.etag, &current.etag) {
-            (Some(previous), Some(current)) => previous == current,
-            _ => match (&previous.last_modified, &current.last_modified) {
-                (Some(previous), Some(current)) => previous == current,
-                _ => true,
-            },
-        }
+    if previous.total != current.total || previous.segments != current.segments {
+        return false;
+    }
+
+    if let (Some(a), Some(b)) = (&previous.etag, &current.etag) {
+        return a == b;
+    }
+
+    match (&previous.last_modified, &current.last_modified) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
 }
 
 async fn remove_segment_files(destination: &Path) {
@@ -768,7 +780,9 @@ mod tests {
                     }
                 };
                 let mut buf = [0u8; 8192];
-                let Ok(n) = stream.read(&mut buf) else { continue };
+                let Ok(n) = stream.read(&mut buf) else {
+                    continue;
+                };
                 let request = String::from_utf8_lossy(&buf[..n]).to_string();
                 let (head, body) = responder(&request);
                 let _ = stream.write_all(head.as_bytes());
@@ -934,5 +948,43 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_parse_content_range_valid() {
+        let (start, total) = parse_content_range("bytes 0-1023/2048").unwrap();
+        assert_eq!(start, 0);
+        assert_eq!(total, Some(2048));
+
+        let (start, total) = parse_content_range("bytes 500-999/*").unwrap();
+        assert_eq!(start, 500);
+        assert_eq!(total, None);
+    }
+
+    #[test]
+    fn test_parse_content_range_invalid() {
+        assert!(parse_content_range("invalid range").is_err());
+        assert!(parse_content_range("bytes invalid").is_err());
+    }
+
+    #[test]
+    fn test_segment_ranges_partitioning() {
+        let total = 1000;
+        let ranges = segment_ranges(total, 4);
+        assert_eq!(ranges.len(), 4);
+        assert_eq!(ranges[0], (0, 249));
+        assert_eq!(ranges[1], (250, 499));
+        assert_eq!(ranges[2], (500, 749));
+        assert_eq!(ranges[3], (750, 999));
+    }
+
+    #[test]
+    fn test_safe_file_stem_windows_reserved() {
+        assert_eq!(safe_file_stem("CON"), "CON_");
+        assert_eq!(safe_file_stem("AUX"), "AUX_");
+        assert_eq!(
+            safe_file_stem("Normal Title: Special"),
+            "Normal Title_ Special"
+        );
     }
 }
