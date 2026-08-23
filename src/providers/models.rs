@@ -2,20 +2,35 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
     #[default]
+    #[serde(rename = "moviebox", alias = "movie_box")]
     MovieBox,
+    #[serde(rename = "fourkhdhub", alias = "four_k_hd_hub", alias = "4khdhub")]
     FourKHdHub,
+    #[serde(rename = "bdix_circleftp", alias = "bdix_circle_ftp")]
+    BdixCircleFtp,
+    #[serde(rename = "bdix_dhakaflix", alias = "bdix_dhaka_flix")]
+    BdixDhakaFlix,
+    #[serde(rename = "addons", alias = "addon")]
+    Addons,
 }
 
 impl ProviderKind {
-    pub const ENABLED: [Self; 2] = [Self::MovieBox, Self::FourKHdHub];
+    pub const ENABLED: [Self; 4] = [
+        Self::MovieBox,
+        Self::FourKHdHub,
+        Self::BdixCircleFtp,
+        Self::BdixDhakaFlix,
+    ];
 
     pub const fn cache_key(self) -> &'static str {
         match self {
             Self::MovieBox => "moviebox",
             Self::FourKHdHub => "fourkhdhub",
+            Self::BdixCircleFtp => "bdix_circleftp",
+            Self::BdixDhakaFlix => "bdix_dhakaflix",
+            Self::Addons => "addons",
         }
     }
 
@@ -23,7 +38,25 @@ impl ProviderKind {
         match self {
             Self::MovieBox => "MovieBox",
             Self::FourKHdHub => "4KHDHub",
+            Self::BdixCircleFtp => "CircleFTP (BDIX)",
+            Self::BdixDhakaFlix => "DhakaFlix (BDIX)",
+            Self::Addons => "Addons",
         }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "moviebox" => Some(Self::MovieBox),
+            "4khdhub" | "fourkhdhub" => Some(Self::FourKHdHub),
+            "bdix_circleftp" | "circleftp (bdix)" => Some(Self::BdixCircleFtp),
+            "bdix_dhakaflix" | "dhakaflix (bdix)" => Some(Self::BdixDhakaFlix),
+            "addons" | "addon" => Some(Self::Addons),
+            _ => None,
+        }
+    }
+
+    pub const fn is_bdix(self) -> bool {
+        matches!(self, Self::BdixCircleFtp | Self::BdixDhakaFlix)
     }
 }
 
@@ -89,6 +122,7 @@ pub struct MediaDetails {
     pub prints: Option<String>,
     pub audios: Option<String>,
     pub poster_url: Option<String>,
+    pub duration: Option<String>,
     pub genres: Vec<String>,
     pub seasons: Vec<Season>,
 }
@@ -99,6 +133,12 @@ pub struct SourceMirror {
     pub resolver_url: String,
     pub headers: Vec<(String, String)>,
     pub direct_file: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubtitleOption {
+    pub name: String,
+    pub url: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

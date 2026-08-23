@@ -2,315 +2,243 @@
 
 # MovieBox-TUI
 
-**Stream movies, shows, anime, and live TV from your terminal.** <br>
-Fast and clean. No configuration, no torrents, and no debrid required.
+Watch and download movies, TV shows, anime, and live TV right in your terminal — without opening a browser.
 
 [![Crates.io](https://img.shields.io/crates/v/moviebox-tui.svg?logo=rust)](https://crates.io/crates/moviebox-tui)
-[![Downloads](https://img.shields.io/crates/d/moviebox-tui.svg)](https://crates.io/crates/moviebox-tui)
-[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
-[![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg?logo=rust)](#requirements)
-
-<br>
-
-<img src="https://raw.githubusercontent.com/mesamirh/MovieBox-Tui/main/assets/screenshots/01-home-blocky.jpg" alt="MovieBox-TUI Home" width="85%">
-
-**[See what's new in v0.1.7 on YouTube](https://youtu.be/5M2_mjH5r5Y)**
-
-<sub>Found a bug? [Open an issue](https://github.com/mesamirh/MovieBox-Tui/issues) so I can fix it for everyone!</sub>
+[![Crates.io Downloads](https://img.shields.io/crates/d/moviebox-tui.svg)](https://crates.io/crates/moviebox-tui)
+[![CI](https://github.com/mesamirh/MovieBox-Tui/actions/workflows/ci.yml/badge.svg)](https://github.com/mesamirh/MovieBox-Tui/actions/workflows/ci.yml)
+[![License](https://img.shields.io/crates/l/moviebox-tui.svg)](#license)
 
 </div>
 
+https://github.com/user-attachments/assets/60b5fab9-cf7a-4a59-9bbf-b2357c345091
 
-## Screenshots
+## Why MovieBox-TUI?
 
-<details>
-<summary><b>Movie & Series Details</b></summary><br>
-<p align="center">
-  <img src="https://raw.githubusercontent.com/mesamirh/MovieBox-Tui/main/assets/screenshots/07-movie-details.jpg" alt="Movie Details" width="49%">
-  <img src="https://raw.githubusercontent.com/mesamirh/MovieBox-Tui/main/assets/screenshots/08-series-details.jpg" alt="Series Details" width="49%">
-</p>
-</details>
+Searching and watching media through web browsers often means dealing with heavy memory usage from multiple open tabs, intrusive popups, tracking scripts, and clunky web players.
 
-<details>
-<summary><b>Search & Downloads</b></summary><br>
-<p align="center">
-  <img src="https://raw.githubusercontent.com/mesamirh/MovieBox-Tui/main/assets/screenshots/06-search-results.jpg" alt="Search Results" width="49%">
-  <img src="https://raw.githubusercontent.com/mesamirh/MovieBox-Tui/main/assets/screenshots/12-download-progress.jpg" alt="Download Progress" width="49%">
-</p>
-</details>
+**MovieBox-TUI replaces the web browser workflow with a lightweight terminal interface.** It extracts stream links directly and launches them in your preferred local media player (`mpv`, `VLC`, or `IINA`), with no ads or popups inside the application.
 
-<details>
-<summary><b>Playback & Subtitles</b></summary><br>
-<p align="center">
-  <img src="https://raw.githubusercontent.com/mesamirh/MovieBox-Tui/main/assets/screenshots/11-player-picker.jpg" alt="Media Player Selection" width="49%">
-  <img src="https://raw.githubusercontent.com/mesamirh/MovieBox-Tui/main/assets/screenshots/10-playback-subtitles.jpg" alt="Subtitle Language Selection" width="49%">
-</p>
-</details>
+### Quick Comparison
 
-<details>
-<summary><b>Live TV Experience</b></summary><br>
-<p align="center">
-  <img src="https://raw.githubusercontent.com/mesamirh/MovieBox-Tui/main/assets/screenshots/09-live-tv-list.jpg" alt="Live TV Channels" width="49%">
-  <img src="https://raw.githubusercontent.com/mesamirh/MovieBox-Tui/main/assets/screenshots/05-tv-help.jpg" alt="Live TV Configuration" width="49%">
-</p>
-</details>
+| Feature | Streaming in a Web Browser | MovieBox-TUI in Your Terminal |
+| :--- | :--- | :--- |
+| **Resource Usage** | Heavy browser process overhead | **~5 MB RAM (no web engine required)** |
+| **In-App Experience** | Popups, redirects, and tracking scripts | **No ads or popups inside the application** |
+| **Video Player** | Browser web player | **Direct playback in mpv, VLC, or IINA** |
+| **Account &amp; Login** | Forced account creation &amp; signups | **No account or login required** |
+| **Subtitles** | Manual search and file renaming | **Automatic subtitle downloads in your language** |
+| **Downloads** | Manual single-file downloads | **1-click full season batch downloads** |
+| **File Organization** | Cluttered downloads folder | **Clean, organized Movies and Series folders** |
 
-<details>
-<summary><b>Home Themes</b></summary><br>
-<p align="center">
-  <img src="https://raw.githubusercontent.com/mesamirh/MovieBox-Tui/main/assets/screenshots/03-home-3d.jpg" alt="3D Block Theme" width="49%">
-  <img src="https://raw.githubusercontent.com/mesamirh/MovieBox-Tui/main/assets/screenshots/02-home-ascii.jpg" alt="Minimal ASCII Theme" width="49%">
-</p>
-</details>
+## Features at a Glance
 
-<details>
-<summary><b>Help & Configuration</b></summary><br>
-<p align="center">
-  <img src="https://raw.githubusercontent.com/mesamirh/MovieBox-Tui/main/assets/screenshots/04-global-help.jpg" alt="Global Help Menu" width="85%">
-</p>
-</details>
-
-
-## Features
-
-### Streaming & Playback
-- **Instant Search & Catalogs:** Type to search instantly, or browse trending movies, shows, and anime using slash commands (e.g., `/movies`, `/anime`).
-- **Seamless Local Playback:** Resolves 4K/1080p streams and opens them instantly in your preferred local video player (`mpv`, `IINA`, or `VLC`).
-- **Integrated Subtitles:** Automatically fetches available subtitles — built-in source, then SubDL, then OpenSubtitles — and lets you select your preferred language before playback.
-- **Live IPTV:** Press `Ctrl+T` to toggle Live TV mode and stream thousands of live television channels globally.
-
-### Advanced Downloading
-- **Batch Season Downloader:** Queue up entire television seasons for concurrent downloading with a single keystroke.
-- **Resilient Downloads:** Built-in support for download resumes. If a download is interrupted or fails, it picks up right where it left off.
-- **Auto-Subtitle Fetching:** Automatically downloads the best-matching `.srt` subtitle files alongside your video files.
-
-### Terminal Experience
-- **Native Image Rendering:** Enjoy high-resolution movie posters rendered directly in supported terminals.
-- **Dynamic Theming:** Switch between beautiful 3D block layouts and clean ASCII themes to fit your aesthetic.
-- **Power-User Slash Commands:** Use terminal-style commands to update the app (`/update`), switch categories, or customize your Live TV playlists (`/config`).
-- **Smart Auto-Cleanup:** A silent background worker intelligently manages and deletes old cache files to protect your disk space.
-
+- **Search Everything:** Find movies, TV shows, anime, and live TV channels across multiple sources (MovieBox, 4KHDHub, BDIX mirrors, community HTTP addons, and custom IPTV playlists).
+- **Addon Mode:** Install community HTTP addon manifests for custom catalog metadata (Cinemeta, Anime Kitsu) and direct stream resolution.
+- **Smooth Video Playback:** Plays directly in **mpv**, **VLC**, or **IINA** using your computer's hardware for smooth video.
+- **Easy Downloads:** Download single episodes or entire seasons with one keypress. Completed episodes are skipped automatically.
+- **Simple Terminal Interface:** Full keyboard and mouse support, beautiful color themes, and movie poster art.
 
 ## Installation
 
-**Prerequisites:** You will need a terminal (at least 85×24 characters) and a local video player installed (e.g. `mpv`, `IINA`, or `VLC`).
+A media player (**[mpv](https://mpv.io)**, **[VLC](https://www.videolan.org/vlc/)**, or **[IINA](https://iina.io)**) is recommended for video playback.
 
-The easiest way to get started is by using our quick install scripts. These scripts will automatically download the correct version for your computer.
+### macOS
 
-### Homebrew (macOS & Linux)
+Using **Homebrew**:
 ```bash
 brew tap mesamirh/moviebox-tui https://github.com/mesamirh/MovieBox-Tui
-brew install moviebox-tui
+brew install mesamirh/moviebox-tui/moviebox-tui
 ```
 
-### Install Script (macOS & Linux)
+Or using the automated installer:
 ```bash
-curl -fsSL https://raw.githubusercontent.com/mesamirh/MovieBox-Tui/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/mesamirh/MovieBox-Tui/main/install.sh -o install.sh && bash install.sh
 ```
+
+*(Or download the prebuilt `MovieBox_macOS_Universal.tar.gz` from [GitHub Releases](https://github.com/mesamirh/MovieBox-Tui/releases/latest))*
+
+---
+
+### Linux
+
+Using the automated installer (installs prebuilt static binary to `~/.local/bin`):
+```bash
+curl -fsSL https://raw.githubusercontent.com/mesamirh/MovieBox-Tui/main/install.sh -o install.sh && bash install.sh
+```
+
+Or manual installation:
+```bash
+curl -LO https://github.com/mesamirh/MovieBox-Tui/releases/latest/download/MovieBox_Linux_x64.tar.gz
+tar -xzf MovieBox_Linux_x64.tar.gz
+mkdir -p ~/.local/bin && mv moviebox-tui ~/.local/bin/
+```
+
+---
 
 ### Windows
+
+Using **PowerShell**:
 ```powershell
-powershell -c "irm https://raw.githubusercontent.com/mesamirh/MovieBox-Tui/main/install.ps1 | iex"
+irm https://raw.githubusercontent.com/mesamirh/MovieBox-Tui/main/install.ps1 | iex
 ```
 
-### Cargo (For Rust Developers)
+Or manual installation:
+1. Download `MovieBox_Windows_x64.zip` (or `MovieBox_Windows_arm64.zip`) from [GitHub Releases](https://github.com/mesamirh/MovieBox-Tui/releases/latest).
+2. Extract the archive and place `moviebox-tui.exe` in your PATH (e.g. `%LOCALAPPDATA%\Programs\MovieBox-Tui\bin`).
+
+*(Note: If Windows SmartScreen displays an "Unknown Publisher" prompt on first launch, click **More info** → **Run anyway**)*
+
+---
+
+### Android (Termux)
+
+Using the automated installer (installs prebuilt static ARM64 binary into `$PREFIX/bin`):
 ```bash
-cargo install moviebox-tui
+curl -fsSL https://raw.githubusercontent.com/mesamirh/MovieBox-Tui/main/install.sh -o install.sh && bash install.sh
+termux-setup-storage
 ```
+
+*(Or compile natively via Cargo: `pkg install rust && cargo install moviebox-tui --locked`)*
+
+---
 
 <details>
-<summary><i>Need to uninstall?</i></summary>
+<summary><b>From Source / Cargo (Developers)</b></summary>
 
-- **Homebrew:** `brew uninstall moviebox-tui && brew untap mesamirh/moviebox-tui`
-- **Mac/Linux:** `sudo rm -f /usr/local/bin/moviebox-tui`
-- **Windows:** `Remove-Item -Recurse -Force $env:USERPROFILE\AppData\Local\MovieBox-Tui`
-- **Cargo:** `cargo uninstall moviebox-tui`
-</details>
-
-
-
-## Getting Started
-
-Once installed, just open your terminal and type `moviebox-tui` to jump in!
-
-### OpenSubtitles (Optional)
-
-When a movie or episode has no Indonesian subtitle from the built-in source,
-`moviebox-tui` can look up subtitles from the official
-[OpenSubtitles](https://opensubtitles.com) API. Configure it with environment
-variables (bring your own API key):
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `MOVIEBOX_OPENSUBTITLES_API_KEY` | OpenSubtitles API key (required for this feature) | *(empty)* |
-| `MOVIEBOX_OPENSUBTITLES_USERNAME` | OpenSubtitles username (optional) | *(empty)* |
-| `MOVIEBOX_OPENSUBTITLES_PASSWORD` | OpenSubtitles password (optional) | *(empty)* |
-| `MOVIEBOX_OPENSUBTITLES_ENABLED` | Enable/disable the OpenSubtitles fallback | `true` |
-| `MOVIEBOX_OPENSUBTITLES_LANGUAGES` | Comma-separated subtitle languages to search | `id,en` |
-| `MOVIEBOX_OPENSUBTITLES_BASE_URL` | Override the OpenSubtitles API base URL | *(official API)* |
-
-> **Note:** OpenSubtitles enforces a limited free-tier quota. The remaining
-> daily downloads are shown right in the subtitle picker, and the automatic
-> lookup is skipped when the quota is low or exhausted so manual picks stay
-> available. Rate-limited requests (HTTP 429) are retried automatically, and
-> API errors are reported in plain language. When no env vars are set, behavior
-> is unchanged — playback and downloads proceed without the OpenSubtitles
-> fallback. Searches and downloads are cached locally to avoid wasting quota.
-
-### SubDL (Optional)
-
-Before falling back to OpenSubtitles, `moviebox-tui` first tries the free
-[SubDL](https://subdl.com) provider, so your OpenSubtitles quota is preserved
-whenever a match exists. It needs its own (free) API key:
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `MOVIEBOX_SUBDL_API_KEY` | SubDL API key (required for this feature) | *(empty)* |
-| `MOVIEBOX_SUBDL_ENABLED` | Enable/disable the SubDL fallback | `true` |
-| `MOVIEBOX_SUBDL_LANGUAGES` | Comma-separated subtitle languages to search | `id,en` |
-| `MOVIEBOX_SUBDL_BASE_URL` | Override the SubDL API base URL | *(official API)* |
-
-> **Note:** SubDL is tried before OpenSubtitles, so any match found there never
-> consumes the OpenSubtitles quota. When no API key is set, the provider is
-> disabled and playback falls back to OpenSubtitles as usual. Subtitle searches
-> and downloads are cached locally; downloads arrive as ZIP archives that are
-> extracted automatically.
-
-### Embedded Subtitles (Optional)
-
-MKV/MP4 streams may carry subtitles baked into the file. When a stream has no
-external subtitle, `moviebox-tui` shows a hint based on the file extension, and
-can optionally probe the stream with `ffprobe` (if installed) to report the
-embedded tracks. Playback is never changed — your player auto-loads them.
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `MOVIEBOX_PROBE_EMBEDDED_SUBTITLES` | Probe streams with `ffprobe` to list embedded subtitle tracks | `false` |
-
-### Keyboard Controls
-
-<table>
-  <tr>
-    <th align="left">Key</th>
-    <th align="left">Action</th>
-  </tr>
-  <tr>
-    <td>Alphanumeric</td>
-    <td>Start searching instantly</td>
-  </tr>
-  <tr>
-    <td><kbd>↑</kbd> <kbd>↓</kbd> <kbd>←</kbd> <kbd>→</kbd></td>
-    <td>Navigate menus and grids</td>
-  </tr>
-  <tr>
-    <td><kbd>Enter</kbd></td>
-    <td>View details, pick episodes, or play video</td>
-  </tr>
-  <tr>
-    <td><kbd>o</kbd></td>
-    <td>Switch to a different video player on playback</td>
-  </tr>
-  <tr>
-    <td><kbd>d</kbd></td>
-    <td>Download an episode or an entire season</td>
-  </tr>
-  <tr>
-    <td><kbd>Ctrl</kbd>+<kbd>p</kbd></td>
-    <td>Switch between different content providers / sources</td>
-  </tr>
-  <tr>
-    <td><kbd>Ctrl</kbd>+<kbd>t</kbd></td>
-    <td>Toggle Live TV mode to browse IPTV channels</td>
-  </tr>
-  <tr>
-    <td><kbd>?</kbd></td>
-    <td>Open the global help menu</td>
-  </tr>
-  <tr>
-    <td><kbd>q</kbd></td>
-    <td>Quit (or use <kbd>Esc</kbd> to go back/clear search)</td>
-  </tr>
-</table>
-
-### Slash Commands
-You can type these special commands straight into the search bar:
-
-<table>
-  <tr>
-    <th align="left">Command</th>
-    <th align="left">Category</th>
-    <th align="left">Description</th>
-  </tr>
-  <tr>
-    <td><code>/discover</code> or <code>/home</code></td>
-    <td>Streaming</td>
-    <td>See what's trending right now</td>
-  </tr>
-  <tr>
-    <td><code>/movies</code>, <code>/shows</code>, <code>/anime</code></td>
-    <td>Streaming</td>
-    <td>Jump straight to a specific category</td>
-  </tr>
-  <tr>
-    <td><code>/list</code></td>
-    <td>Live TV</td>
-    <td>Show the list of available live channels</td>
-  </tr>
-  <tr>
-    <td><code>/config</code></td>
-    <td>Live TV</td>
-    <td>Open the TV configuration menu to add your own m3u playlists</td>
-  </tr>
-  <tr>
-    <td><code>/update</code></td>
-    <td>General</td>
-    <td>Check to see if there's a new version of the app</td>
-  </tr>
-  <tr>
-    <td><code>/toggle-update</code></td>
-    <td>General</td>
-    <td>Turn automatic background update checking on or off</td>
-  </tr>
-</table>
-
-
-## Contributing
-
-I'd love your help making this even better! If you've got a big feature in mind, it's usually best to open an issue first so we can chat about it.
+```bash
+cargo install moviebox-tui --locked
+```
 
 ```bash
 git clone https://github.com/mesamirh/MovieBox-Tui.git
 cd MovieBox-Tui
-cargo build
+cargo build --release --locked
 ```
 
-Just try to follow [Conventional Commits](https://www.conventionalcommits.org/) and make sure `cargo fmt` and `cargo clippy` are happy before you open a PR. You can check out [CONTRIBUTING.md](CONTRIBUTING.md) for the full rundown.
+</details>
 
+<details>
+<summary><b>Verify Release Integrity & Provenance</b></summary>
 
-## Credits & Legal
+```bash
+sha256sum -c SHA256SUMS --ignore-missing
+```
 
-Live TV channel playlists are graciously provided by [iptv-org/iptv](https://github.com/iptv-org/iptv).
+```bash
+gh attestation verify <archive-file> -R mesamirh/MovieBox-Tui
+```
 
-> **Disclaimer:** This is a third-party client. It does not host or store any media and only resolves links from upstream APIs. Intended for personal use only.
+</details>
 
+## Usage
 
-## Community & Support
+Start the app:
 
-The best way to support MovieBox-TUI is simply to use it, share it, and leave a star on GitHub!
+```bash
+moviebox-tui
+```
 
-If you'd like to buy me a coffee for the late nights spent coding, you can use the addresses below.
+- **Interactive Help:** Press `?` inside the app anytime to view all keyboard shortcuts and mouse actions.
+- **Mouse & Keyboard:** Full mouse navigation and keyboard controls are supported throughout the application.
+- **Full Reference:** See [Controls & Shortcuts](docs/controls.md) for the complete list of keybindings and slash commands.
 
-- **EVM:** `0x7ea20d5fa29d87f33195f5a3b211ff94038d794c`
-- **BTC:** `3MEAtqtRWrQBhnaMi3Zuf5nt2efNUS2LUQ`
-- **LTC:** `ltc1qhjkq2n6tsayxj56n3c53uqv23v8vqhvc9g3vxl`
+## Indonesian Subtitles (SubDL → OpenSubtitles Fallback)
 
----
+This fork adds automatic Indonesian subtitle support on top of upstream:
 
-<div align="center">
+- **Built-in → SubDL → OpenSubtitles** fallback chain. When no built-in subtitle is available, SubDL is tried first to preserve your OpenSubtitles quota; OpenSubtitles is the final fallback.
+- **Local caching** (30-day TTL, `subdl-` prefix) avoids burning quota on repeated plays; Windows-safe cache keys.
+- **Quota-aware**: remaining downloads are shown in the picker; auto-lookup is skipped once low/exhausted (warns once per value) so manual picks stay available.
+- **Hardening**: retry on HTTP 429 with `Retry-After`, 403 User-Agent fallback, `looks_like_subtitle` guard against ZIP/GZIP bodies, body-size cap 50 MB.
 
-Dual-licensed under [MIT](LICENSE-MIT) or [Apache 2.0](LICENSE-APACHE) at your option.<br>
-Built by [**@mesamirh**](https://github.com/mesamirh)
+### OpenSubtitles (Optional)
 
-<sub>Not affiliated with any third-party content providers or operators.</sub>
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `MOVIEBOX_OPENSUBTITLES_API_KEY` | OpenSubtitles API key (required) | *(empty)* |
+| `MOVIEBOX_OPENSUBTITLES_USERNAME` | Username (optional) | *(empty)* |
+| `MOVIEBOX_OPENSUBTITLES_PASSWORD` | Password (optional) | *(empty)* |
+| `MOVIEBOX_OPENSUBTITLES_ENABLED` | Enable/disable fallback | `true` |
+| `MOVIEBOX_OPENSUBTITLES_LANGUAGES` | Languages to search | `id,en` |
+| `MOVIEBOX_OPENSUBTITLES_BASE_URL` | Override API base URL | *(official API)* |
 
-</div>
+### SubDL (Optional)
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `MOVIEBOX_SUBDL_API_KEY` | SubDL API key (required) | *(empty)* |
+| `MOVIEBOX_SUBDL_ENABLED` | Enable/disable fallback | `true` |
+| `MOVIEBOX_SUBDL_LANGUAGES` | Languages to search | `id,en` |
+| `MOVIEBOX_SUBDL_BASE_URL` | Override API base URL | *(official API)* |
+
+Configure via `.env` (loaded by `dotenvy`; real env vars take precedence) or shell env:
+
+```bash
+cp .env.example .env
+# edit .env with your keys
+moviebox-tui
+```
+
+### Embedded Subtitles (Optional)
+
+MKV/MP4 streams may carry embedded subs. When no external subtitle matches, the player shows a hint (`press j` in mpv) and, if `MOVIEBOX_PROBE_EMBEDDED_SUBTITLES=1` and `ffprobe` is installed, lists embedded tracks (no greedy probe by default; playback is never blocked).
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `MOVIEBOX_PROBE_EMBEDDED_SUBTITLES` | Probe with `ffprobe` | `false` |
+
+> See `.env.example` for a full template. Upstream docs cover generic `MOVIEBOX_LOG`, `MOVIEBOX_THEME`, etc. in `docs/config.md`.
+
+## Documentation
+
+All in-depth guides and technical details are available in the [`docs/`](docs/) directory:
+
+- [Controls & Shortcuts](docs/controls.md) — Complete keyboard shortcuts, mouse actions, and slash commands
+- [Architecture & Data Flow](docs/architecture.md) — How the app works under the hood
+- [Media Players](docs/players.md) — Supported players, custom paths, and launch options
+- [Downloads & Organization](docs/downloads.md) — Folder layout, batch downloading, and subtitles
+- [Live TV & Playlists](docs/tv-mode.md) — How to add and manage custom M3U playlists
+- [Addon Mode & HTTP Addons](docs/addons-mode.md) — How to install and manage community HTTP addon manifests
+- [Configuration Reference](docs/config.md) — Config files and environment variables
+- [Providers](docs/providers.md) — Supported content sources and protocols
+- [Troubleshooting & Debugging](docs/debugging.md) — Fixing common issues and reporting bugs
+- [Testing & QA Architecture](docs/testing.md) — Testing philosophy, unit/integration suites, and QA guidelines
+- [Contributing Guide](CONTRIBUTING.md) — How to contribute code and submit PRs
+
+## Roadmap
+
+- [x] **Terminal UI (TUI):** Interactive terminal application with mouse and keyboard navigation, stream playback, and batch downloading.
+- [ ] **Command-Line Interface (CLI):** Direct command-line flags and arguments for headless searching, streaming, and scripted downloading.
+- [ ] **Desktop GUI Client:** Dedicated graphical desktop application powered by the same backend stream engine.
+
+## Feedback & Support
+
+If you find the project useful, here are a few simple ways to support it:
+
+- **Star the repository** on GitHub to help others discover it.
+- **Report bugs or request features** by opening an [issue](https://github.com/mesamirh/MovieBox-Tui/issues).
+- **Share the project** with friends, colleagues, or terminal enthusiasts.
+- **Contribute improvements** to scrapers, performance, or docs via [pull requests](CONTRIBUTING.md).
+
+<details>
+<summary><b>Optional Support</b></summary>
+
+If you would like to support ongoing development directly:
+
+| Network / Asset | Address |
+| :--- | :--- |
+| **USDT (TRC20)** | `TL4yW73qmbKZpBWwbEFgjBpwVkPDFTkJgV` |
+| **Bitcoin (BTC)** | `3MEAtqtRWrQBhnaMi3Zuf5nt2efNUS2LUQ` |
+| **Ethereum / EVM** | `0x7ea20d5fa29d87f33195f5a3b211ff94038d794c` |
+| **Solana (SOL)** | `6ctm5WFv73MNywoCKAz3xK72yizSspHa72rFNygooU6` |
+
+</details>
+
+## License
+
+Licensed under either [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
+
+## Disclaimer
+
+This project does not host or store any media. It is an independent client for playing publicly available streams. Users are responsible for complying with the laws of their country.

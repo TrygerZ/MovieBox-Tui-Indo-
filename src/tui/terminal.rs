@@ -9,6 +9,10 @@ pub fn uses_basic_ui() -> bool {
 }
 
 pub fn should_query_images() -> bool {
+    if std::env::var("MOVIEBOX_NO_IMAGE").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    {
+        return false;
+    }
     let term = env("TERM");
 
     term != "dumb" && term != "linux"
