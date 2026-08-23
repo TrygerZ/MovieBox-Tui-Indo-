@@ -258,10 +258,7 @@ impl App {
             | Action::OpenSubtitlesFailed { .. }
             | Action::SubdlReady { .. }
             | Action::SubdlFailed { .. } => {
-                // TODO(port-indosub): Wire Indo subtitle fallback (SubDL → OpenSubtitles)
-                // through handle_requests. Kept for fork compatibility; falls back to
-                // system handler which no-ops via wildcard.
-                self.handle_system(action).await;
+                self.handle_subtitles(action).await;
             }
         }
         None

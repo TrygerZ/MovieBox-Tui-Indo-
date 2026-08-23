@@ -333,13 +333,49 @@ impl App {
                                 }
                             }
                         };
+                        let subtitle_ctx = self.build_subtitle_context();
+                        let os_enabled =
+                            crate::providers::subtitles::opensubtitles::OpenSubtitlesConfig::from_env()
+                                .enabled();
+                        let os_auto_resolve = self.state.os_quota_gate(os_enabled).allows_resolve();
                         let sender = self.action_sender.clone();
                         tokio::spawn(async move {
                             match client.resolve_release(&release).await {
                                 Ok(source) => {
+                                    let resolved = if subtitle_url.is_some() {
+                                        subtitle_url
+                                    } else if os_enabled && os_auto_resolve {
+                                        match &subtitle_ctx {
+                                            Some(ctx) => {
+                                                crate::tui::app::subtitles::resolve_best_os_subtitle(
+                                                    ctx,
+                                                )
+                                                .await
+                                            }
+                                            None => None,
+                                        }
+                                    } else {
+                                        None
+                                    };
+                                    let resolved_none = resolved.is_none();
+                                    let notify_sender = sender.clone();
+                                    let url = source.url.clone();
                                     sender
-                                        .send(Action::StartDownload(subtitle_url, Some(source.url)))
+                                        .send(Action::StartDownload(resolved, Some(source.url)))
                                         .ok();
+                                    if resolved_none
+                                        && crate::tui::embedded::container_supports_embedded_subs(
+                                            &url,
+                                        )
+                                    {
+                                        notify_sender
+                                            .send(Action::Notify {
+                                                kind: crate::tui::overlay::NotificationKind::Info,
+                                                title: "Embedded subtitles".to_string(),
+                                                message: "The downloaded file may contain embedded subtitles (MKV/MP4) — select the subtitle track in your player.".to_string(),
+                                            })
+                                            .ok();
+                                    }
                                 }
                                 Err(error) => {
                                     log::error!("stream resolve failed: {error}");

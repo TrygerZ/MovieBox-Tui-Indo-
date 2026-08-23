@@ -500,8 +500,114 @@ impl App {
             }
             Action::ShowSubtitlePopup(link, ext_captions, open_with) => {
                 self.state.is_resolving_playback = false;
-                let options = crate::tui::state::caption_options(&ext_captions);
-
+                let mut options = vec![("None".to_string(), "".to_string())];
+                let mut has_indonesian = false;
+                if let Some(captions_list) =
+                    ext_captions.get("extCaptions").and_then(|c| c.as_array())
+                {
+                    for cap in captions_list {
+                        let name = cap
+                            .get("lanName")
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("Unknown")
+                            .to_string();
+                        let url = cap
+                            .get("url")
+                            .and_then(|u| u.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if !url.is_empty() {
+                            if crate::providers::subtitles::is_indonesian_label(&name) {
+                                has_indonesian = true;
+                            }
+                            options.push((name, url));
+                        }
+                    }
+                }
+                let subdl_enabled =
+                    crate::providers::subtitles::subdl::SubdlClient::from_env().enabled();
+                let os_enabled = !has_indonesian
+                    && crate::providers::subtitles::opensubtitles::OpenSubtitlesConfig::from_env()
+                        .enabled();
+                let os_auto_resolve = self.state.os_quota_gate(os_enabled).allows_resolve();
+                let search_any = subdl_enabled || (os_enabled && os_auto_resolve);
+                if search_any && !self.state.subtitle_searching {
+                    if let Some(ctx) = self.build_subtitle_context() {
+                        self.state.subtitle_searching = true;
+                        self.state.notify(
+                            NotificationKind::Info,
+                            "Looking for subtitles",
+                            "Searching SubDL & OpenSubtitles...",
+                        );
+                        let sender = self.action_sender.clone();
+                        let context_id = format!(
+                            "{}:{}:{}",
+                            ctx.subject_id, ctx.resource_id, self.state.selected_episode
+                        );
+                        tokio::spawn(async move {
+                            let subdl = crate::providers::subtitles::subdl::SubdlClient::from_env();
+                            if subdl.enabled() {
+                                match subdl.search(&ctx).await {
+                                    Ok(outcome) => {
+                                        let merged =
+                                            crate::providers::subtitles::merge_subdl_candidates(
+                                                Vec::new(),
+                                                &outcome.candidates,
+                                            );
+                                        if !merged.is_empty() {
+                                            sender
+                                                .send(Action::SubdlReady {
+                                                    context_id,
+                                                    candidates: merged,
+                                                    is_download: false,
+                                                })
+                                                .ok();
+                                            return;
+                                        }
+                                    }
+                                    Err(_) => {}
+                                }
+                            }
+                            if os_enabled && os_auto_resolve {
+                                let os =
+                                    crate::providers::subtitles::opensubtitles::OpenSubtitlesClient::from_env();
+                                match os.search(&ctx).await {
+                                    Ok(outcome) => {
+                                        let merged =
+                                            crate::providers::subtitles::merge_os_candidates(
+                                                Vec::new(),
+                                                &outcome.candidates,
+                                            );
+                                        sender
+                                            .send(Action::OpenSubtitlesReady {
+                                                context_id,
+                                                candidates: merged,
+                                                is_download: false,
+                                            })
+                                            .ok();
+                                    }
+                                    Err(err) => {
+                                        sender
+                                            .send(Action::OpenSubtitlesFailed {
+                                                context_id,
+                                                is_download: false,
+                                                error: err.to_string(),
+                                            })
+                                            .ok();
+                                    }
+                                }
+                            } else {
+                                sender
+                                    .send(Action::SubdlFailed {
+                                        context_id,
+                                        is_download: false,
+                                        error: "No subtitles found".into(),
+                                    })
+                                    .ok();
+                            }
+                        });
+                    }
+                }
                 if options.len() > 1 {
                     self.state.show_help = false;
                     self.state.player_picker_popup = false;
@@ -511,20 +617,132 @@ impl App {
                     self.state.subtitle_list_state.select(Some(0));
                     self.state.pending_play_link = Some(link);
                     self.state.pending_open_with = open_with;
+                    self.state.os_waiting = false;
+                } else if search_any {
+                    self.state.pending_play_link = Some(link);
+                    self.state.pending_open_with = open_with;
+                    self.state.os_waiting = true;
+                    self.state.subtitle_list.clear();
+                    self.state.os_subtitles.clear();
+                    return None;
+                } else if open_with {
+                    self.action_sender
+                        .send(Action::ShowPlayerPicker(link, None))
+                        .ok();
                 } else {
-                    if open_with {
-                        self.action_sender
-                            .send(Action::ShowPlayerPicker(link, None))
-                            .ok();
-                    } else {
-                        self.action_sender.send(Action::LaunchMpv(link, None)).ok();
-                    }
+                    self.action_sender.send(Action::LaunchMpv(link, None)).ok();
                 }
             }
             Action::ShowDownloadSubtitlePopup(ext_captions) => {
                 self.state.is_resolving_playback = false;
-                let options = crate::tui::state::caption_options(&ext_captions);
-
+                let mut options = vec![("None".to_string(), "".to_string())];
+                let mut has_indonesian = false;
+                if let Some(captions_list) =
+                    ext_captions.get("extCaptions").and_then(|c| c.as_array())
+                {
+                    for cap in captions_list {
+                        let name = cap
+                            .get("lanName")
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("Unknown")
+                            .to_string();
+                        let url = cap
+                            .get("url")
+                            .and_then(|u| u.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if !url.is_empty() {
+                            if crate::providers::subtitles::is_indonesian_label(&name) {
+                                has_indonesian = true;
+                            }
+                            options.push((name, url));
+                        }
+                    }
+                }
+                let subdl_enabled =
+                    crate::providers::subtitles::subdl::SubdlClient::from_env().enabled();
+                let os_enabled = !has_indonesian
+                    && crate::providers::subtitles::opensubtitles::OpenSubtitlesConfig::from_env()
+                        .enabled();
+                let os_auto_resolve = self.state.os_quota_gate(os_enabled).allows_resolve();
+                let search_any = subdl_enabled || (os_enabled && os_auto_resolve);
+                if search_any && !self.state.subtitle_searching {
+                    if let Some(ctx) = self.build_subtitle_context() {
+                        self.state.subtitle_searching = true;
+                        self.state.notify(
+                            NotificationKind::Info,
+                            "Looking for subtitles",
+                            "Searching SubDL & OpenSubtitles...",
+                        );
+                        let sender = self.action_sender.clone();
+                        let context_id = format!(
+                            "{}:{}:{}",
+                            ctx.subject_id, ctx.resource_id, self.state.selected_episode
+                        );
+                        tokio::spawn(async move {
+                            let subdl = crate::providers::subtitles::subdl::SubdlClient::from_env();
+                            if subdl.enabled() {
+                                match subdl.search(&ctx).await {
+                                    Ok(outcome) => {
+                                        let merged =
+                                            crate::providers::subtitles::merge_subdl_candidates(
+                                                Vec::new(),
+                                                &outcome.candidates,
+                                            );
+                                        if !merged.is_empty() {
+                                            sender
+                                                .send(Action::SubdlReady {
+                                                    context_id,
+                                                    candidates: merged,
+                                                    is_download: true,
+                                                })
+                                                .ok();
+                                            return;
+                                        }
+                                    }
+                                    Err(_) => {}
+                                }
+                            }
+                            if os_enabled && os_auto_resolve {
+                                let os =
+                                    crate::providers::subtitles::opensubtitles::OpenSubtitlesClient::from_env();
+                                match os.search(&ctx).await {
+                                    Ok(outcome) => {
+                                        let merged =
+                                            crate::providers::subtitles::merge_os_candidates(
+                                                Vec::new(),
+                                                &outcome.candidates,
+                                            );
+                                        sender
+                                            .send(Action::OpenSubtitlesReady {
+                                                context_id,
+                                                candidates: merged,
+                                                is_download: true,
+                                            })
+                                            .ok();
+                                    }
+                                    Err(err) => {
+                                        sender
+                                            .send(Action::OpenSubtitlesFailed {
+                                                context_id,
+                                                is_download: true,
+                                                error: err.to_string(),
+                                            })
+                                            .ok();
+                                    }
+                                }
+                            } else {
+                                sender
+                                    .send(Action::SubdlFailed {
+                                        context_id,
+                                        is_download: true,
+                                        error: "No subtitles found".into(),
+                                    })
+                                    .ok();
+                            }
+                        });
+                    }
+                }
                 if options.len() > 1 {
                     self.state.show_help = false;
                     self.state.player_picker_popup = false;
@@ -532,6 +750,12 @@ impl App {
                     self.state.is_download_subtitle_popup = true;
                     self.state.subtitle_list = options;
                     self.state.subtitle_list_state.select(Some(0));
+                    self.state.os_waiting = false;
+                } else if search_any {
+                    self.state.os_waiting = true;
+                    self.state.subtitle_list.clear();
+                    self.state.os_subtitles.clear();
+                    return None;
                 } else {
                     self.action_sender.send(Action::DownloadStream(None)).ok();
                 }

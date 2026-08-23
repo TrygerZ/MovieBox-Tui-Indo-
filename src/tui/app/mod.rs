@@ -13,6 +13,7 @@ mod playback;
 mod requests;
 mod run;
 mod search;
+mod subtitles;
 mod system;
 mod tv;
 

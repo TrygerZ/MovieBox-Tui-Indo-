@@ -737,6 +737,81 @@ impl App {
                     let sub_url = self.state.subtitle_list.get(idx).map(|(_, u)| u.clone());
                     if let Some(link) = self.state.pending_play_link.take() {
                         let open_with = self.state.pending_open_with;
+                        if let Some(ref marker) = sub_url {
+                            if marker.starts_with("os:") {
+                                let parsed = crate::tui::app::subtitles::parse_os_marker(marker);
+                                let file_id = parsed.as_ref().map(|(fid, _)| *fid);
+                                let lang =
+                                    parsed.map(|(_, l)| l).unwrap_or_else(|| "id".to_string());
+                                let sender = self.action_sender.clone();
+                                let provider = self.state.active_provider;
+                                let subject_id =
+                                    self.state.active_subject_id.clone().unwrap_or_default();
+                                let season = self.state.selected_season;
+                                let episode = self.state.selected_episode;
+                                tokio::spawn(async move {
+                                    let mut resolved = None;
+                                    if let Some(fid) = file_id {
+                                        match crate::tui::app::subtitles::resolve_os_subtitle_to_cache(
+                                            provider, &subject_id, season, episode, fid, &lang,
+                                        )
+                                        .await
+                                        {
+                                            Ok(path) => resolved = Some(path),
+                                            Err(reason) => {
+                                                sender
+                                                    .send(Action::SetStatus(format!(
+                                                        "Error:{reason}"
+                                                    )))
+                                                    .ok();
+                                            }
+                                        }
+                                    }
+                                    if open_with {
+                                        sender.send(Action::ShowPlayerPicker(link, resolved)).ok();
+                                    } else {
+                                        sender.send(Action::LaunchMpv(link, resolved)).ok();
+                                    }
+                                });
+                                return None;
+                            } else if marker.starts_with("subdl:") {
+                                let parsed = crate::tui::app::subtitles::parse_subdl_marker(marker);
+                                let subdl_id = parsed.as_ref().map(|(id, _)| id.clone());
+                                let lang =
+                                    parsed.map(|(_, l)| l).unwrap_or_else(|| "id".to_string());
+                                let sender = self.action_sender.clone();
+                                let provider = self.state.active_provider;
+                                let subject_id =
+                                    self.state.active_subject_id.clone().unwrap_or_default();
+                                let season = self.state.selected_season;
+                                let episode = self.state.selected_episode;
+                                tokio::spawn(async move {
+                                    let mut resolved = None;
+                                    if let Some(sid) = subdl_id {
+                                        match crate::tui::app::subtitles::resolve_subdl_subtitle_to_cache(
+                                            provider, &subject_id, season, episode, &sid, &lang,
+                                        )
+                                        .await
+                                        {
+                                            Ok(path) => resolved = Some(path),
+                                            Err(reason) => {
+                                                sender
+                                                    .send(Action::SetStatus(format!(
+                                                        "Error:{reason}"
+                                                    )))
+                                                    .ok();
+                                            }
+                                        }
+                                    }
+                                    if open_with {
+                                        sender.send(Action::ShowPlayerPicker(link, resolved)).ok();
+                                    } else {
+                                        sender.send(Action::LaunchMpv(link, resolved)).ok();
+                                    }
+                                });
+                                return None;
+                            }
+                        }
                         if open_with {
                             self.action_sender
                                 .send(Action::ShowPlayerPicker(link, sub_url))
@@ -759,6 +834,61 @@ impl App {
                         self.state.last_download_subtitle_language = Some(name.clone());
                         if self.state.download_queue_total > 0 {
                             self.state.season_subtitle_preference = Some(name);
+                        }
+                    }
+
+                    if let Some(ref marker) = sub_url_final {
+                        if marker.starts_with("os:") {
+                            let parsed = crate::tui::app::subtitles::parse_os_marker(marker);
+                            let file_id = parsed.as_ref().map(|(fid, _)| *fid);
+                            let lang = parsed.map(|(_, l)| l).unwrap_or_else(|| "id".to_string());
+                            let sender = self.action_sender.clone();
+                            let provider = self.state.active_provider;
+                            let subject_id =
+                                self.state.active_subject_id.clone().unwrap_or_default();
+                            let season = self.state.selected_season;
+                            let episode = self.state.selected_episode;
+                            tokio::spawn(async move {
+                                let mut resolved = None;
+                                if let Some(fid) = file_id {
+                                    resolved =
+                                        crate::tui::app::subtitles::resolve_os_subtitle_to_cache(
+                                            provider,
+                                            &subject_id,
+                                            season,
+                                            episode,
+                                            fid,
+                                            &lang,
+                                        )
+                                        .await
+                                        .ok();
+                                }
+                                sender.send(Action::DownloadStream(resolved)).ok();
+                            });
+                            return None;
+                        } else if marker.starts_with("subdl:") {
+                            let parsed = crate::tui::app::subtitles::parse_subdl_marker(marker);
+                            let subdl_id = parsed.as_ref().map(|(id, _)| id.clone());
+                            let lang = parsed.map(|(_, l)| l).unwrap_or_else(|| "id".to_string());
+                            let sender = self.action_sender.clone();
+                            let provider = self.state.active_provider;
+                            let subject_id =
+                                self.state.active_subject_id.clone().unwrap_or_default();
+                            let season = self.state.selected_season;
+                            let episode = self.state.selected_episode;
+                            tokio::spawn(async move {
+                                let mut resolved = None;
+                                if let Some(sid) = subdl_id {
+                                    resolved =
+                                        crate::tui::app::subtitles::resolve_subdl_subtitle_to_cache(
+                                            provider, &subject_id, season, episode, &sid, &lang,
+                                        )
+                                        .await
+                                        .ok();
+                                }
+                                sender.send(Action::DownloadStream(resolved)).ok();
+                            });
+                            return None;
                         }
                     }
 
