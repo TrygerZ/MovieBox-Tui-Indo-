@@ -82,6 +82,16 @@ pub fn merge_subdl_candidates(
     out
 }
 
+/// Merge SubDL and OpenSubtitles candidates into a single deduplicated list.
+/// SubDL candidates appear first (free / quota-less), followed by OpenSubtitles.
+pub fn merge_all_candidates(
+    subdl_candidates: &[subdl::SubdlCandidate],
+    os_candidates: &[OsCandidate],
+) -> Vec<(String, String)> {
+    let merged = merge_subdl_candidates(Vec::new(), subdl_candidates);
+    merge_os_candidates(merged, os_candidates)
+}
+
 pub fn build_label(c: &OsCandidate) -> String {
     let lang =
         if c.language.eq_ignore_ascii_case("id") || c.language.eq_ignore_ascii_case("indonesian") {
@@ -374,5 +384,36 @@ mod tests {
             parts[1].chars().count() <= 40,
             "release name not truncated: {label}"
         );
+    }
+
+    #[test]
+    fn test_merge_all_candidates_preserves_both_sources() {
+        use crate::providers::subtitles::subdl::SubdlCandidate;
+        let subdl_cands = vec![SubdlCandidate {
+            subtitle_id: "subdl-123".into(),
+            language: "id".into(),
+            score: 100,
+            release_name: Some("SubDL Release".into()),
+            rating: Some(8.5),
+            download_count: Some(50),
+        }];
+        let os_cands = vec![OsCandidate {
+            label: String::new(),
+            file_id: 456,
+            language: "id".into(),
+            score: 90,
+            release_name: Some("OS Release".into()),
+            download_count: Some(20),
+            machine_translated: false,
+        }];
+
+        let merged = merge_all_candidates(&subdl_cands, &os_cands);
+        assert_eq!(merged.len(), 2);
+        // SubDL candidate comes first
+        assert!(merged[0].0.contains("[SubDL]"));
+        assert_eq!(merged[0].1, "subdl:subdl-123:id");
+        // OpenSubtitles candidate comes second and is NOT suppressed
+        assert!(merged[1].0.contains("[OS]"));
+        assert_eq!(merged[1].1, "os:456:id");
     }
 }

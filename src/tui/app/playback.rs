@@ -16,6 +16,85 @@ pub(super) enum PlaybackResolution {
     NoPlayersInstalled,
 }
 
+async fn search_and_dispatch_subtitles(
+    sender: tokio::sync::mpsc::UnboundedSender<Action>,
+    ctx: crate::providers::subtitles::SubtitleContext,
+    context_id: String,
+    os_enabled: bool,
+    os_auto_resolve: bool,
+    is_download: bool,
+) {
+    let subdl_fut = async {
+        let subdl = crate::providers::subtitles::subdl::SubdlClient::from_env();
+        if subdl.enabled() {
+            subdl.search(&ctx).await.ok()
+        } else {
+            None
+        }
+    };
+
+    let os_fut = async {
+        if os_enabled && os_auto_resolve {
+            let os = crate::providers::subtitles::opensubtitles::OpenSubtitlesClient::from_env();
+            Some(os.search(&ctx).await)
+        } else {
+            None
+        }
+    };
+
+    let (subdl_res, os_res) = tokio::join!(subdl_fut, os_fut);
+
+    let subdl_cands = subdl_res
+        .as_ref()
+        .map(|o| o.candidates.as_slice())
+        .unwrap_or_default();
+
+    let mut os_error = None;
+    let os_cands: &[crate::providers::subtitles::OsCandidate] = match &os_res {
+        Some(Ok(outcome)) => &outcome.candidates,
+        Some(Err(err)) => {
+            os_error = Some(err.to_string());
+            &[]
+        }
+        None => &[],
+    };
+
+    let merged = crate::providers::subtitles::merge_all_candidates(subdl_cands, os_cands);
+
+    if !merged.is_empty() {
+        let action = if merged.iter().any(|(_, m)| m.starts_with("subdl:")) {
+            Action::SubdlReady {
+                context_id,
+                candidates: merged,
+                is_download,
+            }
+        } else {
+            Action::OpenSubtitlesReady {
+                context_id,
+                candidates: merged,
+                is_download,
+            }
+        };
+        sender.send(action).ok();
+    } else if let Some(err) = os_error {
+        sender
+            .send(Action::OpenSubtitlesFailed {
+                context_id,
+                is_download,
+                error: err,
+            })
+            .ok();
+    } else {
+        sender
+            .send(Action::SubdlFailed {
+                context_id,
+                is_download,
+                error: "No subtitles found".into(),
+            })
+            .ok();
+    }
+}
+
 impl App {
     pub(super) fn resolve_playback_player(
         &self,
@@ -715,65 +794,14 @@ impl App {
                             "{}:{}:{}",
                             ctx.subject_id, ctx.resource_id, self.state.selected_episode
                         );
-                        tokio::spawn(async move {
-                            let subdl = crate::providers::subtitles::subdl::SubdlClient::from_env();
-                            if subdl.enabled() {
-                                if let Ok(outcome) = subdl.search(&ctx).await {
-                                    let merged =
-                                        crate::providers::subtitles::merge_subdl_candidates(
-                                            Vec::new(),
-                                            &outcome.candidates,
-                                        );
-                                    if !merged.is_empty() {
-                                        sender
-                                            .send(Action::SubdlReady {
-                                                context_id,
-                                                candidates: merged,
-                                                is_download: false,
-                                            })
-                                            .ok();
-                                        return;
-                                    }
-                                }
-                            }
-                            if os_enabled && os_auto_resolve {
-                                let os =
-                                    crate::providers::subtitles::opensubtitles::OpenSubtitlesClient::from_env();
-                                match os.search(&ctx).await {
-                                    Ok(outcome) => {
-                                        let merged =
-                                            crate::providers::subtitles::merge_os_candidates(
-                                                Vec::new(),
-                                                &outcome.candidates,
-                                            );
-                                        sender
-                                            .send(Action::OpenSubtitlesReady {
-                                                context_id,
-                                                candidates: merged,
-                                                is_download: false,
-                                            })
-                                            .ok();
-                                    }
-                                    Err(err) => {
-                                        sender
-                                            .send(Action::OpenSubtitlesFailed {
-                                                context_id,
-                                                is_download: false,
-                                                error: err.to_string(),
-                                            })
-                                            .ok();
-                                    }
-                                }
-                            } else {
-                                sender
-                                    .send(Action::SubdlFailed {
-                                        context_id,
-                                        is_download: false,
-                                        error: "No subtitles found".into(),
-                                    })
-                                    .ok();
-                            }
-                        });
+                        tokio::spawn(search_and_dispatch_subtitles(
+                            sender,
+                            ctx,
+                            context_id,
+                            os_enabled,
+                            os_auto_resolve,
+                            false,
+                        ));
                     }
                 }
                 if options.len() > 1 {
@@ -831,65 +859,14 @@ impl App {
                             "{}:{}:{}",
                             ctx.subject_id, ctx.resource_id, self.state.selected_episode
                         );
-                        tokio::spawn(async move {
-                            let subdl = crate::providers::subtitles::subdl::SubdlClient::from_env();
-                            if subdl.enabled() {
-                                if let Ok(outcome) = subdl.search(&ctx).await {
-                                    let merged =
-                                        crate::providers::subtitles::merge_subdl_candidates(
-                                            Vec::new(),
-                                            &outcome.candidates,
-                                        );
-                                    if !merged.is_empty() {
-                                        sender
-                                            .send(Action::SubdlReady {
-                                                context_id,
-                                                candidates: merged,
-                                                is_download: true,
-                                            })
-                                            .ok();
-                                        return;
-                                    }
-                                }
-                            }
-                            if os_enabled && os_auto_resolve {
-                                let os =
-                                    crate::providers::subtitles::opensubtitles::OpenSubtitlesClient::from_env();
-                                match os.search(&ctx).await {
-                                    Ok(outcome) => {
-                                        let merged =
-                                            crate::providers::subtitles::merge_os_candidates(
-                                                Vec::new(),
-                                                &outcome.candidates,
-                                            );
-                                        sender
-                                            .send(Action::OpenSubtitlesReady {
-                                                context_id,
-                                                candidates: merged,
-                                                is_download: true,
-                                            })
-                                            .ok();
-                                    }
-                                    Err(err) => {
-                                        sender
-                                            .send(Action::OpenSubtitlesFailed {
-                                                context_id,
-                                                is_download: true,
-                                                error: err.to_string(),
-                                            })
-                                            .ok();
-                                    }
-                                }
-                            } else {
-                                sender
-                                    .send(Action::SubdlFailed {
-                                        context_id,
-                                        is_download: true,
-                                        error: "No subtitles found".into(),
-                                    })
-                                    .ok();
-                            }
-                        });
+                        tokio::spawn(search_and_dispatch_subtitles(
+                            sender,
+                            ctx,
+                            context_id,
+                            os_enabled,
+                            os_auto_resolve,
+                            true,
+                        ));
                     }
                 }
                 if options.len() > 1 {
