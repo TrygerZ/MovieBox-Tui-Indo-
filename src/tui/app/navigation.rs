@@ -877,12 +877,20 @@ impl App {
                             tokio::spawn(async move {
                                 let mut resolved = None;
                                 if let Some(sid) = subdl_id {
-                                    resolved =
-                                        crate::tui::app::subtitles::resolve_subdl_subtitle_to_cache(
-                                            provider, &subject_id, season, episode, &sid, &lang,
-                                        )
-                                        .await
-                                        .ok();
+                                    match crate::tui::app::subtitles::resolve_subdl_subtitle_to_cache(
+                                        provider, &subject_id, season, episode, &sid, &lang,
+                                    )
+                                    .await
+                                    {
+                                        Ok(path) => resolved = Some(path),
+                                        Err(reason) => {
+                                            sender
+                                                .send(Action::SetStatus(format!(
+                                                    "Error:{reason}"
+                                                )))
+                                                .ok();
+                                        }
+                                    }
                                 }
                                 sender.send(Action::DownloadStream(resolved)).ok();
                             });

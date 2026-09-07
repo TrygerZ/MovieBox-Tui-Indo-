@@ -281,11 +281,20 @@ impl SubdlClient {
     /// per-account download quota is never consumed.
     pub async fn download_bytes(&self, subtitle_id: &str) -> Result<(String, Vec<u8>), SubdlError> {
         let url = subdl_download_url(subtitle_id);
-        let res = self.http.get(&url).send().await?;
+        let res = self
+            .http
+            .get(&url)
+            .header(reqwest::header::REFERER, "https://subdl.com/")
+            .send()
+            .await?;
         if res.status().as_u16() == 404 {
             return Err(SubdlError::NotFound);
         }
-        let res = res.error_for_status()?;
+        if !res.status().is_success() {
+            let status = res.status().as_u16();
+            let message = Self::body_snippet(res).await;
+            return Err(SubdlError::Http(status, message));
+        }
         let bytes = Self::read_body_limited(res, MAX_SUBTITLE_BYTES).await?;
         extract_first_subtitle_from_zip(&bytes)
     }
@@ -460,7 +469,11 @@ pub fn subdl_marker(c: &SubdlCandidate) -> String {
 
 /// Build the anonymous download URL for a subtitle id (`n_id`).
 fn subdl_download_url(subtitle_id: &str) -> String {
-    format!("{DOWNLOAD_BASE_URL}/subtitle/{subtitle_id}.zip")
+    let base = std::env::var("MOVIEBOX_SUBDL_DOWNLOAD_BASE_URL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DOWNLOAD_BASE_URL.to_string());
+    format!("{base}/subtitle/{subtitle_id}.zip")
 }
 
 /// Extract the `n_id` from a download path like `/subtitle/3197651-3213944.zip`
@@ -635,6 +648,7 @@ mod tests {
 
     #[test]
     fn test_subdl_download_url() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(
             subdl_download_url("3197651-3213944"),
             "https://dl.subdl.com/subtitle/3197651-3213944.zip"
@@ -932,5 +946,73 @@ mod tests {
         }
         // The guard itself is exercised deterministically above.
         assert_eq!(safe_basename("../evil.srt"), None);
+    }
+
+    #[test]
+    fn test_subdl_error_display_formatting() {
+        assert_eq!(SubdlError::NotFound.to_string(), "subtitle not found");
+        assert_eq!(
+            SubdlError::NoSubtitleInZip.to_string(),
+            "subtitle archive contains no subtitle file"
+        );
+        assert_eq!(
+            SubdlError::Http(403, "Cloudflare challenge".to_string()).to_string(),
+            "SubDL API error: HTTP 403: Cloudflare challenge"
+        );
+        assert_eq!(
+            SubdlError::BodyTooLarge(50).to_string(),
+            "subtitle archive too large (over 50 MB)"
+        );
+    }
+
+    #[test]
+    fn test_download_bytes_http_referer_and_zip_extraction() {
+        use std::io::Write;
+
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let zip_bytes = build_zip(&[("test.srt", b"1\n00:00:01,000 --> 00:00:02,000\nSubtitle\n")]);
+
+        let server = std::thread::spawn(move || -> std::io::Result<()> {
+            let (mut stream, _) = listener.accept()?;
+            let mut req_buf = [0u8; 2048];
+            let n = stream.read(&mut req_buf)?;
+            let req_str = String::from_utf8_lossy(&req_buf[..n]);
+
+            // Verify Referer header
+            if req_str
+                .to_ascii_lowercase()
+                .contains("referer: https://subdl.com/")
+            {
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/zip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    zip_bytes.len()
+                );
+                stream.write_all(header.as_bytes())?;
+                stream.write_all(&zip_bytes)?;
+            } else {
+                let header = "HTTP/1.1 403 Forbidden\r\nContent-Length: 9\r\nConnection: close\r\n\r\nForbidden";
+                stream.write_all(header.as_bytes())?;
+            }
+            stream.flush()?;
+            Ok(())
+        });
+
+        let mock_base = format!("http://{}", addr);
+        with_env("MOVIEBOX_SUBDL_DOWNLOAD_BASE_URL", Some(&mock_base), || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let client = SubdlClient::new(SubdlConfig::default());
+            let (ext, bytes) = rt.block_on(client.download_bytes("test-123")).unwrap();
+            assert_eq!(ext, "srt");
+            assert!(bytes.starts_with(b"1\n00:00:01,000"));
+        });
+
+        server.join().unwrap().unwrap();
     }
 }
