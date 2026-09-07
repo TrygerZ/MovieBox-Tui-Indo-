@@ -5,9 +5,10 @@
 ## Checklist
 
 - [ ] `cargo fmt --check` succeeds
-- [ ] `cargo clippy --all-targets --locked -- -D warnings` succeeds
-- [ ] `cargo check --locked` succeeds
+- [ ] `cargo clippy --all-targets --all-features --locked -- -D warnings` succeeds
+- [ ] `cargo check --all-targets --all-features --locked` succeeds
+- [ ] `cargo test --all-features --locked` succeeds
 - [ ] Docs updated if this changes features, keybindings, or usage
-- [ ] No placeholder test step was added; this repo currently has no unit-test suite
+- [ ] Platform-specific changes include or update deterministic tests where possible
 
 > Formatting and linting are enforced automatically by the pre-commit hook and CI.

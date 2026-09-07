@@ -1,12 +1,34 @@
 pub mod adapt;
 pub mod client;
 pub mod crypto;
+pub mod session;
 pub mod title;
 
 pub use title::clean_moviebox_title;
 
-use crate::providers::models::ProviderKind;
+use crate::providers::models::{CatalogItem, MediaDetails, ProviderError, ProviderKind};
 use crate::providers::{Provider, ProviderCapabilities};
+
+impl From<ScraperError> for ProviderError {
+    fn from(err: ScraperError) -> Self {
+        match err {
+            ScraperError::Reqwest(e) => ProviderError::Network(e.to_string()),
+            ScraperError::ApiStatus(429) => ProviderError::RateLimited(None),
+            ScraperError::ApiStatus(404) => ProviderError::NotFound,
+            ScraperError::ApiStatus(s) => ProviderError::Unavailable(format!("HTTP status {s}")),
+            ScraperError::HostsExhausted => {
+                ProviderError::Unavailable("All hosts exhausted".to_string())
+            }
+            ScraperError::Json(e) => ProviderError::Parsing(e.to_string()),
+            ScraperError::MissingToken => ProviderError::Unavailable("Missing token".to_string()),
+            ScraperError::InvalidUrl(u) => ProviderError::Unavailable(format!("Invalid URL: {u}")),
+            ScraperError::InvalidHeader(h) => {
+                ProviderError::Unavailable(format!("Invalid header: {h}"))
+            }
+            ScraperError::Join(j) => ProviderError::Unavailable(format!("Join error: {j}")),
+        }
+    }
+}
 
 impl Provider for client::MovieBoxClient {
     fn id(&self) -> ProviderKind {
@@ -23,16 +45,79 @@ impl Provider for client::MovieBoxClient {
         }
     }
 
-    async fn search(&self, query: &str, page: usize) -> Result<serde_json::Value, String> {
-        self.search(query, page)
+    async fn search(&self, query: &str, page: usize) -> Result<Vec<CatalogItem>, ProviderError> {
+        let json = self
+            .search(query, page)
             .await
-            .map_err(|error| format!("{error:?}"))
+            .map_err(ProviderError::from)?;
+        Ok(adapt::moviebox_search_json_to_catalog(&json))
     }
 
-    async fn details(&self, id: &str) -> Result<serde_json::Value, String> {
-        self.get_details(id)
+    async fn details(&self, id: &str) -> Result<MediaDetails, ProviderError> {
+        let json = self.get_details(id).await.map_err(ProviderError::from)?;
+        adapt::moviebox_details_json_to_media_details(&json)
+    }
+}
+
+impl crate::providers::ReleaseProvider for client::MovieBoxClient {
+    async fn episode_streams(
+        &self,
+        id: &str,
+        season: usize,
+        episode: usize,
+    ) -> Result<Vec<crate::providers::models::Release>, ProviderError> {
+        let (play_info_res, resources_res) = tokio::join!(
+            self.get_play_info(id, season, episode),
+            self.get_resources(id, season, episode, 1, None, 5)
+        );
+
+        let upload_resource_id = resources_res.ok().and_then(|val| {
+            val.get("list")
+                .or_else(|| val.get("data").and_then(|d| d.get("list")))
+                .and_then(|l| l.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|item| {
+                    item.get("resourceId")
+                        .or_else(|| item.get("id"))
+                        .and_then(|v| {
+                            if let Some(n) = v.as_i64() {
+                                Some(n.to_string())
+                            } else if let Some(n) = v.as_u64() {
+                                Some(n.to_string())
+                            } else {
+                                v.as_str().map(|s| s.to_string())
+                            }
+                        })
+                })
+        });
+
+        let json = play_info_res.map_err(ProviderError::from)?;
+        let mut releases =
+            adapt::moviebox_play_info_json_to_releases(&json, season, episode, self.user_agent());
+
+        if !releases.is_empty() {
+            if let Some(upload_id) = upload_resource_id {
+                for rel in &mut releases {
+                    rel.resource_id = Some(upload_id.clone());
+                }
+            }
+            return Ok(releases);
+        }
+
+        let (items, _) = self
+            .fetch_resource_page(id, 0, 1)
             .await
-            .map_err(|error| format!("{error:?}"))
+            .map_err(ProviderError::from)?;
+        let mut legacy_releases = Vec::new();
+        for item in items {
+            let rel = adapt::moviebox_resource_item_to_release(&item);
+            if (season == 0 && episode == 0)
+                || (rel.season == Some(season) && rel.episode == Some(episode))
+            {
+                legacy_releases.push(rel);
+            }
+        }
+        Ok(legacy_releases)
     }
 }
 
@@ -46,13 +131,31 @@ fn encode_id(id: &str) -> String {
 }
 
 impl MovieBoxClient {
+    pub async fn get_play_info(
+        &self,
+        subject_id: &str,
+        season: usize,
+        episode: usize,
+    ) -> Result<Value, ScraperError> {
+        let path = if season == 0 && episode == 0 {
+            format!(
+                "/wefeed-mobile-bff/subject-api/play-info/v2?subjectId={}",
+                subject_id
+            )
+        } else {
+            format!(
+                "/wefeed-mobile-bff/subject-api/play-info/v2?subjectId={}&se={}&ep={}",
+                subject_id, season, episode
+            )
+        };
+        self.get(&path).await
+    }
     pub async fn search(&self, query: &str, page: usize) -> Result<Value, ScraperError> {
         let payload = json!({
             "keyword": query,
             "page": page,
-            "perPage": 20,
-            "subjectType": "All",
-            "tabId": "All"
+            "perPage": 15,
+            "subjectType": 0
         });
         self.post("/wefeed-mobile-bff/subject-api/search/v2", &payload)
             .await
@@ -185,7 +288,22 @@ impl MovieBoxClient {
         if let Some(cols) = res.get("collectionResolutions").and_then(|c| c.as_array()) {
             for col in cols {
                 if let Some(r) = col.get("resolution").and_then(|v| v.as_u64()) {
-                    resolutions.push(r as u32);
+                    if r > 0 {
+                        resolutions.push(r as u32);
+                    }
+                }
+            }
+        }
+
+        if resolutions.is_empty() {
+            if let Some(list) = res.get("list").and_then(|l| l.as_array()) {
+                for item in list {
+                    if let Some(r) = item.get("resolution").and_then(|v| v.as_u64()) {
+                        let res_u32 = r as u32;
+                        if res_u32 > 0 && !resolutions.contains(&res_u32) {
+                            resolutions.push(res_u32);
+                        }
+                    }
                 }
             }
         }
@@ -195,7 +313,6 @@ impl MovieBoxClient {
         if resolutions.is_empty() {
             resolutions = vec![1080, 720, 480, 360];
         }
-
         Ok(resolutions)
     }
 

@@ -457,20 +457,40 @@ where
 
     let assembly = sidecar_path(destination, "assembling");
     let mut output = tokio::fs::File::create(&assembly).await?;
+    let mut copy_buffer = vec![0u8; 256 * 1024];
     for index in 0..segments {
         let path = segment_path(destination, index);
         let mut part = tokio::fs::File::open(&path).await?;
-        tokio::io::copy(&mut part, &mut output).await?;
+        loop {
+            let n = tokio::io::AsyncReadExt::read(&mut part, &mut copy_buffer).await?;
+            if n == 0 {
+                break;
+            }
+            tokio::io::AsyncWriteExt::write_all(&mut output, &copy_buffer[..n]).await?;
+        }
     }
     output.flush().await?;
     output.sync_data().await?;
+    drop(output);
     if file_len(&assembly).await != total {
         return Err(DownloadError::Incomplete {
             downloaded: file_len(&assembly).await,
             expected: total,
         });
     }
-    tokio::fs::rename(&assembly, destination).await?;
+    if destination.exists() {
+        let _ = tokio::fs::remove_file(destination).await;
+    }
+    if let Err(e) = tokio::fs::rename(&assembly, destination).await {
+        let _ = tokio::fs::remove_file(destination).await;
+        tokio::fs::rename(&assembly, destination)
+            .await
+            .map_err(|e2| {
+                DownloadError::File(std::io::Error::other(format!(
+                    "failed to move assembled file to destination: {e} ({e2})"
+                )))
+            })?;
+    }
     for index in 0..segments {
         let _ = tokio::fs::remove_file(segment_path(destination, index)).await;
     }
@@ -547,15 +567,21 @@ async fn download_segment(
             )));
         }
 
-        let mut file = tokio::fs::OpenOptions::new()
+        let raw_file = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)
             .await?;
+        let mut file = tokio::io::BufWriter::with_capacity(256 * 1024, raw_file);
         let mut response = response;
         let mut written = existing;
+        let mut unbatched_bytes = 0u64;
+        let mut last_progress_send = Instant::now();
         loop {
             if cancel.load(Ordering::Relaxed) {
+                if unbatched_bytes > 0 {
+                    let _ = progress.send((unbatched_bytes, attempt)).await;
+                }
                 file.flush().await?;
                 return Err(DownloadError::Paused);
             }
@@ -565,14 +591,27 @@ async fn download_segment(
                     let bytes = chunk.len().min(remaining as usize);
                     file.write_all(&chunk[..bytes]).await?;
                     written += bytes as u64;
-                    let _ = progress.send((bytes as u64, attempt)).await;
+                    unbatched_bytes += bytes as u64;
+                    if unbatched_bytes >= 256 * 1024
+                        || last_progress_send.elapsed() >= Duration::from_millis(100)
+                    {
+                        let _ = progress.send((unbatched_bytes, attempt)).await;
+                        unbatched_bytes = 0;
+                        last_progress_send = Instant::now();
+                    }
                     if written == expected {
+                        if unbatched_bytes > 0 {
+                            let _ = progress.send((unbatched_bytes, attempt)).await;
+                        }
                         file.flush().await?;
-                        file.sync_data().await?;
+                        file.get_mut().sync_data().await?;
                         return Ok(());
                     }
                 }
                 Ok(Ok(None)) => {
+                    if unbatched_bytes > 0 {
+                        let _ = progress.send((unbatched_bytes, attempt)).await;
+                    }
                     file.flush().await?;
                     last_error = Some(DownloadError::Incomplete {
                         downloaded: written,
@@ -581,11 +620,17 @@ async fn download_segment(
                     break;
                 }
                 Ok(Err(error)) => {
+                    if unbatched_bytes > 0 {
+                        let _ = progress.send((unbatched_bytes, attempt)).await;
+                    }
                     file.flush().await?;
                     last_error = Some(DownloadError::Network(error));
                     break;
                 }
                 Err(_) => {
+                    if unbatched_bytes > 0 {
+                        let _ = progress.send((unbatched_bytes, attempt)).await;
+                    }
                     file.flush().await?;
                     last_error = Some(DownloadError::InvalidRange("read timeout".into()));
                     break;
@@ -706,7 +751,10 @@ async fn finalize(
     metadata: &Path,
     destination: &Path,
 ) -> Result<(), std::io::Error> {
-    tokio::fs::rename(partial, destination).await?;
+    if tokio::fs::rename(partial, destination).await.is_err() {
+        let _ = tokio::fs::remove_file(destination).await;
+        tokio::fs::rename(partial, destination).await?;
+    }
     let _ = tokio::fs::remove_file(metadata).await;
     Ok(())
 }
@@ -979,12 +1027,67 @@ mod tests {
     }
 
     #[test]
-    fn test_safe_file_stem_windows_reserved() {
+    fn test_safe_file_stem_empty_fallback() {
+        assert_eq!(safe_file_stem(""), DEFAULT_STREAM_NAME);
+        assert_eq!(safe_file_stem("   "), DEFAULT_STREAM_NAME);
+        assert_eq!(safe_file_stem("..."), DEFAULT_STREAM_NAME);
+        assert_eq!(safe_file_stem("___"), DEFAULT_STREAM_NAME);
+    }
+
+    #[test]
+    fn test_safe_file_stem_sanitization_and_reserved() {
+        assert_eq!(safe_file_stem("../../../etc/passwd"), "etc_passwd");
+        assert_eq!(
+            safe_file_stem("C:\\Windows\\System32\\calc.exe"),
+            "C__Windows_System32_calc.exe"
+        );
         assert_eq!(safe_file_stem("CON"), "CON_");
+        assert_eq!(safe_file_stem("con"), "con_");
+        assert_eq!(safe_file_stem("PRN"), "PRN_");
         assert_eq!(safe_file_stem("AUX"), "AUX_");
+        assert_eq!(safe_file_stem("NUL"), "NUL_");
+        assert_eq!(safe_file_stem("COM1"), "COM1_");
+        assert_eq!(safe_file_stem("LPT9"), "LPT9_");
         assert_eq!(
             safe_file_stem("Normal Title: Special"),
             "Normal Title_ Special"
         );
+        assert_eq!(
+            safe_file_stem("Movie: The <Ultimate> Edition *?|"),
+            "Movie_ The _Ultimate_ Edition"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_finalize_replaces_existing_destination_cleanly() {
+        let dir = std::env::temp_dir().join(format!(
+            "mbx_test_finalize_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let partial = dir.join("video.mp4.part");
+        let metadata = dir.join("video.mp4.metadata");
+        let destination = dir.join("video.mp4");
+
+        tokio::fs::write(&destination, b"old version")
+            .await
+            .unwrap();
+        tokio::fs::write(&partial, b"new version").await.unwrap();
+        tokio::fs::write(&metadata, b"{}").await.unwrap();
+
+        let res = finalize(&partial, &metadata, &destination).await;
+        assert!(res.is_ok());
+        assert!(!partial.exists());
+        assert!(!metadata.exists());
+        assert!(destination.exists());
+        assert_eq!(
+            tokio::fs::read_to_string(&destination).await.unwrap(),
+            "new version"
+        );
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

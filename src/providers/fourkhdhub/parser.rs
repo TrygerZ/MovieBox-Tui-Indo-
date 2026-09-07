@@ -6,16 +6,45 @@ use crate::providers::models::{
 use reqwest::Url;
 use scraper::{ElementRef, Html, Selector};
 use std::collections::{BTreeMap, HashMap};
+use std::sync::LazyLock;
+
+static SEL_CARD: LazyLock<Selector> = LazyLock::new(|| Selector::parse("a.movie-card").unwrap());
+static SEL_TITLE: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse(".movie-card-title").unwrap());
+static SEL_META: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse(".movie-card-meta").unwrap());
+static SEL_IMG: LazyLock<Selector> = LazyLock::new(|| Selector::parse("img").unwrap());
+static SEL_H1: LazyLock<Selector> = LazyLock::new(|| Selector::parse("h1").unwrap());
+static SEL_CONTENT_DESC: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse(".content-section p.mt-4").unwrap());
+static SEL_TAGLINE: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse(".movie-tagline").unwrap());
+static SEL_IMDB: LazyLock<Selector> = LazyLock::new(|| Selector::parse(".imdb-score").unwrap());
+static SEL_BADGE_A: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse(".badge-outline a").unwrap());
+static SEL_METADATA_ITEM: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse(".metadata-item").unwrap());
+static SEL_METADATA_LABEL: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse(".metadata-label").unwrap());
+static SEL_METADATA_VALUE: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse(".metadata-value").unwrap());
+static SEL_EPISODE_ITEM: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("#episodes .episode-download-item").unwrap());
+static SEL_DOWNLOAD_ITEM: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse(".download-item").unwrap());
+static SEL_EPISODE_FILE_TITLE: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse(".episode-file-title").unwrap());
+static SEL_FILE_TITLE: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse(".file-title").unwrap());
+static SEL_LINK_HREF: LazyLock<Selector> = LazyLock::new(|| Selector::parse("a[href]").unwrap());
+static SEL_BADGE_SIZE: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse(".badge-size, .badge").unwrap());
 
 pub fn parse_search(base: &Url, html: &str) -> Result<Vec<CatalogItem>, FourKHdHubError> {
     let document = Html::parse_document(html);
-    let card = selector("a.movie-card")?;
-    let title = selector(".movie-card-title")?;
-    let meta = selector(".movie-card-meta")?;
-    let image = selector("img")?;
     let mut items = Vec::new();
 
-    for node in document.select(&card) {
+    for node in document.select(&SEL_CARD) {
         let Some(href) = node.value().attr("href") else {
             continue;
         };
@@ -23,11 +52,11 @@ pub fn parse_search(base: &Url, html: &str) -> Result<Vec<CatalogItem>, FourKHdH
         if url.host_str() != base.host_str() {
             continue;
         }
-        let item_title = text_of(node.select(&title).next()).unwrap_or_default();
+        let item_title = text_of(node.select(&SEL_TITLE).next()).unwrap_or_default();
         if item_title.is_empty() {
             continue;
         }
-        let meta_text = text_of(node.select(&meta).next()).unwrap_or_default();
+        let meta_text = text_of(node.select(&SEL_META).next()).unwrap_or_default();
         let year = first_four_digit_year(&meta_text);
         let media_type = if href.contains("-series-") {
             MediaType::Series
@@ -35,7 +64,7 @@ pub fn parse_search(base: &Url, html: &str) -> Result<Vec<CatalogItem>, FourKHdH
             MediaType::Movie
         };
         let poster_url = node
-            .select(&image)
+            .select(&SEL_IMG)
             .next()
             .and_then(|img| img.value().attr("src"))
             .map(str::to_string);
@@ -56,9 +85,8 @@ pub fn parse_search(base: &Url, html: &str) -> Result<Vec<CatalogItem>, FourKHdH
 
 pub fn parse_details(id: &str, html: &str) -> Result<MediaDetails, FourKHdHubError> {
     let document = Html::parse_document(html);
-    let h1 = selector("h1")?;
     let raw_title = document
-        .select(&h1)
+        .select(&SEL_H1)
         .find_map(|node| text_of(Some(node)))
         .filter(|text| !text.is_empty())
         .or_else(|| meta_content(&document, "meta[property=\"og:title\"]"))
@@ -70,14 +98,14 @@ pub fn parse_details(id: &str, html: &str) -> Result<MediaDetails, FourKHdHubErr
         MediaType::Movie
     };
     let description = document
-        .select(&selector(".content-section p.mt-4")?)
+        .select(&SEL_CONTENT_DESC)
         .find_map(|node| text_of(Some(node)))
         .or_else(|| meta_content(&document, "meta[name=\"description\"]"));
     let tagline = document
-        .select(&selector(".movie-tagline")?)
+        .select(&SEL_TAGLINE)
         .find_map(|node| text_of(Some(node)));
     let imdb_rating = document
-        .select(&selector(".imdb-score")?)
+        .select(&SEL_IMDB)
         .find_map(|node| text_of(Some(node)));
     let poster_url = meta_content(&document, "meta[property=\"og:image\"]");
     let year = find_metadata(&document, "Release:")
@@ -87,7 +115,7 @@ pub fn parse_details(id: &str, html: &str) -> Result<MediaDetails, FourKHdHubErr
         })
         .or_else(|| first_four_digit_year(&raw_title));
     let genres = document
-        .select(&selector(".badge-outline a")?)
+        .select(&SEL_BADGE_A)
         .filter_map(|node| text_of(Some(node)))
         .filter(|value| is_genre(value))
         .collect();
@@ -112,6 +140,7 @@ pub fn parse_details(id: &str, html: &str) -> Result<MediaDetails, FourKHdHubErr
         duration: None,
         genres,
         seasons,
+        dubs: vec![],
     })
 }
 
@@ -122,23 +151,23 @@ pub fn parse_releases(
 ) -> Result<Vec<Release>, FourKHdHubError> {
     let document = Html::parse_document(html);
     let item_selector = if season > 0 {
-        selector("#episodes .episode-download-item")?
+        &*SEL_EPISODE_ITEM
     } else {
-        selector(".download-item")?
+        &*SEL_DOWNLOAD_ITEM
     };
     let filename_selector = if season > 0 {
-        selector(".episode-file-title")?
+        &*SEL_EPISODE_FILE_TITLE
     } else {
-        selector(".file-title")?
+        &*SEL_FILE_TITLE
     };
-    let link_selector = selector("a[href]")?;
-    let size_selector = selector(".badge-size, .badge")?;
+    let link_selector = &*SEL_LINK_HREF;
+    let size_selector = &*SEL_BADGE_SIZE;
     let page_language =
         find_metadata(&document, "Audios:").and_then(|value| normalize_language_label(&value));
     let mut grouped: HashMap<String, Release> = HashMap::new();
 
-    for item in document.select(&item_selector) {
-        let filename = text_of(item.select(&filename_selector).next()).unwrap_or_default();
+    for item in document.select(item_selector) {
+        let filename = text_of(item.select(filename_selector).next()).unwrap_or_default();
         if filename.is_empty() || is_archive(&filename) {
             continue;
         }
@@ -147,7 +176,7 @@ pub fn parse_releases(
             continue;
         }
         let mirrors = item
-            .select(&link_selector)
+            .select(link_selector)
             .filter_map(|link| {
                 let href = link.value().attr("href")?;
                 if !href.starts_with("https://") || href.contains("logout") {
@@ -166,7 +195,7 @@ pub fn parse_releases(
             continue;
         }
         let size_text = item
-            .select(&size_selector)
+            .select(size_selector)
             .filter_map(|node| text_of(Some(node)))
             .find(|text| parse_size_bytes(text).is_some());
         let key = normalize_filename(&filename);
@@ -180,6 +209,7 @@ pub fn parse_releases(
             episode: parsed_episode.map(|value| value.1),
             filename: filename.clone(),
             mirrors: Vec::new(),
+            resource_id: None,
         });
         for mirror in mirrors {
             if !release
@@ -197,11 +227,11 @@ pub fn parse_releases(
 }
 
 fn parse_seasons(document: &Html) -> Result<Vec<Season>, FourKHdHubError> {
-    let item = selector("#episodes .episode-download-item")?;
-    let title = selector(".episode-file-title")?;
+    let item = &*SEL_EPISODE_ITEM;
+    let title = &*SEL_EPISODE_FILE_TITLE;
     let mut seasons: BTreeMap<usize, BTreeMap<usize, Episode>> = BTreeMap::new();
-    for node in document.select(&item) {
-        let filename = text_of(node.select(&title).next()).unwrap_or_default();
+    for node in document.select(item) {
+        let filename = text_of(node.select(title).next()).unwrap_or_default();
         let Some((season, episode)) = parse_season_episode(&filename) else {
             continue;
         };
@@ -224,89 +254,6 @@ fn parse_seasons(document: &Html) -> Result<Vec<Season>, FourKHdHubError> {
         .collect())
 }
 
-pub fn search_to_moviebox_json(items: &[CatalogItem]) -> serde_json::Value {
-    let subjects = items
-        .iter()
-        .map(|item| {
-            serde_json::json!({
-                "subjectId": item.id.value,
-                "title": item.title,
-                "subjectType": if item.media_type == MediaType::Series { 2 } else { 1 },
-                "releaseDate": item.year,
-                "cover": { "url": item.poster_url },
-                "season": item.season_count.unwrap_or_default()
-            })
-        })
-        .collect::<Vec<_>>();
-    serde_json::json!({ "results": [{ "subjects": subjects }] })
-}
-
-pub fn details_to_moviebox_json(details: &MediaDetails) -> serde_json::Value {
-    let seasons = details
-        .seasons
-        .iter()
-        .map(|season| {
-            serde_json::json!({
-                "se": season.number,
-                "maxEp": season.episodes.len(),
-                "episodeNumbers": season.episodes.iter().map(|episode| episode.number).collect::<Vec<_>>()
-            })
-        })
-        .collect::<Vec<_>>();
-    serde_json::json!({
-        "id": details.id.value,
-        "subjectId": details.id.value,
-        "title": details.title,
-        "subjectType": if details.media_type == MediaType::Series { 2 } else { 1 },
-        "releaseDate": details.year,
-        "description": details.description,
-        "tagline": details.tagline,
-        "imdbRatingValue": details.imdb_rating,
-        "director": details.director,
-        "stars": details.stars,
-        "prints": details.prints,
-        "audios": details.audios,
-        "duration": details.duration,
-        "cover": { "url": details.poster_url },
-        "genre": details.genres,
-        "seasons": { "seasons": seasons }
-    })
-}
-
-pub fn releases_to_moviebox_json(releases: &[Release]) -> serde_json::Value {
-    let list = releases
-        .iter()
-        .enumerate()
-        .map(|(index, release)| {
-            let resolution = release
-                .quality
-                .as_deref()
-                .and_then(|quality| quality.trim_end_matches('p').parse::<u64>().ok())
-                .unwrap_or_default();
-            serde_json::json!({
-                "resourceId": format!("fourk-{}", index),
-                "resourceLink": release.mirrors.first().map(|mirror| mirror.resolver_url.clone()),
-                "title": release.filename,
-                "fileName": release.filename,
-                "size": release.size_bytes.map(|size| size.to_string()),
-                "resolution": resolution,
-                "codecName": release.codec,
-                "language": release.language,
-                "sourceCount": release.mirrors.len(),
-                "uploadBy": "4KHDHub",
-                "se": release.season.unwrap_or_default(),
-                "ep": release.episode.unwrap_or_default(),
-                "_fourk_release": release
-            })
-        })
-        .collect::<Vec<_>>();
-    serde_json::Value::Array(list)
-}
-
-fn selector(value: &str) -> Result<Selector, FourKHdHubError> {
-    Selector::parse(value).map_err(|_| FourKHdHubError::Parse(format!("invalid selector: {value}")))
-}
-
 fn text_of(node: Option<ElementRef<'_>>) -> Option<String> {
     node.map(|node| node.text().collect::<Vec<_>>().join(" "))
         .map(|text| text.split_whitespace().collect::<Vec<_>>().join(" "))
@@ -323,22 +270,15 @@ fn meta_content(document: &Html, query: &str) -> Option<String> {
 }
 
 fn find_metadata(document: &Html, label: &str) -> Option<String> {
-    let item = Selector::parse(".metadata-item").ok()?;
-    let label_selector = Selector::parse(".metadata-label").ok()?;
-    let value_selector = Selector::parse(".metadata-value").ok()?;
-    document.select(&item).find_map(|node| {
-        let current = text_of(node.select(&label_selector).next())?;
-        (current == label).then(|| text_of(node.select(&value_selector).next()))?
+    document.select(&SEL_METADATA_ITEM).find_map(|node| {
+        let current = text_of(node.select(&SEL_METADATA_LABEL).next())?;
+        (current == label).then(|| text_of(node.select(&SEL_METADATA_VALUE).next()))?
     })
 }
 
 fn first_four_digit_year(value: &str) -> Option<String> {
-    value
-        .as_bytes()
-        .windows(4)
-        .find(|window| window.iter().all(u8::is_ascii_digit) && matches!(window[0], b'1' | b'2'))
-        .and_then(|window| std::str::from_utf8(window).ok())
-        .map(str::to_string)
+    let year = crate::tui::text::extract_4digit_year(value);
+    (!year.is_empty()).then_some(year)
 }
 
 fn is_genre(value: &str) -> bool {
@@ -368,21 +308,21 @@ fn is_genre(value: &str) -> bool {
 
 fn strip_trailing_year(value: &str) -> String {
     let trimmed = value.trim();
-    // Verify byte boundaries before slicing: a multi-byte (e.g. CJK) char at
-    // the end would make `trimmed[len-6..]` panic with "byte index is not a
-    // char boundary". Checking the `(` / `)` positions and the 4 middle bytes
-    // being ASCII digits guarantees every slice below is on a char boundary.
-    let len = trimmed.len();
-    if len >= 6
-        && trimmed.ends_with(')')
-        && trimmed.as_bytes()[len - 6] == b'('
-        && trimmed.as_bytes()[len - 5..len - 1]
+    let bytes = trimmed.as_bytes();
+    let start = match bytes.len().checked_sub(6) {
+        Some(index) if trimmed.is_char_boundary(index) => index,
+        _ => return trimmed.to_string(),
+    };
+    let is_parenthesized_year = bytes[start] == b'('
+        && bytes[bytes.len() - 1] == b')'
+        && bytes[start + 1..bytes.len() - 1]
             .iter()
-            .all(|byte| byte.is_ascii_digit())
-    {
-        return trimmed[..len - 6].trim_end().to_string();
+            .all(|byte| byte.is_ascii_digit());
+    if is_parenthesized_year {
+        trimmed[..start].trim_end().to_string()
+    } else {
+        trimmed.to_string()
     }
-    trimmed.to_string()
 }
 
 fn parse_season_count(value: &str) -> Option<usize> {
@@ -598,7 +538,7 @@ fn normalize_filename(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::strip_trailing_year;
 
     #[test]
     fn strip_trailing_year_handles_multibyte_titles() {
@@ -610,5 +550,40 @@ mod tests {
         assert_eq!(strip_trailing_year("One Piece (2023)"), "One Piece");
         assert_eq!(strip_trailing_year("Movie (abcd)"), "Movie (abcd)");
         assert_eq!(strip_trailing_year("abc"), "abc");
+    }
+
+    #[test]
+    fn strips_parenthesized_year() {
+        assert_eq!(strip_trailing_year("Movie Name (2024)"), "Movie Name");
+        assert_eq!(strip_trailing_year("  X (1999)  "), "X");
+    }
+
+    #[test]
+    fn keeps_non_year_suffixes() {
+        assert_eq!(
+            strip_trailing_year("Not A Year (20x4)"),
+            "Not A Year (20x4)"
+        );
+        assert_eq!(strip_trailing_year("Season (Part 2)"), "Season (Part 2)");
+        assert_eq!(strip_trailing_year("Short"), "Short");
+    }
+
+    #[test]
+    fn never_panics_on_multibyte_titles() {
+        assert_eq!(strip_trailing_year("英雄éé"), "英雄éé");
+        assert_eq!(strip_trailing_year("英雄éé(2020)"), "英雄éé");
+        assert_eq!(strip_trailing_year("Ünïcödé 🎬"), "Ünïcödé 🎬");
+        assert_eq!(
+            strip_trailing_year("アニメ タイトル (2023)"),
+            "アニメ タイトル"
+        );
+    }
+
+    #[test]
+    fn handles_short_and_empty_input() {
+        assert_eq!(strip_trailing_year(""), "");
+        assert_eq!(strip_trailing_year("(2024)"), "");
+        assert_eq!(strip_trailing_year("12345"), "12345");
+        assert_eq!(strip_trailing_year("123456"), "123456");
     }
 }

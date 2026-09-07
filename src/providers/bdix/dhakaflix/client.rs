@@ -1,3 +1,4 @@
+use futures::StreamExt;
 use reqwest::Client;
 use serde_json::json;
 use std::collections::HashMap;
@@ -24,8 +25,9 @@ fn parse_title_and_year(raw_title: &str) -> (String, Option<String>) {
     if let Some(start) = title.rfind('(') {
         if let Some(end) = title[start..].find(')') {
             let year_str = &title[start + 1..start + end];
-            if year_str.len() == 4 && year_str.chars().all(|c| c.is_ascii_digit()) {
-                year = Some(year_str.to_string());
+            let extracted = crate::tui::text::extract_4digit_year(year_str);
+            if extracted.len() == 4 && year_str.trim().len() == 4 {
+                year = Some(extracted);
                 title = title[..start].trim().to_string();
                 return (title, year);
             }
@@ -83,7 +85,7 @@ impl Default for DhakaFlixClient {
 impl DhakaFlixClient {
     pub fn new() -> Self {
         Self {
-            client: reqwest::Client::builder()
+            client: crate::net::http_client_builder()
                 .timeout(Duration::from_secs(5))
                 .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
                 .build()
@@ -217,12 +219,16 @@ impl DhakaFlixClient {
         let all_results: Vec<(CatalogItem, u8)> = results_array.into_iter().flatten().collect();
         let mut all_results = Self::dedup_best_quality(all_results);
 
-        let mut poster_futures = Vec::new();
-        for item in &all_results {
-            let client = self.client.clone();
-            let id = item.id.value.clone();
+        let item_ids: Vec<(usize, String)> = all_results
+            .iter()
+            .enumerate()
+            .map(|(idx, item)| (idx, item.id.value.clone()))
+            .collect();
 
-            poster_futures.push(async move {
+        let poster_stream = futures::stream::iter(item_ids.into_iter().map(|(idx, id)| {
+            let client = self.client.clone();
+
+            async move {
                 let parts: Vec<&str> = id.split(':').collect();
                 if parts.len() >= 3 {
                     let base_url = parts[0..2].join(":");
@@ -252,7 +258,10 @@ impl DhakaFlixClient {
                                                 || href_lower.ends_with(".jpeg")
                                                 || href_lower.ends_with(".png")
                                             {
-                                                return Some(format!("{}{}", base_url, href));
+                                                return (
+                                                    idx,
+                                                    Some(format!("{}{}", base_url, href)),
+                                                );
                                             }
                                         }
                                     }
@@ -261,15 +270,17 @@ impl DhakaFlixClient {
                         }
                     }
                 }
-                None
-            });
-        }
+                (idx, None)
+            }
+        }));
 
-        let posters = futures::future::join_all(poster_futures).await;
-        for (item, poster) in all_results.iter_mut().zip(posters) {
-            item.poster_url = poster;
+        let posters: Vec<(usize, Option<String>)> =
+            poster_stream.buffer_unordered(6).collect().await;
+        for (idx, poster) in posters {
+            if let Some(item) = all_results.get_mut(idx) {
+                item.poster_url = poster;
+            }
         }
-
         Ok(all_results)
     }
 
@@ -307,6 +318,7 @@ impl DhakaFlixClient {
             duration: None,
             genres: vec![],
             seasons: vec![],
+            dubs: vec![],
         })
     }
 
@@ -422,6 +434,7 @@ impl DhakaFlixClient {
                                         headers: vec![],
                                         direct_file: true,
                                     }],
+                                    resource_id: None,
                                 });
                             }
                         }

@@ -11,6 +11,7 @@ pub mod terminal;
 pub mod text;
 pub mod theme;
 pub use crate::updater;
+pub mod widgets;
 
 pub fn clear_area(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, _theme: &theme::Theme) {
     frame.render_widget(ratatui::widgets::Clear, area);

@@ -310,6 +310,10 @@ fn test_reconciliation_from_lua_tracker_state_files() {
         duration_seconds: Some(3600),
         completed: true,
         timestamp: 1100,
+        title: None,
+        cover_url: None,
+        stype: None,
+        release_year: None,
     };
     let state_file_1 = temp_dir.path().join("moviebox_show_alpha_1_1.json");
     std::fs::write(&state_file_1, serde_json::to_string(&state1).unwrap()).unwrap();
@@ -323,6 +327,10 @@ fn test_reconciliation_from_lua_tracker_state_files() {
         duration_seconds: Some(3600),
         completed: false,
         timestamp: 1200,
+        title: None,
+        cover_url: None,
+        stype: None,
+        release_year: None,
     };
     let state_file_2 = temp_dir.path().join("moviebox_show_alpha_1_2.json");
     std::fs::write(&state_file_2, serde_json::to_string(&state2).unwrap()).unwrap();
@@ -418,4 +426,161 @@ async fn test_history_slash_command_populates_search_results_accurately() {
         .collect();
     assert!(providers.contains(&ProviderKind::MovieBox));
     assert!(providers.contains(&ProviderKind::Addons));
+}
+#[test]
+fn test_update_progress_precision_preservation() {
+    let mut manager = HistoryManager::default();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut item = dummy_history_item(
+        "moviebox",
+        "mb_m2",
+        "Interstellar",
+        1,
+        "2014",
+        0,
+        0,
+        Some(10140),
+        5000,
+        false,
+    );
+    item.timestamp = now;
+
+    manager.recent.push(item.clone());
+
+    let lower_item = item.clone();
+    manager.update_progress(lower_item, 3000, Some(10140), false);
+
+    assert_eq!(manager.recent.first().unwrap().progress_seconds, 5000);
+}
+
+#[test]
+fn test_duplicate_history_prevention_on_repeated_play() {
+    let mut manager = HistoryManager::default();
+    let item = dummy_history_item(
+        "moviebox",
+        "mb_m3",
+        "The Matrix",
+        1,
+        "1999",
+        0,
+        0,
+        Some(8160),
+        1200,
+        false,
+    );
+
+    manager.update_progress(item.clone(), 1200, Some(8160), false);
+    manager.update_progress(item.clone(), 2400, Some(8160), false);
+    manager.update_progress(item.clone(), 3600, Some(8160), false);
+
+    assert_eq!(manager.recent.len(), 1);
+    assert_eq!(manager.recent.first().unwrap().progress_seconds, 3600);
+}
+
+#[test]
+fn test_corrupted_history_deserialization_recovery() {
+    let malformed_json = "{ \"watched\": [\"corrupt\"], \"recent\": \"invalid_shape\" }";
+    let deserialized = serde_json::from_str::<HistoryManager>(malformed_json);
+    assert!(deserialized.is_err());
+
+    let empty_json = "{}";
+    let empty_manager = serde_json::from_str::<HistoryManager>(empty_json).unwrap();
+    assert!(empty_manager.recent.is_empty());
+}
+#[test]
+fn test_reconciliation_self_heals_unseen_items_with_metadata() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let state_file = temp_dir.path().join("moviebox_new_movie_0_0.json");
+    let state = PendingPlaybackState {
+        provider: "moviebox".to_string(),
+        subject_id: "new_movie".to_string(),
+        season: 0,
+        episode: 0,
+        progress_seconds: 4200,
+        duration_seconds: Some(7200),
+        completed: false,
+        timestamp: 5000,
+        title: Some("Inception".to_string()),
+        cover_url: Some("https://example.com/inception.jpg".to_string()),
+        stype: Some(1),
+        release_year: Some("2010".to_string()),
+    };
+    std::fs::write(&state_file, serde_json::to_string(&state).unwrap()).unwrap();
+
+    let mut manager = HistoryManager::default();
+    assert!(manager.recent.is_empty());
+
+    let modified = manager.reconcile_from_dir(temp_dir.path());
+    assert!(modified);
+    assert_eq!(manager.recent.len(), 1);
+
+    let recovered = manager.recent.first().unwrap();
+    assert_eq!(recovered.title, "Inception");
+    assert_eq!(recovered.subject_id, "new_movie");
+    assert_eq!(recovered.progress_seconds, 4200);
+    assert_eq!(recovered.duration_seconds, Some(7200));
+    assert_eq!(recovered.release_year, "2010");
+    assert_eq!(recovered.stype, 1);
+    assert!(!state_file.exists());
+}
+
+#[test]
+fn test_record_start_registers_history_immediately() {
+    let mut manager = HistoryManager::default();
+    let item = dummy_history_item(
+        "moviebox",
+        "interstellar",
+        "Interstellar",
+        1,
+        "2014",
+        0,
+        0,
+        Some(10140),
+        0,
+        false,
+    );
+
+    manager.record_start(&item, 120);
+    assert_eq!(manager.recent.len(), 1);
+    let first = manager.recent.first().unwrap();
+    assert_eq!(first.subject_id, "interstellar");
+    assert_eq!(first.progress_seconds, 120);
+    assert!(!first.completed);
+
+    manager.record_start(&item, 60);
+    let second = manager.recent.first().unwrap();
+    assert_eq!(second.progress_seconds, 120);
+
+    manager.record_start(&item, 500);
+    let third = manager.recent.first().unwrap();
+    assert_eq!(third.progress_seconds, 500);
+}
+
+#[test]
+fn test_pending_playback_state_from_item_fidelity() {
+    let item = dummy_history_item(
+        "moviebox",
+        "oppenheimer",
+        "Oppenheimer",
+        1,
+        "2023",
+        0,
+        0,
+        Some(10800),
+        3600,
+        false,
+    );
+
+    let pending = PendingPlaybackState::from_item(&item, 3600, Some(10800), false);
+    assert_eq!(pending.provider, "moviebox");
+    assert_eq!(pending.subject_id, "oppenheimer");
+    assert_eq!(pending.title.as_deref(), Some("Oppenheimer"));
+    assert_eq!(pending.release_year.as_deref(), Some("2023"));
+    assert_eq!(pending.stype, Some(1));
+    assert_eq!(pending.progress_seconds, 3600);
+    assert_eq!(pending.duration_seconds, Some(10800));
+    assert!(!pending.completed);
 }

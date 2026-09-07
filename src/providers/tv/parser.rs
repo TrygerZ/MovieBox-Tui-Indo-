@@ -17,7 +17,7 @@ impl M3UParser {
     pub fn new() -> Self {
         let cache_dir = crate::config::cache_dir().join("tv_playlists");
         std::fs::create_dir_all(&cache_dir).ok();
-        let client = reqwest::Client::builder()
+        let client = crate::net::http_client_builder()
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(30))
             .build()
@@ -30,7 +30,7 @@ impl M3UParser {
         url: &str,
     ) -> Result<Vec<Channel>, Box<dyn std::error::Error>> {
         let trimmed = url.trim();
-        let is_remote = crate::tui::text::is_http_url(trimmed);
+        let is_remote = crate::net::is_http_url(trimmed);
         let content = if is_remote {
             let file_path = self.cache_dir.join(cache_filename(trimmed));
             let mut needs_download = true;
@@ -109,27 +109,9 @@ impl M3UParser {
 
     pub fn parse_m3u(&self, content: &str) -> Vec<Channel> {
         let content = content.strip_prefix('\u{FEFF}').unwrap_or(content);
-        let mut channels = Vec::new();
-        let mut current_channel = Channel {
-            id: String::new(),
-            name: String::new(),
-            logo: String::new(),
-            group: String::new(),
-            stream_url: String::new(),
-        };
-
-        let extract_attr = |line: &str, attr_name: &str| -> String {
-            for quote in ['"', '\''] {
-                let pattern = format!("{attr_name}={quote}");
-                if let Some(idx) = line.find(&pattern) {
-                    let start = idx + pattern.len();
-                    if let Some(end) = line[start..].find(quote) {
-                        return line[start..start + end].to_string();
-                    }
-                }
-            }
-            String::new()
-        };
+        let estimated = content.as_bytes().iter().filter(|&&b| b == b'\n').count() / 2;
+        let mut channels = Vec::with_capacity(estimated.max(16));
+        let mut current_channel = Channel::default();
 
         for line in content.lines() {
             let line = line.trim();
@@ -137,11 +119,20 @@ impl M3UParser {
                 continue;
             }
             if line.starts_with("#EXTINF:") {
-                current_channel.id = extract_attr(line, "tvg-id");
-                current_channel.logo = extract_attr(line, "tvg-logo");
-                current_channel.group = extract_attr(line, "group-title");
+                let tvg_id = extract_attr_slice(line, "tvg-id");
+                if !tvg_id.is_empty() {
+                    current_channel.id = tvg_id.to_string();
+                }
+                let tvg_logo = extract_attr_slice(line, "tvg-logo");
+                if !tvg_logo.is_empty() {
+                    current_channel.logo = tvg_logo.to_string();
+                }
+                let group_title = extract_attr_slice(line, "group-title");
+                if !group_title.is_empty() {
+                    current_channel.group = group_title.to_string();
+                }
 
-                if let Some(idx) = line.rfind(',') {
+                if let Some(idx) = find_extinf_title_comma(line) {
                     current_channel.name = line[idx + 1..].trim().to_string();
                 }
             } else if !line.starts_with('#') {
@@ -149,20 +140,47 @@ impl M3UParser {
                 if current_channel.id.is_empty() {
                     current_channel.id = current_channel.name.clone();
                 }
-                channels.push(current_channel.clone());
-
-                current_channel = Channel {
-                    id: String::new(),
-                    name: String::new(),
-                    logo: String::new(),
-                    group: String::new(),
-                    stream_url: String::new(),
-                };
+                channels.push(std::mem::take(&mut current_channel));
             }
         }
 
         channels
     }
+}
+
+fn extract_attr_slice<'a>(line: &'a str, attr_name: &str) -> &'a str {
+    let bytes = line.as_bytes();
+    let name_bytes = attr_name.as_bytes();
+    let mut i = 0;
+    while i + name_bytes.len() + 2 <= bytes.len() {
+        if &bytes[i..i + name_bytes.len()] == name_bytes {
+            let next_byte = bytes[i + name_bytes.len()];
+            if next_byte == b'=' {
+                let quote = bytes[i + name_bytes.len() + 1];
+                if quote == b'"' || quote == b'\'' {
+                    let start = i + name_bytes.len() + 2;
+                    if let Some(end_rel) = bytes[start..].iter().position(|&b| b == quote) {
+                        return &line[start..start + end_rel];
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    ""
+}
+
+fn find_extinf_title_comma(line: &str) -> Option<usize> {
+    let mut in_quote: Option<char> = None;
+    for (idx, ch) in line.char_indices() {
+        match in_quote {
+            Some(quote) if ch == quote => in_quote = None,
+            None if ch == '"' || ch == '\'' => in_quote = Some(ch),
+            None if ch == ',' => return Some(idx),
+            _ => {}
+        }
+    }
+    line.find(',')
 }
 
 fn cache_filename(raw: &str) -> String {
@@ -203,5 +221,21 @@ http://example.com/discovery.m3u8
         assert_eq!(channels[2].name, "Discovery Channel");
         assert_eq!(channels[2].group, "");
         assert_eq!(channels[2].stream_url, "http://example.com/discovery.m3u8");
+    }
+
+    #[test]
+    fn test_parse_m3u_title_with_commas_and_quoted_attributes() {
+        let parser = M3UParser::new();
+        let content = r#"#EXTM3U
+#EXTINF:-1 tvg-id="cnn.us" group-title="News, International",CNN, The Worldwide News Leader
+http://example.com/cnn.m3u8
+#EXTINF:0,Movie Channel, HD (US), 24/7
+http://example.com/movie.m3u8
+"#;
+        let channels = parser.parse_m3u(content);
+        assert_eq!(channels.len(), 2);
+        assert_eq!(channels[0].name, "CNN, The Worldwide News Leader");
+        assert_eq!(channels[0].group, "News, International");
+        assert_eq!(channels[1].name, "Movie Channel, HD (US), 24/7");
     }
 }

@@ -108,6 +108,13 @@ pub struct Season {
     pub episodes: Vec<Episode>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AudioTrackOption {
+    pub subject_id: String,
+    pub language: String,
+    pub label: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MediaDetails {
     pub id: ProviderMediaId,
@@ -125,6 +132,71 @@ pub struct MediaDetails {
     pub duration: Option<String>,
     pub genres: Vec<String>,
     pub seasons: Vec<Season>,
+    pub dubs: Vec<AudioTrackOption>,
+}
+
+impl MediaDetails {
+    pub fn is_series(&self) -> bool {
+        self.media_type == MediaType::Series || !self.seasons.is_empty()
+    }
+
+    pub fn has_languages(&self) -> bool {
+        self.dubs.len() > 1
+    }
+
+    pub fn cover_url(&self) -> Option<&str> {
+        self.poster_url.as_deref()
+    }
+
+    pub fn from_search_result(
+        item: &crate::models::SearchResult,
+        preview: Option<&MediaDetails>,
+    ) -> Self {
+        if let Some(p) = preview.filter(|p| p.id.value == item.id && p.id.provider == item.provider)
+        {
+            let mut details = p.clone();
+            if details.title.trim().is_empty() {
+                details.title = item.title.clone();
+            }
+            if details.year.is_none() && !item.release_year.trim().is_empty() {
+                details.year = Some(item.release_year.clone());
+            }
+            if details.poster_url.is_none() {
+                details.poster_url = item.cover_url.clone();
+            }
+            details
+        } else {
+            MediaDetails {
+                id: ProviderMediaId {
+                    provider: item.provider,
+                    value: item.id.clone(),
+                },
+                title: item.title.clone(),
+                media_type: if item.stype == 2 {
+                    MediaType::Series
+                } else {
+                    MediaType::Movie
+                },
+                year: if !item.release_year.trim().is_empty() {
+                    Some(item.release_year.clone())
+                } else {
+                    None
+                },
+                description: None,
+                tagline: None,
+                imdb_rating: None,
+                director: None,
+                stars: None,
+                prints: None,
+                audios: None,
+                poster_url: item.cover_url.clone(),
+                duration: None,
+                genres: vec![],
+                seasons: vec![],
+                dubs: vec![],
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,6 +224,46 @@ pub struct Release {
     pub season: Option<usize>,
     pub episode: Option<usize>,
     pub mirrors: Vec<SourceMirror>,
+    #[serde(default)]
+    pub resource_id: Option<String>,
+}
+impl Release {
+    pub fn is_multi_resolution(&self) -> bool {
+        self.quality
+            .as_deref()
+            .is_some_and(|q| q.eq_ignore_ascii_case("multi") || q.eq_ignore_ascii_case("multi-res"))
+    }
+
+    pub fn resolution_u64(&self) -> u64 {
+        self.quality
+            .as_deref()
+            .and_then(|q| q.trim_end_matches('p').parse::<u64>().ok())
+            .unwrap_or(1080)
+    }
+
+    pub fn resolution_i64(&self) -> i64 {
+        if self.is_multi_resolution() {
+            -1
+        } else {
+            self.resolution_u64() as i64
+        }
+    }
+    pub fn source_label(&self) -> &str {
+        self.mirrors
+            .first()
+            .map(|m| m.label.as_str())
+            .unwrap_or_else(|| match self.provider {
+                ProviderKind::FourKHdHub => "4KHDHub",
+                ProviderKind::BdixCircleFtp => "CircleFTP",
+                ProviderKind::BdixDhakaFlix => "DhakaFlix",
+                ProviderKind::Addons => "Addon",
+                ProviderKind::MovieBox => "Direct",
+            })
+    }
+
+    pub fn direct_url(&self) -> Option<&str> {
+        self.mirrors.first().map(|m| m.resolver_url.as_str())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -172,5 +284,45 @@ impl PlaybackSource {
             subtitle,
             source_label: provider.label().to_string(),
         }
+    }
+}
+#[derive(Debug, thiserror::Error, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProviderError {
+    #[error("Network connection failed: {0}")]
+    Network(String),
+    #[error("Rate limited by provider")]
+    RateLimited(Option<u64>),
+    #[error("Item not found on provider")]
+    NotFound,
+    #[error("Failed to parse response: {0}")]
+    Parsing(String),
+    #[error("Provider is temporarily unavailable: {0}")]
+    Unavailable(String),
+}
+
+impl ProviderError {
+    pub fn user_message(&self, provider: ProviderKind) -> String {
+        match self {
+            Self::Network(msg) => format!("Network error on {provider}: {msg}"),
+            Self::RateLimited(secs) => match secs {
+                Some(s) => format!("Rate limited on {provider}. Retry in {s}s."),
+                None => format!("Rate limited on {provider}."),
+            },
+            Self::NotFound => format!("Content not found on {provider}."),
+            Self::Parsing(msg) => format!("Parser error on {provider}: {msg}"),
+            Self::Unavailable(msg) => format!("{provider} unavailable: {msg}"),
+        }
+    }
+}
+
+impl From<String> for ProviderError {
+    fn from(msg: String) -> Self {
+        Self::Unavailable(msg)
+    }
+}
+
+impl From<&str> for ProviderError {
+    fn from(msg: &str) -> Self {
+        Self::Unavailable(msg.to_string())
     }
 }

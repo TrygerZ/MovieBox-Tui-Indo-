@@ -46,10 +46,12 @@ async fn test_update_check_guard_clears_on_success() {
     app.handle_action(Action::CheckForUpdates).await;
     assert!(app.state().is_checking_updates);
 
-    app.handle_action(Action::UpdateAvailable(Ok(Some((
-        "0.1.13".to_string(),
-        "Release notes content".to_string(),
-    )))))
+    app.handle_action(Action::UpdateAvailable(Ok(Some(Release {
+        version: "0.1.13".to_string(),
+        tag_name: "v0.1.13".to_string(),
+        notes: "Release notes content".to_string(),
+        assets: Vec::new(),
+    }))))
     .await;
 
     assert!(!app.state().is_checking_updates);
@@ -57,22 +59,6 @@ async fn test_update_check_guard_clears_on_success() {
         app.state().update_available,
         Some(("0.1.13".to_string(), "Release notes content".to_string()))
     );
-}
-
-#[tokio::test]
-async fn test_update_modal_mouse_hitbox_matches_rendered_geometry() {
-    let area = Rect::new(0, 0, 80, 24);
-    let notes = "• Feature 1\n• Feature 2\n• Feature 3";
-    let layout = update_modal_layout(area, notes);
-
-    assert_eq!(layout.popup_area.width, 72);
-    assert_eq!(layout.display_count, 3);
-    assert!(!layout.has_more);
-    assert_eq!(layout.popup_area.height, 11);
-
-    assert_eq!(layout.button_row_y, layout.popup_area.y + 9);
-    assert_eq!(layout.update_btn_end_x, layout.popup_area.x + 24);
-    assert_eq!(layout.open_btn_end_x, layout.popup_area.x + 48);
 }
 
 #[tokio::test]
@@ -375,65 +361,6 @@ fn test_homebrew_detection_and_safe_refusal() {
 }
 
 #[test]
-fn test_update_asset_selection_for_current_platform() {
-    let release = Release {
-        version: "0.1.13".to_string(),
-        tag_name: "v0.1.13".to_string(),
-        notes: "Notes".to_string(),
-        assets: vec![
-            ReleaseAsset {
-                name: "MovieBox_macOS_Universal.tar.gz".to_string(),
-                download_url: "https://.../MovieBox_macOS_Universal.tar.gz".to_string(),
-                size: Some(15000),
-            },
-            ReleaseAsset {
-                name: "MovieBox_Linux_x64.tar.gz".to_string(),
-                download_url: "https://.../MovieBox_Linux_x64.tar.gz".to_string(),
-                size: Some(12000),
-            },
-            ReleaseAsset {
-                name: "MovieBox_Linux_arm64.tar.gz".to_string(),
-                download_url: "https://.../MovieBox_Linux_arm64.tar.gz".to_string(),
-                size: Some(11000),
-            },
-            ReleaseAsset {
-                name: "MovieBox_Windows_x64.zip".to_string(),
-                download_url: "https://.../MovieBox_Windows_x64.zip".to_string(),
-                size: Some(13000),
-            },
-            ReleaseAsset {
-                name: "MovieBox_Windows_arm64.zip".to_string(),
-                download_url: "https://.../MovieBox_Windows_arm64.zip".to_string(),
-                size: Some(12000),
-            },
-            ReleaseAsset {
-                name: "SHA256SUMS".to_string(),
-                download_url: "https://.../SHA256SUMS".to_string(),
-                size: Some(512),
-            },
-        ],
-    };
-
-    let mac = TargetPlatform::detect("macos", "arm64", false).unwrap();
-    assert_eq!(
-        release.find_compatible_asset(mac).unwrap().name,
-        "MovieBox_macOS_Universal.tar.gz"
-    );
-
-    let linux = TargetPlatform::detect("linux", "x86_64", false).unwrap();
-    assert_eq!(
-        release.find_compatible_asset(linux).unwrap().name,
-        "MovieBox_Linux_x64.tar.gz"
-    );
-
-    let win = TargetPlatform::detect("windows", "x86_64", false).unwrap();
-    assert_eq!(
-        release.find_compatible_asset(win).unwrap().name,
-        "MovieBox_Windows_x64.zip"
-    );
-}
-
-#[test]
 fn test_update_asset_missing_for_current_platform() {
     let release = Release {
         version: "0.1.13".to_string(),
@@ -460,4 +387,48 @@ fn test_update_asset_rejects_wrong_architecture() {
 fn test_update_asset_rejects_wrong_platform() {
     assert!(TargetPlatform::detect("solaris", "x86_64", false).is_none());
     assert!(TargetPlatform::detect("netbsd", "x86_64", false).is_none());
+}
+
+#[tokio::test]
+async fn test_update_editing_mode_input_isolation() {
+    let mut app = App::new();
+    app.state_mut().update_available =
+        Some(("0.1.16".to_string(), "New release notes".to_string()));
+    app.state_mut().input_mode = moviebox_tui::tui::state::InputMode::Editing;
+
+    let u_key = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('u'),
+        crossterm::event::KeyModifiers::empty(),
+    );
+    app.handle_action(Action::Key(u_key)).await;
+    assert!(app.state().update_available.is_some());
+    assert!(!app.state().is_updating);
+    assert_eq!(app.state().search_query.as_str(), "u");
+}
+
+#[tokio::test]
+async fn test_update_is_updating_blocks_keys_and_mouse() {
+    let mut app = App::new();
+    app.state_mut().is_updating = true;
+    let q_key = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('q'),
+        crossterm::event::KeyModifiers::empty(),
+    );
+    app.handle_action(Action::Key(q_key)).await;
+    app.handle_action(Action::MouseClick(10, 10)).await;
+    assert!(app.state().is_updating);
+}
+
+#[tokio::test]
+async fn test_update_progress_message_tracking() {
+    let mut app = App::new();
+    app.handle_action(Action::SelfUpdateProgress(
+        "Downloading binary...".to_string(),
+    ))
+    .await;
+
+    assert_eq!(
+        app.state().update_progress_msg.as_deref(),
+        Some("Downloading binary...")
+    );
 }

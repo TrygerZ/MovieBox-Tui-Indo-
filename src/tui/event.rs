@@ -43,10 +43,14 @@ impl EventHandler {
                             Ok(CrosstermEvent::Mouse(mouse)) => {
                                 match mouse.kind {
                                     crossterm::event::MouseEventKind::ScrollUp => {
-                                        let _ = event_sender.send(Action::Key(crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Up, crossterm::event::KeyModifiers::empty()))).await;
+                                        let _ = event_sender
+                                            .send(Action::WheelScroll { up: true })
+                                            .await;
                                     }
                                     crossterm::event::MouseEventKind::ScrollDown => {
-                                        let _ = event_sender.send(Action::Key(crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Down, crossterm::event::KeyModifiers::empty()))).await;
+                                        let _ = event_sender
+                                            .send(Action::WheelScroll { up: false })
+                                            .await;
                                     }
                                     crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
                                         let _ = event_sender.send(Action::MouseClick(mouse.column, mouse.row)).await;

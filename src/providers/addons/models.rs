@@ -385,7 +385,15 @@ pub struct MetaDetail {
     #[serde(default, deserialize_with = "de_string_or_vec")]
     pub cast: Vec<String>,
     #[serde(default, deserialize_with = "de_string_or_vec")]
+    pub stars: Vec<String>,
+    #[serde(default, deserialize_with = "de_string_or_vec")]
     pub director: Vec<String>,
+    #[serde(default, deserialize_with = "de_string_or_vec")]
+    pub directors: Vec<String>,
+    #[serde(default, deserialize_with = "de_string_or_vec")]
+    pub writer: Vec<String>,
+    #[serde(default, deserialize_with = "de_string_or_vec")]
+    pub writers: Vec<String>,
     #[serde(default)]
     pub videos: Vec<MetaVideo>,
 }

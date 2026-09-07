@@ -15,7 +15,7 @@ impl Default for AddonClient {
 
 impl AddonClient {
     pub fn new() -> Self {
-        let http = Client::builder()
+        let http = crate::net::http_client_builder()
             .timeout(Duration::from_secs(12))
             .connect_timeout(Duration::from_secs(8))
             .user_agent("MovieBox-Tui/1.0 (Addon-Client)")
@@ -28,7 +28,7 @@ impl AddonClient {
         let mut url = raw.trim().to_string();
         if url.starts_with("stremio://") {
             url = format!("https://{}", &url["stremio://".len()..]);
-        } else if !crate::tui::text::is_http_url(&url) {
+        } else if !crate::net::is_http_url(&url) {
             url = format!("https://{url}");
         }
         if !url.ends_with("/manifest.json") && !url.contains("/manifest.json?") {
@@ -53,14 +53,13 @@ impl AddonClient {
     pub async fn fetch_manifest(&self, manifest_url: &str) -> Result<AddonManifest, String> {
         let url = Self::normalize_manifest_url(manifest_url);
         let url_clone = url.clone();
-        if let Ok(Some(cached_json)) =
-            tokio::task::spawn_blocking(move || crate::cache::get_addon_manifest_cache(&url_clone))
-                .await
+        if let Ok(Some(manifest)) = tokio::task::spawn_blocking(move || {
+            crate::cache::get_addon_manifest_cache_typed(&url_clone)
+        })
+        .await
         {
-            if let Ok(manifest) = serde_json::from_value::<AddonManifest>(cached_json) {
-                if !manifest.name.trim().is_empty() {
-                    return Ok(manifest);
-                }
+            if !manifest.name.trim().is_empty() {
+                return Ok(manifest);
             }
         }
 
@@ -84,12 +83,11 @@ impl AddonClient {
             return Err("Addon manifest missing valid name".to_string());
         }
 
-        if let Ok(json_val) = serde_json::to_value(&manifest) {
-            let url_clone = url.clone();
-            tokio::task::spawn_blocking(move || {
-                crate::cache::set_addon_manifest_cache(&url_clone, &json_val);
-            });
-        }
+        let url_clone = url.clone();
+        let manifest_clone = manifest.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::cache::set_addon_manifest_cache_typed(&url_clone, &manifest_clone);
+        });
 
         Ok(manifest)
     }

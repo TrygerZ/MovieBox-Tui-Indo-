@@ -181,6 +181,7 @@ impl CircleFtpClient {
             duration,
             genres,
             seasons,
+            dubs: vec![],
         })
     }
 
@@ -285,6 +286,7 @@ impl CircleFtpClient {
                                             headers: Vec::new(),
                                             direct_file: true,
                                         }],
+                                        resource_id: None,
                                     });
                                 }
                             }
@@ -320,6 +322,7 @@ impl CircleFtpClient {
                         headers: Vec::new(),
                         direct_file: true,
                     }],
+                    resource_id: None,
                 });
             }
         }
@@ -333,7 +336,7 @@ impl CircleFtpClient {
 }
 
 fn build_client() -> reqwest::Client {
-    reqwest::Client::builder()
+    crate::net::http_client_builder()
         .timeout(Duration::from_secs(5))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())

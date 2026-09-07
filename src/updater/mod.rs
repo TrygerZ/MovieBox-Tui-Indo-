@@ -16,6 +16,30 @@ pub async fn perform_self_update(
     release: &Release,
     progress_sender: Option<&tokio::sync::mpsc::UnboundedSender<String>>,
 ) -> Result<SelfUpdateOutcome, String> {
+    let current_exe = std::env::current_exe()
+        .map_err(|e| format!("failed to get current executable path: {e}"))?;
+
+    let env = detect_environment(&current_exe);
+    match env {
+        InstallationEnvironment::Homebrew => {
+            return Ok(SelfUpdateOutcome::RequiresManualUpgrade(
+                "This installation is managed by Homebrew. Run: brew upgrade moviebox-tui"
+                    .to_string(),
+            ));
+        }
+        InstallationEnvironment::Termux => {
+            return Ok(SelfUpdateOutcome::RequiresManualUpgrade(
+                "Android / Termux update: run 'curl -fsSL https://raw.githubusercontent.com/mesamirh/MovieBox-Tui/main/install.sh | bash'".to_string(),
+            ));
+        }
+        InstallationEnvironment::ReadOnly => {
+            return Ok(SelfUpdateOutcome::RequiresManualUpgrade(
+                "MovieBox-Tui binary is not user-writable. Please update via your system package manager.".to_string(),
+            ));
+        }
+        InstallationEnvironment::DirectReplace | InstallationEnvironment::WindowsHelper => {}
+    }
+
     let platform = TargetPlatform::current().ok_or_else(|| {
         "current operating system or architecture is not supported for in-app self-update"
             .to_string()
@@ -31,29 +55,17 @@ pub async fn perform_self_update(
     let checksum_asset = release
         .find_checksum_asset()
         .ok_or_else(|| "no SHA256SUMS checksum file found in GitHub release".to_string())?;
-
-    let current_exe = std::env::current_exe()
-        .map_err(|e| format!("failed to get current executable path: {e}"))?;
-
-    let env = detect_environment(&current_exe);
-    if env == InstallationEnvironment::Homebrew {
-        return Ok(SelfUpdateOutcome::RequiresManualUpgrade(
-            "This installation is managed by Homebrew. Run: brew upgrade moviebox-tui".to_string(),
-        ));
-    }
-    if env == InstallationEnvironment::ReadOnly {
-        return Ok(SelfUpdateOutcome::RequiresManualUpgrade(
-            "MovieBox-Tui binary is not user-writable. Please update via your system package manager.".to_string(),
-        ));
-    }
-
     let temp_dir = tempfile::Builder::new()
         .prefix("moviebox_update_")
         .tempdir()
         .map_err(|e| format!("failed to create temporary update directory: {e}"))?;
 
     let archive_path = temp_dir.path().join(&asset.name);
-    let staged_binary_path = temp_dir.path().join(platform.expected_binary_name());
+    let staged_binary_path = if env == InstallationEnvironment::WindowsHelper {
+        apply::persistent_staging_path(&current_exe)
+    } else {
+        temp_dir.path().join(platform.expected_binary_name())
+    };
 
     if let Some(tx) = progress_sender {
         let _ = tx.send(format!("Downloading {}...", asset.name));
@@ -254,15 +266,10 @@ mod tests {
     }
 
     #[test]
-    fn test_update_asset_termux_arm64_selection() {
-        let release = sample_release_with_all_assets();
-        let termux_arm64 = TargetPlatform::detect("linux", "aarch64", true).unwrap();
-        assert_eq!(termux_arm64, TargetPlatform::LinuxArm64);
-
-        let asset = release.find_compatible_asset(termux_arm64).unwrap();
-        assert_eq!(asset.name, "MovieBox_Linux_arm64.tar.gz");
-
+    fn test_update_asset_termux_is_protected_from_glibc_binary() {
+        assert!(TargetPlatform::detect("linux", "aarch64", true).is_none());
         assert!(TargetPlatform::detect("linux", "x86_64", true).is_none());
+        assert!(TargetPlatform::detect("android", "aarch64", false).is_none());
     }
 
     #[test]

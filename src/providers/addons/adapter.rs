@@ -1,6 +1,9 @@
 use super::models::{MetaDetail, MetaItem, StreamItem};
 use crate::models::SearchResult;
-use crate::providers::models::{PlaybackSource, ProviderKind, Release, SourceMirror};
+use crate::providers::models::{
+    CatalogItem, Episode, MediaDetails, MediaType, PlaybackSource, ProviderKind, ProviderMediaId,
+    Release, Season, SourceMirror,
+};
 use std::collections::BTreeMap;
 
 pub fn meta_to_search_result(item: &MetaItem) -> SearchResult {
@@ -35,63 +38,44 @@ pub fn meta_to_search_result(item: &MetaItem) -> SearchResult {
     }
 }
 
-pub fn metas_to_moviebox_search_json(metas: Vec<MetaItem>) -> serde_json::Value {
-    let mut seen_ids = std::collections::HashSet::new();
-    let subjects = metas
-        .into_iter()
-        .filter(|item| seen_ids.insert(item.id.clone()))
-        .map(|item| {
-            let is_series = item.r#type.eq_ignore_ascii_case("series")
-                || item.r#type.eq_ignore_ascii_case("tv")
-                || item.r#type.eq_ignore_ascii_case("anime");
-            let year: String = item
-                .release_info
-                .as_deref()
-                .or(item.year.as_deref())
-                .or(item.released.as_deref())
-                .map(crate::tui::text::extract_4digit_year)
-                .unwrap_or_default();
+pub fn meta_to_catalog_item(item: &MetaItem) -> CatalogItem {
+    let is_series = item.r#type.eq_ignore_ascii_case("series")
+        || item.r#type.eq_ignore_ascii_case("tv")
+        || item.r#type.eq_ignore_ascii_case("anime");
+    let year: Option<String> = item
+        .release_info
+        .as_deref()
+        .or(item.year.as_deref())
+        .or(item.released.as_deref())
+        .map(crate::tui::text::extract_4digit_year)
+        .filter(|y| !y.is_empty());
 
-            let title = if !item.name.trim().is_empty() {
-                item.name.clone()
-            } else {
-                item.title.clone().unwrap_or_else(|| "Unknown".to_string())
-            };
+    let title = if !item.name.trim().is_empty() {
+        item.name.clone()
+    } else {
+        item.title.clone().unwrap_or_else(|| "Unknown".to_string())
+    };
 
-            let poster_url = item
-                .poster
-                .clone()
-                .or_else(|| item.cover.clone())
-                .unwrap_or_default();
+    let poster_url = item.poster.clone().or_else(|| item.cover.clone());
 
-            let desc = item.description.clone();
-            let rating = item.imdb_rating.clone().or_else(|| item.rating.clone());
-            let genres = item.genres.clone();
-
-            serde_json::json!({
-                "subjectId": item.id,
-                "title": title,
-                "subjectType": if is_series { 2 } else { 1 },
-                "releaseDate": year,
-                "description": desc,
-                "intro": desc,
-                "imdbRatingValue": rating,
-                "genre": genres,
-                "cover": {
-                    "url": poster_url
-                }
-            })
-        })
-        .collect::<Vec<_>>();
-
-    serde_json::json!({
-        "results": [{
-            "subjects": subjects
-        }]
-    })
+    CatalogItem {
+        id: ProviderMediaId {
+            provider: ProviderKind::Addons,
+            value: item.id.clone(),
+        },
+        title,
+        media_type: if is_series {
+            MediaType::Series
+        } else {
+            MediaType::Movie
+        },
+        year,
+        poster_url,
+        season_count: None,
+    }
 }
 
-pub fn meta_detail_to_moviebox_json(detail: &MetaDetail) -> serde_json::Value {
+pub fn meta_detail_to_media_details(detail: &MetaDetail) -> MediaDetails {
     let is_series = detail.r#type.eq_ignore_ascii_case("series")
         || detail.r#type.eq_ignore_ascii_case("tv")
         || detail.r#type.eq_ignore_ascii_case("anime")
@@ -111,24 +95,20 @@ pub fn meta_detail_to_moviebox_json(detail: &MetaDetail) -> serde_json::Value {
         eps.sort_unstable();
     }
 
-    let mut seasons_json = season_map
+    let seasons = season_map
         .into_iter()
-        .map(|(season_num, eps)| {
-            serde_json::json!({
-                "se": season_num,
-                "maxEp": eps.len(),
-                "episodeNumbers": eps
-            })
+        .map(|(season_num, eps)| Season {
+            number: season_num,
+            episodes: eps
+                .into_iter()
+                .map(|ep_num| Episode {
+                    season: season_num,
+                    number: ep_num,
+                    title: None,
+                })
+                .collect(),
         })
         .collect::<Vec<_>>();
-
-    if is_series && seasons_json.is_empty() {
-        seasons_json = vec![serde_json::json!({
-            "se": 1,
-            "maxEp": 1,
-            "episodeNumbers": vec![1]
-        })];
-    }
 
     let year_raw = detail
         .release_info
@@ -137,17 +117,13 @@ pub fn meta_detail_to_moviebox_json(detail: &MetaDetail) -> serde_json::Value {
         .or(detail.released.as_deref())
         .unwrap_or_default();
     let year = crate::tui::text::extract_4digit_year(year_raw);
-
-    let mut genres = detail.genres.clone();
-    if genres.is_empty() {
-        genres = detail.genre.clone();
-    }
-
-    let poster_url = detail
-        .poster
-        .clone()
-        .or_else(|| detail.cover.clone())
-        .or_else(|| detail.background.clone());
+    let year = if !year.is_empty() {
+        Some(year)
+    } else if !year_raw.is_empty() {
+        Some(year_raw.to_string())
+    } else {
+        None
+    };
 
     let title = if !detail.name.trim().is_empty() {
         detail.name.clone()
@@ -158,42 +134,86 @@ pub fn meta_detail_to_moviebox_json(detail: &MetaDetail) -> serde_json::Value {
             .unwrap_or_else(|| "Unknown".to_string())
     };
 
+    let poster_url = detail
+        .poster
+        .clone()
+        .or_else(|| detail.cover.clone())
+        .or_else(|| detail.background.clone());
+
     let description = detail
         .description
         .clone()
         .or_else(|| detail.overview.clone())
         .or_else(|| detail.synopsis.clone());
 
-    let rating = detail.imdb_rating.clone().or_else(|| detail.rating.clone());
-
-    serde_json::json!({
-        "id": detail.id,
-        "subjectId": detail.id,
-        "title": title,
-        "subjectType": if is_series { 2 } else { 1 },
-        "releaseDate": if year.is_empty() { year_raw.to_string() } else { year },
-        "description": description.clone(),
-        "intro": description.clone(),
-        "synopsis": description,
-        "imdbRatingValue": rating,
-        "director": if detail.director.is_empty() { None } else { Some(detail.director.join(", ")) },
-        "stars": if detail.cast.is_empty() { None } else { Some(detail.cast.join(", ")) },
-        "duration": detail.runtime,
-        "cover": { "url": poster_url },
-        "genre": genres,
-        "seasons": { "seasons": seasons_json }
-    })
+    MediaDetails {
+        id: ProviderMediaId {
+            provider: ProviderKind::Addons,
+            value: detail.id.clone(),
+        },
+        title,
+        media_type: if is_series {
+            MediaType::Series
+        } else {
+            MediaType::Movie
+        },
+        year,
+        description,
+        tagline: None,
+        imdb_rating: detail.imdb_rating.clone().or_else(|| detail.rating.clone()),
+        director: if !detail.director.is_empty() {
+            Some(detail.director.join(", "))
+        } else if !detail.directors.is_empty() {
+            Some(detail.directors.join(", "))
+        } else if !detail.writers.is_empty() {
+            Some(detail.writers.join(", "))
+        } else if !detail.writer.is_empty() {
+            Some(detail.writer.join(", "))
+        } else {
+            None
+        },
+        stars: if !detail.cast.is_empty() {
+            Some(detail.cast.join(", "))
+        } else if !detail.stars.is_empty() {
+            Some(detail.stars.join(", "))
+        } else {
+            None
+        },
+        prints: None,
+        audios: None,
+        poster_url,
+        duration: detail.runtime.clone(),
+        genres: if !detail.genres.is_empty() {
+            detail.genres.clone()
+        } else {
+            detail.genre.clone()
+        },
+        seasons,
+        dubs: vec![],
+    }
 }
 
 pub fn parse_quality(text: &str) -> Option<String> {
     let upper = text.to_ascii_uppercase();
     if upper.contains("2160P") || upper.contains("4K") || upper.contains("UHD") {
         Some("2160p".to_string())
-    } else if upper.contains("1080P") || upper.contains("FHD") || upper.contains("FULL HD") {
+    } else if upper.contains("1080P")
+        || upper.contains("FHD")
+        || upper.contains("FULL HD")
+        || upper.contains("FULLHD")
+    {
         Some("1080p".to_string())
-    } else if upper.contains("720P") || upper.contains("HD") {
+    } else if upper.contains("720P")
+        || upper
+            .split(|c: char| !c.is_alphanumeric())
+            .any(|w| w == "HD")
+    {
         Some("720p".to_string())
-    } else if upper.contains("480P") || upper.contains("SD") {
+    } else if upper.contains("480P")
+        || upper
+            .split(|c: char| !c.is_alphanumeric())
+            .any(|w| w == "SD")
+    {
         Some("480p".to_string())
     } else {
         None
@@ -504,7 +524,7 @@ pub fn stream_item_to_release(
     episode: usize,
 ) -> Option<Release> {
     let url = stream.url.as_ref()?.trim();
-    if !crate::tui::text::is_http_url(url) {
+    if !crate::net::is_http_url(url) {
         return None;
     }
 
@@ -571,44 +591,8 @@ pub fn stream_item_to_release(
             headers,
             direct_file: true,
         }],
+        resource_id: None,
     })
-}
-
-pub fn releases_to_moviebox_json(releases: &[Release]) -> serde_json::Value {
-    let list = releases
-        .iter()
-        .enumerate()
-        .map(|(index, release)| {
-            let resolution = release
-                .quality
-                .as_deref()
-                .and_then(|q| q.trim_end_matches('p').parse::<u64>().ok())
-                .unwrap_or(1080);
-            let first_mirror = release.mirrors.first();
-            let source_label = first_mirror
-                .map(|m| m.label.clone())
-                .unwrap_or_else(|| "Addon".to_string());
-            let resource_link = first_mirror.map(|m| m.resolver_url.clone());
-
-            serde_json::json!({
-                "resourceId": format!("addon-{index}"),
-                "resourceLink": resource_link,
-                "title": release.filename,
-                "fileName": release.filename,
-                "size": release.size_bytes.map(|s| s.to_string()),
-                "resolution": resolution,
-                "codecName": release.codec,
-                "language": release.language,
-                "sourceCount": release.mirrors.len(),
-                "uploadBy": source_label,
-                "se": release.season.unwrap_or_default(),
-                "ep": release.episode.unwrap_or_default(),
-                "_addon_release": release
-            })
-        })
-        .collect::<Vec<_>>();
-
-    serde_json::Value::Array(list)
 }
 
 pub fn release_to_playback_source(release: &Release) -> Option<PlaybackSource> {
@@ -620,4 +604,105 @@ pub fn release_to_playback_source(release: &Release) -> Option<PlaybackSource> {
         subtitle: None,
         source_label: mirror.label.clone(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_meta_to_catalog_item() {
+        let item = MetaItem {
+            id: "tt1234".to_string(),
+            r#type: "movie".to_string(),
+            name: "Test Movie".to_string(),
+            title: None,
+            poster: Some("https://example.com/poster.jpg".to_string()),
+            cover: None,
+            description: Some("Description".to_string()),
+            overview: None,
+            synopsis: None,
+            release_info: Some("2022".to_string()),
+            year: None,
+            released: None,
+            imdb_rating: Some("7.5".to_string()),
+            rating: None,
+            genres: vec!["Action".to_string()],
+            genre: Vec::new(),
+        };
+
+        let catalog = meta_to_catalog_item(&item);
+        assert_eq!(catalog.id.value, "tt1234");
+        assert_eq!(catalog.title, "Test Movie");
+        assert_eq!(catalog.media_type, MediaType::Movie);
+        assert_eq!(catalog.year.as_deref(), Some("2022"));
+        assert_eq!(
+            catalog.poster_url.as_deref(),
+            Some("https://example.com/poster.jpg")
+        );
+    }
+
+    #[test]
+    fn test_meta_detail_to_media_details() {
+        let detail = MetaDetail {
+            id: "tt5678".to_string(),
+            r#type: "series".to_string(),
+            name: "Test Series".to_string(),
+            title: None,
+            poster: Some("https://example.com/series.jpg".to_string()),
+            cover: None,
+            background: None,
+            logo: None,
+            description: Some("Series description".to_string()),
+            overview: None,
+            synopsis: None,
+            release_info: Some("2021".to_string()),
+            year: None,
+            released: None,
+            imdb_rating: Some("8.2".to_string()),
+            rating: None,
+            genres: vec!["Drama".to_string()],
+            genre: Vec::new(),
+            runtime: Some("45m".to_string()),
+            cast: vec!["Actor One".to_string(), "Actor Two".to_string()],
+            stars: Vec::new(),
+            director: vec!["Director Name".to_string()],
+            directors: Vec::new(),
+            writer: Vec::new(),
+            writers: Vec::new(),
+            videos: vec![
+                super::super::models::MetaVideo {
+                    id: Some("ep1".to_string()),
+                    title: Some("Pilot".to_string()),
+                    name: None,
+                    season: Some(1),
+                    episode: Some(1),
+                    number: None,
+                    released: None,
+                    thumbnail: None,
+                },
+                super::super::models::MetaVideo {
+                    id: Some("ep2".to_string()),
+                    title: Some("Episode 2".to_string()),
+                    name: None,
+                    season: Some(1),
+                    episode: Some(2),
+                    number: None,
+                    released: None,
+                    thumbnail: None,
+                },
+            ],
+        };
+
+        let media = meta_detail_to_media_details(&detail);
+        assert_eq!(media.id.value, "tt5678");
+        assert_eq!(media.title, "Test Series");
+        assert_eq!(media.media_type, MediaType::Series);
+        assert_eq!(media.year.as_deref(), Some("2021"));
+        assert_eq!(media.director.as_deref(), Some("Director Name"));
+        assert_eq!(media.stars.as_deref(), Some("Actor One, Actor Two"));
+        assert_eq!(media.seasons.len(), 1);
+        assert_eq!(media.seasons[0].number, 1);
+        assert_eq!(media.seasons[0].episodes.len(), 2);
+    }
 }

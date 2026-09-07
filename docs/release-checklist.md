@@ -11,13 +11,20 @@ Run the repository checks first:
 ```bash
 cargo fmt --check
 cargo clippy --all-targets --all-features --locked -- -D warnings
-cargo check --locked
-cargo test --locked
+cargo check --all-targets --all-features --locked
+cargo test --all-features --locked
 cargo audit
 cargo package --locked
 ```
 
-Confirm the entire unit and integration test suite passes cleanly across all targets (`docs/testing.md`).
+Confirm the entire unit and integration test suite passes on the CI host matrix
+(`docs/testing.md`). Release targets that are cross-compiled must at least build
+cleanly and pass the release workflow's target-binary `--version` smoke test; they
+still require native player/runtime checks before release certification. A local
+host without the target C/linker toolchain cannot substitute for that runner result.
+Known gap: the Windows ARM64 binary is built and published but never executed by the
+release workflow (x64 runners cannot run it); smoke-test it manually, e.g. under
+Windows on ARM emulation or a native ARM64 device, before certifying a release.
 
 Confirm the main GitHub Actions workflows are green:
 
@@ -80,6 +87,7 @@ Confirm:
 Verify on a real Termux device before calling the desktop release production-ready:
 
 - app starts normally
+- app does not reproduce the historical `rustls-platform-verifier` initialization panic
 - `Play` opens the Android chooser through `termux-open` or `/system/bin/am`
 - chosen player starts playback
 - downloads still go where the docs describe

@@ -20,6 +20,10 @@ while [ $# -gt 0 ]; do
             shift
             ;;
         --version|-v)
+            if [ $# -lt 2 ] || [ -z "${2:-}" ]; then
+                printf "error: --version requires a release tag argument.\n" >&2
+                exit 1
+            fi
             VERSION="${2:-}"
             shift 2
             ;;
@@ -28,6 +32,10 @@ while [ $# -gt 0 ]; do
             shift
             ;;
         --dir)
+            if [ $# -lt 2 ] || [ -z "${2:-}" ]; then
+                printf "error: --dir requires a path argument.\n" >&2
+                exit 1
+            fi
             CUSTOM_DIR="${2:-}"
             shift 2
             ;;
@@ -52,11 +60,11 @@ while [ $# -gt 0 ]; do
 MovieBox-TUI Installer
 
 USAGE:
-    curl -fsSL https://raw.githubusercontent.com/mesamirh/MovieBox-Tui/main/install.sh | bash [OPTIONS]
+    curl -fsSL https://raw.githubusercontent.com/mesamirh/MovieBox-Tui/main/install.sh | bash -s -- [OPTIONS]
     ./install.sh [OPTIONS]
 
 OPTIONS:
-    -v, --version <tag>    Install a specific version (e.g. v0.1.12)
+    -v, --version <tag>    Install a specific version (e.g. v0.1.14)
         --dir <path>       Install binary to a custom directory
     -f, --force            Reinstall even if already at the latest version
         --dry-run          Perform preflight checks without writing files
@@ -67,9 +75,14 @@ EOF
             exit 0
             ;;
         *)
+            printf "warning: ignoring unknown argument: %s\n" "$1" >&2
             shift
             ;;
     esac
+done
+
+while [ -n "$CUSTOM_DIR" ] && [ "${CUSTOM_DIR%/}" != "$CUSTOM_DIR" ]; do
+    CUSTOM_DIR="${CUSTOM_DIR%/}"
 done
 
 IS_TTY=0
@@ -136,11 +149,16 @@ fi
 
 cleanup() {
     printf "%b" "$CURSOR_SHOW" 2>/dev/null || true
+    if [ -n "${TMP_VER_FILE:-}" ] && [ -f "$TMP_VER_FILE" ]; then
+        rm -f "$TMP_VER_FILE"
+    fi
     if [ -n "${TMP_DIR:-}" ] && [ -d "$TMP_DIR" ]; then
         rm -rf "$TMP_DIR"
     fi
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 log_step() {
     printf "  %b%s%b %b%s%b\n" "$C_BLUE" "→" "$C_RESET" "$C_TEXT" "$1" "$C_RESET"
@@ -164,12 +182,33 @@ clear_screen() {
     fi
 }
 
+get_terminal_cols() {
+    local cols=""
+    if [ -n "${COLUMNS:-}" ] && [[ "$COLUMNS" =~ ^[0-9]+$ ]] && [ "$COLUMNS" -gt 0 ]; then
+        cols="$COLUMNS"
+    elif [ -t 1 ] || [ -t 2 ]; then
+        cols=$(tput cols 2>/dev/null || true)
+        if [ -z "$cols" ] || [ "$cols" -le 0 ] 2>/dev/null; then
+            cols=$(stty size 2>/dev/null | awk '{print $2}')
+        fi
+    fi
+    if [ -z "$cols" ] || [ "$cols" -le 0 ] 2>/dev/null; then
+        cols=80
+    fi
+    printf "%s" "$cols"
+}
+
 print_header() {
     clear_screen
-    if [ "$IS_COLOR" -eq 1 ] && [ "$IS_TTY" -eq 1 ]; then
-        printf "%b\n" "$CURSOR_HIDE"
-        printf "%b%b" "$C_BOLD" "$C_MAUVE"
-        local lines=(
+    local cols
+    cols=$(get_terminal_cols)
+
+    local lines=()
+    local banner_width=0
+
+    if [ "$cols" -ge 76 ]; then
+        banner_width=72
+        lines=(
             "███╗   ███╗  ██████╗  ██╗   ██╗ ██╗ ███████╗ ██████╗   ██████╗  ██╗  ██╗"
             "████╗ ████║ ██╔═══██╗ ██║   ██║ ██║ ██╔════╝ ██╔══██╗ ██╔═══██╗ ╚██╗██╔╝"
             "██╔████╔██║ ██║   ██║ ██║   ██║ ██║ █████╗   ██████╔╝ ██║   ██║  ╚███╔╝ "
@@ -177,22 +216,60 @@ print_header() {
             "██║ ╚═╝ ██║ ╚██████╔╝  ╚████╔╝  ██║ ███████╗ ██████╔╝ ╚██████╔╝ ██╔╝ ██╗"
             "╚═╝     ╚═╝  ╚═════╝    ╚═══╝   ╚═╝ ╚══════╝ ╚═════╝   ╚═════╝  ╚═╝  ╚═╝"
         )
+    elif [ "$cols" -ge 36 ]; then
+        banner_width=31
+        lines=(
+            "█▀▄▀█ █▀█ █ █ █ █▀▀ █▀▄ █▀█ ▀▄▀"
+            "█ ▀ █ █▄█ ▀▄▀ █ ██▄ █▄▀ █▄█ █ █"
+        )
+    else
+        banner_width=12
+        lines=(
+            "MovieBox-TUI"
+        )
+    fi
+
+    local banner_pad=0
+    if [ "$cols" -gt "$banner_width" ]; then
+        banner_pad=$(( (cols - banner_width) / 2 ))
+    fi
+
+    local sub="Official Installer"
+    local sub_len=${#sub}
+    local sub_pad=0
+    if [ "$cols" -gt "$sub_len" ]; then
+        sub_pad=$(( (cols - sub_len) / 2 ))
+    fi
+
+    if [ "$IS_COLOR" -eq 1 ] && [ "$IS_TTY" -eq 1 ]; then
+        printf "%b\n" "$CURSOR_HIDE"
+        printf "%b%b" "$C_BOLD" "$C_MAUVE"
         for line in "${lines[@]}"; do
-            printf "%s\n" "$line"
+            if [ "$banner_pad" -gt 0 ]; then
+                printf "%*s%s\n" "$banner_pad" "" "$line"
+            else
+                printf "%s\n" "$line"
+            fi
             sleep 0.02
         done
-        printf "%b%b                           Official Installer%b%b\n\n" "$C_SAPPHIRE" "$C_BOLD" "$C_RESET" "$CURSOR_SHOW"
+        if [ "$sub_pad" -gt 0 ]; then
+            printf "%*s%b%b%s%b%b\n\n" "$sub_pad" "" "$C_SAPPHIRE" "$C_BOLD" "$sub" "$C_RESET" "$CURSOR_SHOW"
+        else
+            printf "%b%b%s%b%b\n\n" "$C_SAPPHIRE" "$C_BOLD" "$sub" "$C_RESET" "$CURSOR_SHOW"
+        fi
     else
-        cat << 'EOF'
-███╗   ███╗  ██████╗  ██╗   ██╗ ██╗ ███████╗ ██████╗   ██████╗  ██╗  ██╗
-████╗ ████║ ██╔═══██╗ ██║   ██║ ██║ ██╔════╝ ██╔══██╗ ██╔═══██╗ ╚██╗██╔╝
-██╔████╔██║ ██║   ██║ ██║   ██║ ██║ █████╗   ██████╔╝ ██║   ██║  ╚███╔╝ 
-██║╚██╔╝██║ ██║   ██║ ╚██╗ ██╔╝ ██║ ██╔══╝   ██╔══██╗ ██║   ██║  ██╔██╗ 
-██║ ╚═╝ ██║ ╚██████╔╝  ╚████╔╝  ██║ ███████╗ ██████╔╝ ╚██████╔╝ ██╔╝ ██╗
-╚═╝     ╚═╝  ╚═════╝    ╚═══╝   ╚═╝ ╚══════╝ ╚═════╝   ╚═════╝  ╚═╝  ╚═╝
-                           Official Installer
-
-EOF
+        for line in "${lines[@]}"; do
+            if [ "$banner_pad" -gt 0 ]; then
+                printf "%*s%s\n" "$banner_pad" "" "$line"
+            else
+                printf "%s\n" "$line"
+            fi
+        done
+        if [ "$sub_pad" -gt 0 ]; then
+            printf "%*s%s\n\n" "$sub_pad" "" "$sub"
+        else
+            printf "%s\n\n" "$sub"
+        fi
     fi
 }
 
@@ -253,8 +330,10 @@ do_uninstall() {
     local target_paths=(
         "$HOME/.local/bin/$BIN_NAME"
         "/usr/local/bin/$BIN_NAME"
-        "${PREFIX:-}/bin/$BIN_NAME"
     )
+    if [ -n "${PREFIX:-}" ]; then
+        target_paths+=("$PREFIX/bin/$BIN_NAME")
+    fi
 
     if command -v "$BIN_NAME" >/dev/null 2>&1; then
         local current_path
@@ -303,7 +382,7 @@ fi
 
 if [ "$IS_TERMUX" -eq 1 ]; then
     if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
-        FILE="MovieBox_Linux_arm64.tar.gz"
+        FILE="MovieBox_Android_arm64.tar.gz"
         PLATFORM_NAME="Android Termux (arm64)"
     else
         log_error "Unsupported Termux architecture ($ARCH). Only arm64/aarch64 is hosted. Use 'cargo install moviebox-tui'."
@@ -337,12 +416,14 @@ resolve_version() {
     fi
 
     local release_header
-    release_header=$(curl -fsSI "https://github.com/$REPO/releases/latest") || {
-        log_error "Failed to contact GitHub for latest release."
-        return 1
-    }
-    local tag
-    tag=$(printf "%s" "$release_header" | grep -i '^location:' | awk -F '/' '{print $NF}' | tr -d '\r\n')
+    release_header=$(curl -fsSI "https://github.com/$REPO/releases/latest" 2>/dev/null || true)
+    local tag=""
+    if [ -n "$release_header" ]; then
+        tag=$(printf "%s" "$release_header" | grep -i '^location:' | awk -F '/' '{print $NF}' | tr -d '\r\n')
+    fi
+    if [ -z "$tag" ]; then
+        tag=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null | grep '"tag_name":' | head -1 | awk -F '"' '{print $4}' || true)
+    fi
     if [ -z "$tag" ]; then
         log_error "Could not resolve latest release version from GitHub."
         return 1
@@ -353,6 +434,7 @@ resolve_version() {
 run_spinner "[1/4] Checking environment & resolving version" resolve_version || exit 1
 TARGET_VERSION=$(cat "$TMP_VER_FILE" 2>/dev/null || true)
 rm -f "$TMP_VER_FILE"
+TMP_VER_FILE=""
 
 if [ -z "$TARGET_VERSION" ]; then
     log_error "Could not resolve release version."
@@ -381,7 +463,7 @@ if [ -n "$EXISTING_BIN" ] && [ -x "$EXISTING_BIN" ]; then
             printf "\n  %b%s%b %b%s%b\n" "$C_YELLOW" "ℹ" "$C_RESET" "$C_TEXT" "MovieBox-TUI $TARGET_VERSION is already installed at $EXISTING_BIN." "$C_RESET"
             printf "  Choose an action: [1] Reinstall  [2] Uninstall  [3] Exit: "
             if [ -e /dev/tty ]; then
-                read -r user_choice </dev/tty || user_choice="3"
+                read -r user_choice </dev/tty 2>/dev/null || user_choice="3"
             else
                 read -r user_choice || user_choice="3"
             fi
@@ -417,7 +499,16 @@ URL="https://github.com/$REPO/releases/download/$TARGET_VERSION/$FILE"
 CHECKSUM_URL="https://github.com/$REPO/releases/download/$TARGET_VERSION/SHA256SUMS"
 
 download_files() {
-    curl -fsSL "$URL" -o "$TMP_DIR/$FILE" && \
+    if ! curl -fsSL "$URL" -o "$TMP_DIR/$FILE"; then
+        if [ "$IS_TERMUX" -eq 1 ]; then
+            printf "\n" >&2
+            log_error "Failed to download $FILE."
+            printf "  %bℹ%b Precompiled native Android binaries are hosted starting from v0.1.17+.\n" "$C_SAPPHIRE" "$C_RESET" >&2
+            printf "  To install from source on Termux:\n" >&2
+            printf "    %bpkg install -y rust clang && cargo install moviebox-tui --locked%b\n\n" "$C_BOLD" "$C_RESET" >&2
+        fi
+        return 1
+    fi
     curl -fsSL "$CHECKSUM_URL" -o "$TMP_DIR/SHA256SUMS"
 }
 
@@ -448,19 +539,20 @@ verify_checksum() {
 run_spinner "[3/4] Verifying SHA256 checksum" verify_checksum || exit 1
 log_success "[3/4] Cryptographic checksum verified"
 
+mkdir -p "$INSTALL_DIR" 2>/dev/null || true
+if [ ! -w "$INSTALL_DIR" ] && [ ! -w "$(dirname "$INSTALL_DIR")" ]; then
+    INSTALL_DIR="$HOME/.local/bin"
+    APP_PATH="$INSTALL_DIR/$BIN_NAME"
+    mkdir -p "$INSTALL_DIR" 2>/dev/null || true
+fi
+
 install_binary() {
     tar -xzf "$TMP_DIR/$FILE" -C "$TMP_DIR"
     if [ ! -f "$TMP_DIR/$BIN_NAME" ]; then
         return 1
     fi
 
-    mkdir -p "$INSTALL_DIR" 2>/dev/null || true
-    if [ ! -w "$INSTALL_DIR" ] && [ ! -w "$(dirname "$INSTALL_DIR")" ]; then
-        INSTALL_DIR="$HOME/.local/bin"
-        APP_PATH="$INSTALL_DIR/$BIN_NAME"
-        mkdir -p "$INSTALL_DIR" 2>/dev/null || true
-    fi
-
+    rm -f "$APP_PATH"
     cp "$TMP_DIR/$BIN_NAME" "$APP_PATH"
     chmod 755 "$APP_PATH"
 }
@@ -468,9 +560,20 @@ install_binary() {
 run_spinner "[4/4] Installing binary to $INSTALL_DIR" install_binary || exit 1
 log_success "[4/4] Binary installed to $APP_PATH"
 
+if [ "$DRY_RUN" -eq 0 ]; then
+    if ! smoke_output=$("$APP_PATH" --version 2>&1); then
+        log_error "Installed binary failed execution smoke test ($APP_PATH):"
+        printf "  %s\n" "$smoke_output" >&2
+        if [ "$IS_TERMUX" -eq 1 ]; then
+            printf "\n  %bℹ%b If Termux rejects the binary, install via cargo:\n" "$C_SAPPHIRE" "$C_RESET" >&2
+            printf "    %bpkg install -y rust clang && cargo install moviebox-tui --locked%b\n\n" "$C_BOLD" "$C_RESET" >&2
+        fi
+        exit 1
+    fi
+fi
 SHELL_MODIFIED=""
 if [ "$NO_MODIFY_PATH" -eq 0 ]; then
-    if ! echo "$PATH" | tr ':' '\n' | grep -q "^$INSTALL_DIR$"; then
+    if ! echo "$PATH" | tr ':' '\n' | grep -Fqx "$INSTALL_DIR"; then
         CURRENT_SHELL=$(basename "${SHELL:-bash}")
         RC_FILE=""
         case "$CURRENT_SHELL" in
@@ -493,7 +596,7 @@ if [ "$NO_MODIFY_PATH" -eq 0 ]; then
 
         if [ -n "$RC_FILE" ]; then
             mkdir -p "$(dirname "$RC_FILE")"
-            if [ -f "$RC_FILE" ] && grep -q "$INSTALL_DIR" "$RC_FILE"; then
+            if [ -f "$RC_FILE" ] && grep -Fq -- "$INSTALL_DIR" "$RC_FILE"; then
                 :
             else
                 if [ "$CURRENT_SHELL" = "fish" ]; then
@@ -508,20 +611,31 @@ if [ "$NO_MODIFY_PATH" -eq 0 ]; then
 fi
 
 PLAYER_DETECTED=""
-if command -v mpv >/dev/null 2>&1; then
-    PLAYER_DETECTED="mpv"
-elif command -v iina >/dev/null 2>&1 || command -v iina-cli >/dev/null 2>&1; then
-    PLAYER_DETECTED="IINA"
-elif command -v vlc >/dev/null 2>&1; then
-    PLAYER_DETECTED="VLC"
+if [ "$OS" = "Darwin" ]; then
+    if command -v iina >/dev/null 2>&1 || command -v iina-cli >/dev/null 2>&1 || [ -d "/Applications/IINA.app" ] || [ -d "$HOME/Applications/IINA.app" ]; then
+        PLAYER_DETECTED="IINA"
+    elif command -v mpv >/dev/null 2>&1 || [ -d "/Applications/mpv.app" ] || [ -d "$HOME/Applications/mpv.app" ]; then
+        PLAYER_DETECTED="mpv"
+    elif command -v vlc >/dev/null 2>&1 || [ -d "/Applications/VLC.app" ] || [ -d "$HOME/Applications/VLC.app" ]; then
+        PLAYER_DETECTED="VLC"
+    fi
+else
+    if command -v mpv >/dev/null 2>&1 || [ -f "$HOME/.local/share/flatpak/exports/bin/io.mpv.Mpv" ] || [ -f "/var/lib/flatpak/exports/bin/io.mpv.Mpv" ]; then
+        PLAYER_DETECTED="mpv"
+    elif command -v vlc >/dev/null 2>&1 || [ -f "$HOME/.local/share/flatpak/exports/bin/org.videolan.VLC" ] || [ -f "/var/lib/flatpak/exports/bin/org.videolan.VLC" ]; then
+        PLAYER_DETECTED="VLC"
+    elif command -v termux-open >/dev/null 2>&1 || command -v termux-am >/dev/null 2>&1; then
+        PLAYER_DETECTED="Android Player (termux intent)"
+    fi
 fi
-
 printf "\n"
 printf "  %b✔ MovieBox-Tui %s successfully installed!%b\n\n" "$C_GREEN" "$TARGET_VERSION" "$C_RESET"
 printf "  %b•%b %bBinary:%b  %b%s%b\n" "$C_MUTED" "$C_RESET" "$C_MUTED" "$C_RESET" "$C_TEXT" "$APP_PATH" "$C_RESET"
 
 if [ -n "$PLAYER_DETECTED" ]; then
     printf "  %b•%b %bPlayer:%b  %b%s (ready)%b\n" "$C_MUTED" "$C_RESET" "$C_MUTED" "$C_RESET" "$C_GREEN" "$PLAYER_DETECTED" "$C_RESET"
+elif [ "$IS_TERMUX" -eq 1 ]; then
+    printf "  %b•%b %bPlayer:%b  %bNone detected (run 'pkg install -y termux-tools termux-am')%b\n" "$C_MUTED" "$C_RESET" "$C_MUTED" "$C_RESET" "$C_SAPPHIRE" "$C_RESET"
 else
     printf "  %b•%b %bPlayer:%b  %bNone detected (mpv, VLC, or IINA recommended)%b\n" "$C_MUTED" "$C_RESET" "$C_MUTED" "$C_RESET" "$C_SAPPHIRE" "$C_RESET"
 fi
@@ -535,7 +649,14 @@ printf "  %bTo start streaming:%b\n" "$C_TEXT" "$C_RESET"
 printf "    %b$ moviebox-tui%b\n\n" "$C_GREEN" "$C_RESET"
 
 if [ -z "$PLAYER_DETECTED" ]; then
-    printf "  %bℹ%b Note: A media player (mpv, VLC, or IINA) is recommended for video playback.\n\n" "$C_SAPPHIRE" "$C_RESET"
+    if [ "$IS_TERMUX" -eq 1 ]; then
+        printf "  %bℹ%b Note: Run %b'pkg install -y termux-tools termux-am'%b to enable video playback on Termux.\n" "$C_SAPPHIRE" "$C_RESET" "$C_BOLD" "$C_RESET"
+        printf "    Streams play via external Android players (VLC, MX Player, or Just Player).\n\n"
+    else
+        printf "  %bℹ%b Note: A media player (mpv, VLC, or IINA) is recommended for video playback.\n\n" "$C_SAPPHIRE" "$C_RESET"
+    fi
+elif [ "$IS_TERMUX" -eq 1 ]; then
+    printf "  %bℹ%b Streams will open in your default Android video player (VLC, MX Player, or Just Player).\n\n" "$C_SAPPHIRE" "$C_RESET"
 fi
 
 if [ -n "$SHELL_MODIFIED" ]; then

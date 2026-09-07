@@ -11,7 +11,10 @@ param(
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 try {
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+} catch {}
+try {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls13
 } catch {}
 Set-StrictMode -Version Latest
 
@@ -29,7 +32,7 @@ USAGE:
     .\install.ps1 [OPTIONS]
 
 OPTIONS:
-    -Version <tag>       Install a specific version (e.g. v0.1.13)
+    -Version <tag>       Install a specific version (e.g. v0.1.14)
     -InstallDir <path>   Install binary to a custom directory
     -Force               Reinstall even if already at the latest version
     -DryRun              Perform preflight checks without writing files
@@ -45,17 +48,110 @@ function Write-Success { param([string]$Message) Write-Host "  + " -ForegroundCo
 function Write-Warn { param([string]$Message) Write-Host "  ! " -ForegroundColor Yellow -NoNewline; Write-Host $Message }
 function Write-Err { param([string]$Message) Write-Host "  x " -ForegroundColor Red -NoNewline; Write-Host $Message; exit 1 }
 
+if ($Version -and $Version[0] -ne "v") {
+    $Version = "v$Version"
+}
+
+function Get-UserPathRaw {
+    param([ref]$Kind)
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("Environment")
+    if (-not $key) { return "" }
+    try {
+        $raw = $key.GetValue("Path", "", [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        try { $Kind.Value = $key.GetValueKind("Path") } catch { $Kind.Value = [Microsoft.Win32.RegistryValueKind]::ExpandString }
+        return [string]$raw
+    } finally {
+        $key.Close()
+    }
+}
+
+function Set-UserPathRaw {
+    param([string]$NewPath, [Microsoft.Win32.RegistryValueKind]$ValueKind)
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("Environment", $true)
+    if (-not $key) { return }
+    try { $key.SetValue("Path", $NewPath, $ValueKind) } finally { $key.Close() }
+}
+
+function Add-ToUserPath {
+    param([string]$Directory)
+    $kind = [Microsoft.Win32.RegistryValueKind]::ExpandString
+    $raw = Get-UserPathRaw -Kind ([ref]$kind)
+    $segments = @($raw -split ";" | Where-Object { $_ })
+    if ($segments -notcontains $Directory.TrimEnd("\")) {
+        $joined = if ($raw.Trim()) { "$raw;$Directory" } else { $Directory }
+        Set-UserPathRaw -NewPath $joined -ValueKind $kind
+        return $true
+    }
+    return $false
+}
+
+function Remove-FromUserPath {
+    param([string[]]$Directories)
+    $kind = [Microsoft.Win32.RegistryValueKind]::ExpandString
+    $raw = Get-UserPathRaw -Kind ([ref]$kind)
+    if (-not $raw) { return $false }
+    $normalized = @($Directories | ForEach-Object { $_.TrimEnd("\").ToLowerInvariant() })
+    $kept = @($raw -split ";" | Where-Object { $_ -and ($normalized -notcontains $_.TrimEnd("\").ToLowerInvariant()) })
+    if ($kept.Count -eq @($raw -split ";" | Where-Object { $_ }).Count) { return $false }
+    Set-UserPathRaw -NewPath ($kept -join ";") -ValueKind $kind
+    return $true
+}
+
+function Get-TerminalCols {
+    $Cols = 80
+    try {
+        if ($Host.UI.RawUI.WindowSize.Width -gt 0) {
+            $Cols = $Host.UI.RawUI.WindowSize.Width
+        }
+    } catch {
+        $Cols = 80
+    }
+    return $Cols
+}
+
 function Print-Header {
     try { [Console]::Clear() } catch { Clear-Host }
-    $Header = @"
- __  __            _      ____              _____ _   _ ___ 
-|  \/  | _____   _(_) ___| __ )  _____  __ |_   _| | | |_ _|
-| |\/| |/ _ \ \ / / |/ _ \  _ \ / _ \ \/ /   | | | | | || | 
-| |  | | (_) \ V /| |  __/ |_) | (_) >  <    | | | |_| || | 
-|_|  |_|\___/ \_/ |_|\___|____/ \___/_/\_\   |_|  \___/|___|
-"@
-    Write-Host $Header -ForegroundColor Magenta
-    Write-Host "                     Official Installer`n" -ForegroundColor Cyan
+    $Cols = Get-TerminalCols
+
+    if ($Cols -ge 65) {
+        $BannerWidth = 60
+        $Lines = @(
+            " __  __            _      ____              _____ _   _ ___ ",
+            "|  \/  | _____   _(_) ___| __ )  _____  __ |_   _| | | |_ _|",
+            "| |\/| |/ _ \ \ / / |/ _ \  _ \ / _ \ \/ /   | | | | | || | ",
+            "| |  | | (_) \ V /| |  __/ |_) | (_) >  <    | | | |_| || | ",
+            "|_|  |_|\___/ \_/ |_|\___|____/ \___/_/\_\   |_|  \___/|___|"
+        )
+    } elseif ($Cols -ge 36) {
+        $BannerWidth = 31
+        $Lines = @(
+            "█▀▄▀█ █▀█ █ █ █ █▀▀ █▀▄ █▀█ ▀▄▀",
+            "█ ▀ █ █▄█ ▀▄▀ █ ██▄ █▄▀ █▄█ █ █"
+        )
+    } else {
+        $BannerWidth = 12
+        $Lines = @(
+            "MovieBox-TUI"
+        )
+    }
+
+    $BannerPad = [Math]::Max(0, [int][Math]::Floor(($Cols - $BannerWidth) / 2))
+    $Sub = "Official Installer"
+    $SubPad = [Math]::Max(0, [int][Math]::Floor(($Cols - $Sub.Length) / 2))
+
+    foreach ($Line in $Lines) {
+        if ($BannerPad -gt 0) {
+            Write-Host ((" " * $BannerPad) + $Line) -ForegroundColor Magenta
+        } else {
+            Write-Host $Line -ForegroundColor Magenta
+        }
+    }
+
+    if ($SubPad -gt 0) {
+        Write-Host ((" " * $SubPad) + $Sub + "`n") -ForegroundColor Cyan
+    } else {
+        Write-Host ($Sub + "`n") -ForegroundColor Cyan
+    }
 }
 
 function Do-Uninstall {
@@ -87,7 +183,11 @@ function Do-Uninstall {
     }
 
     if ($Found) {
+        $Removed = Remove-FromUserPath -Directories @($DefaultInstallDir, "$env:LOCALAPPDATA\MovieBox-Tui\bin")
         Write-Success "$AppName was successfully uninstalled."
+        if ($Removed) {
+            Write-Success "Removed stale entry from User PATH."
+        }
     } else {
         Write-Warn "No installed binary of $BinName was found."
     }
@@ -210,6 +310,14 @@ try {
     try { Unblock-File -Path $ExtractedExe -ErrorAction SilentlyContinue } catch {}
     Move-Item -Path $ExtractedExe -Destination $ExePath -Force
     try { Unblock-File -Path $ExePath -ErrorAction SilentlyContinue } catch {}
+    try {
+        $SmokeOutput = (& $ExePath --version 2>&1 | Out-String)
+        if ($LASTEXITCODE -ne 0) {
+            throw "Binary execution test failed: $SmokeOutput"
+        }
+    } catch {
+        throw "Binary execution test failed: $_"
+    }
     Write-Success "[4/4] Binary installed to $ExePath"
 } catch {
     Remove-Item $TempDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -220,21 +328,18 @@ try {
 
 $PathModified = $false
 if (-not $NoModifyPath) {
-    $UserPath = [Environment]::GetEnvironmentVariable("PATH", "User")
-    if ($UserPath -notmatch [regex]::Escape($EffectiveInstallDir)) {
-        $NewPath = if ($UserPath) { "$UserPath;$EffectiveInstallDir" } else { $EffectiveInstallDir }
-        [Environment]::SetEnvironmentVariable("PATH", $NewPath, "User")
+    if (Add-ToUserPath -Directory $EffectiveInstallDir) {
         $PathModified = $true
     }
-    if ($env:PATH -notmatch [regex]::Escape($EffectiveInstallDir)) {
+    if (@($env:PATH -split ";") -notcontains $EffectiveInstallDir.TrimEnd("\")) {
         $env:PATH = "$env:PATH;$EffectiveInstallDir"
     }
 }
 
 $PlayerDetected = ""
-if (Get-Command "mpv" -ErrorAction SilentlyContinue) {
+if ((Get-Command "mpv" -ErrorAction SilentlyContinue) -or (Test-Path "C:\Program Files\mpv\mpv.exe") -or (Test-Path "C:\Program Files\MPV Player\mpv.exe") -or (Test-Path "C:\mpv\mpv.exe") -or (Test-Path "$env:LOCALAPPDATA\Programs\mpv\mpv.exe")) {
     $PlayerDetected = "mpv"
-} elseif (Get-Command "vlc" -ErrorAction SilentlyContinue) {
+} elseif ((Get-Command "vlc" -ErrorAction SilentlyContinue) -or (Test-Path "C:\Program Files\VideoLAN\VLC\vlc.exe") -or (Test-Path "C:\Program Files (x86)\VideoLAN\VLC\vlc.exe") -or (Test-Path "$env:LOCALAPPDATA\Programs\VLC\vlc.exe")) {
     $PlayerDetected = "VLC"
 }
 
@@ -263,7 +368,7 @@ Write-Host "    $ moviebox-tui" -ForegroundColor Green
 Write-Host ""
 
 if (-not $PlayerDetected) {
-    Write-Host "  [i] Note: A media player (mpv, VLC, or IINA) is recommended for video playback.`n" -ForegroundColor Cyan
+    Write-Host "  [i] Note: A media player (mpv or VLC) is recommended for video playback.`n" -ForegroundColor Cyan
 }
 
 if ($PathModified) {

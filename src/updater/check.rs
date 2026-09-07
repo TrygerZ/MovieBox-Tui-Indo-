@@ -109,7 +109,7 @@ async fn fetch_latest_tag() -> Result<String, String> {
 }
 
 pub(crate) fn http_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
+    crate::net::http_client_builder()
         .user_agent("MovieBox-Tui")
         .timeout(std::time::Duration::from_secs(30))
         .connect_timeout(std::time::Duration::from_secs(10))

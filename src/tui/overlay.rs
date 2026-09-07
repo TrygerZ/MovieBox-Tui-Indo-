@@ -3,15 +3,16 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{
-        Block, BorderType, Borders, List, ListItem, ListState, Paragraph, Scrollbar,
-        ScrollbarOrientation, ScrollbarState,
-    },
+    widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph},
 };
 
 use crate::tui::theme::Theme;
 
-const MAX_PICKER_ROWS: usize = 8;
+const MAX_PICKER_ROWS_CAP: usize = 14;
+
+pub(crate) fn max_picker_rows(area: Rect) -> usize {
+    (area.height.saturating_sub(6) as usize).clamp(4, MAX_PICKER_ROWS_CAP)
+}
 
 pub use crate::models::{Notification, NotificationKind};
 
@@ -19,6 +20,91 @@ pub struct PickerSpec<'a> {
     pub title: &'a str,
     pub confirm_label: &'a str,
     pub minimum_width: u16,
+}
+
+pub fn picker_layout(
+    area: Rect,
+    items: &[String],
+    confirm_label: &str,
+    minimum_width: u16,
+) -> Rect {
+    let visible_rows = items.len().clamp(1, max_picker_rows(area));
+    let footer_str = format!("[↑↓] Move  [Enter] {confirm_label}  [Esc] Back");
+    let footer_width = crate::tui::text::width(&footer_str);
+    let content_width = items
+        .iter()
+        .map(|item| crate::tui::text::width(item))
+        .max()
+        .unwrap_or(0)
+        .max(footer_width)
+        .saturating_add(4);
+    centered(
+        area,
+        content_width as u16,
+        (visible_rows as u16 + 4).max(5),
+        minimum_width,
+        64,
+    )
+}
+
+pub fn tv_config_layout(
+    area: Rect,
+    longest_source_width: usize,
+    total_rows: usize,
+    input_active: bool,
+) -> Rect {
+    let content_width = longest_source_width.max(48).max(crate::tui::text::width(
+        "[ Add URL ] [ Add file ] [ Reload ] [ Done ]",
+    ));
+    let popup_width = 68u16
+        .max(content_width.saturating_add(6) as u16)
+        .min(area.width.saturating_sub(4));
+    let popup_height = if input_active {
+        7u16
+    } else {
+        total_rows.min(10).saturating_add(6) as u16
+    };
+    centered(area, popup_width, popup_height, 36, 74)
+}
+
+pub fn addon_manager_layout(area: Rect, addons_count: usize, input_active: bool) -> Rect {
+    let popup_width = 76u16.min(area.width.saturating_sub(4)).max(56);
+    let popup_height = if input_active {
+        7u16
+    } else {
+        (addons_count as u16)
+            .saturating_add(6)
+            .min(area.height.saturating_sub(4))
+            .max(7)
+    };
+    centered(area, popup_width, popup_height, 36, 80)
+}
+pub fn settings_modal_layout(area: Rect, category: crate::tui::state::SettingsCategory) -> Rect {
+    let min_width = 46u16.min(area.width.saturating_sub(2));
+    let popup_width = 76u16.min(area.width.saturating_sub(2)).max(min_width);
+    let content_height = (category.row_count() as u16 * 2).max(4);
+    let desired_height = 2 + 1 + content_height + 2 + 2;
+    let popup_height = desired_height.min(area.height.saturating_sub(2)).max(11);
+    centered(area, popup_width, popup_height, min_width, 76)
+}
+
+pub fn download_confirm_layout(
+    area: Rect,
+    summary_lines: usize,
+    longest_line_width: usize,
+) -> Rect {
+    let content_width = longest_line_width.max(36);
+    centered(
+        area,
+        content_width.saturating_add(4) as u16,
+        summary_lines as u16 + 4,
+        36,
+        64,
+    )
+}
+
+pub fn download_confirm_action_row(popup: Rect, summary_lines: usize) -> u16 {
+    popup.y + summary_lines as u16 + 1
 }
 
 pub fn picker(
@@ -30,71 +116,65 @@ pub fn picker(
     theme: &Theme,
     basic_terminal: bool,
 ) {
+    let lines: Vec<Line<'static>> = items.iter().map(|item| Line::from(item.clone())).collect();
+    picker_with_lines(
+        frame,
+        area,
+        &lines,
+        items,
+        state,
+        spec,
+        theme,
+        basic_terminal,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn picker_with_lines<'a>(
+    frame: &mut Frame,
+    area: Rect,
+    lines: &[Line<'a>],
+    raw_items: &[String],
+    state: &mut ListState,
+    spec: PickerSpec<'_>,
+    theme: &Theme,
+    basic_terminal: bool,
+) {
     let selected = state
         .selected()
         .unwrap_or(0)
-        .min(items.len().saturating_sub(1));
-    let visible_rows = items.len().clamp(1, MAX_PICKER_ROWS);
-    let footer_str = format!("[↑↓] Move  [Enter] {}  [Esc] Back", spec.confirm_label);
-    let footer_width = crate::tui::text::width(&footer_str);
-    let content_width = items
-        .iter()
-        .map(|item| crate::tui::text::width(item))
-        .max()
-        .unwrap_or(0)
-        .max(footer_width)
-        .saturating_add(4);
-    let popup = centered(
-        area,
-        content_width as u16,
-        visible_rows as u16 + 4,
-        spec.minimum_width,
-        64,
-    );
-    clear_modal_area(frame, area, popup, theme);
-
+        .min(lines.len().saturating_sub(1));
+    let visible_rows = lines.len().clamp(1, max_picker_rows(area));
+    let popup = picker_layout(area, raw_items, spec.confirm_label, spec.minimum_width);
     let title = format!(
-        " {} · {}/{} ",
+        "{} · {}/{}",
         spec.title,
         selected.saturating_add(1),
-        items.len().max(1)
+        lines.len().max(1)
     );
-    let block = Block::default()
-        .title(title)
-        .title_style(theme.title)
-        .borders(Borders::ALL)
-        .border_type(border_type(basic_terminal))
-        .border_style(theme.lavender);
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
+    let inner = crate::tui::widgets::ModalFrame::new(&title, theme, basic_terminal)
+        .render(frame, popup, area);
 
     let sections = Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).split(inner);
-    let max_item_w = sections[0]
-        .width
-        .saturating_sub(if items.len() > visible_rows { 3 } else { 1 })
-        as usize;
-    let list_items = items
+    let list_items = lines
         .iter()
-        .map(|item| {
-            let truncated = crate::tui::text::truncate_width(item, max_item_w);
-            ListItem::new(truncated).style(theme.text)
-        })
+        .map(|line| ListItem::new(line.clone()).style(theme.text))
         .collect::<Vec<_>>();
     let list = List::new(list_items)
         .highlight_style(selection_style(theme, basic_terminal))
         .highlight_symbol(if basic_terminal { "> " } else { "▌ " });
     frame.render_stateful_widget(list, sections[0], state);
 
-    if items.len() > visible_rows {
-        let mut scrollbar_state = ScrollbarState::new(items.len())
-            .viewport_content_length(visible_rows)
-            .position(selected);
-        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .thumb_style(theme.lavender)
-            .track_style(theme.surface1)
-            .begin_symbol(Some("▲"))
-            .end_symbol(Some("▼"));
-        frame.render_stateful_widget(scrollbar, sections[0], &mut scrollbar_state);
+    if lines.len() > visible_rows {
+        crate::tui::widgets::render_scrollbar(
+            frame,
+            sections[0],
+            lines.len(),
+            visible_rows,
+            selected,
+            theme,
+            basic_terminal,
+        );
     }
 
     let confirm_label = if sections[1].width < 40 && spec.confirm_label == "Download" {
@@ -102,21 +182,41 @@ pub fn picker(
     } else {
         spec.confirm_label
     };
-    let footer = Line::from(vec![
+    let footer = vec![
         key_hint("↑↓", "Move", theme),
         Span::raw("  "),
         key_hint("Enter", confirm_label, theme),
         Span::raw("  "),
         key_hint("Esc", "Back", theme),
-    ]);
-    frame.render_widget(
-        Paragraph::new(footer).alignment(Alignment::Center).block(
-            Block::default()
-                .borders(Borders::TOP)
-                .border_style(theme.muted),
-        ),
-        sections[1],
-    );
+    ];
+    crate::tui::widgets::render_modal_footer(frame, sections[1], footer, theme);
+}
+
+pub fn browse_category_badge<'a>(label: &str, theme: &'a Theme) -> (Span<'a>, &'static str) {
+    let lower = label.to_ascii_lowercase();
+    if lower.contains("movie")
+        || lower.contains("top rated (all-time)")
+        || lower.contains("top rated (recent")
+    {
+        (
+            Span::styled("[MOVIES]", theme.sapphire.add_modifier(Modifier::BOLD)),
+            "   ",
+        )
+    } else if lower.contains("series")
+        || lower.contains("airing")
+        || lower.contains("show")
+        || lower.contains("tv")
+    {
+        (
+            Span::styled("[SERIES]", theme.lavender.add_modifier(Modifier::BOLD)),
+            "   ",
+        )
+    } else {
+        (
+            Span::styled("[DISCOVER]", theme.teal.add_modifier(Modifier::BOLD)),
+            " ",
+        )
+    }
 }
 
 pub fn confirmation(
@@ -136,72 +236,50 @@ pub fn confirmation(
         36,
         64,
     );
-    clear_modal_area(frame, area, popup, theme);
-
-    let block = Block::default()
-        .title(format!(" {title} "))
-        .title_style(theme.title)
-        .borders(Borders::ALL)
-        .border_type(border_type(basic_terminal))
-        .border_style(theme.lavender);
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
+    let inner = crate::tui::widgets::ModalFrame::new(title, theme, basic_terminal)
+        .render(frame, popup, area);
     let sections = Layout::vertical([
         Constraint::Length(summary.len() as u16),
-        Constraint::Length(1),
-        Constraint::Length(1),
+        Constraint::Length(2),
     ])
     .split(inner);
     frame.render_widget(
         Paragraph::new(summary.to_vec()).alignment(Alignment::Center),
         sections[0],
     );
-
-    let selected_style = selection_style(theme, basic_terminal);
-    let actions = Line::from(vec![
-        Span::styled(
-            " Download ",
-            if confirm_selected {
-                selected_style
-            } else {
-                theme.text_dim
-            },
-        ),
-        Span::raw("    "),
-        Span::styled(
-            " Cancel ",
-            if confirm_selected {
-                theme.text_dim
-            } else {
-                selected_style
-            },
-        ),
-    ]);
-    frame.render_widget(
-        Paragraph::new(actions).alignment(Alignment::Center),
-        sections[1],
-    );
-    let footer = if sections[2].width < 44 {
-        Line::from(vec![
-            key_hint("←→", "Choose", theme),
-            Span::raw(" "),
-            key_hint("Enter", "OK", theme),
-            Span::raw(" "),
-            key_hint("Esc", "Back", theme),
-        ])
+    use ratatui::style::Color;
+    let confirm_btn_style = if confirm_selected {
+        if basic_terminal {
+            theme.text.add_modifier(Modifier::REVERSED | Modifier::BOLD)
+        } else {
+            Style::default()
+                .bg(theme.accent.fg.unwrap_or(Color::Cyan))
+                .fg(theme.crust.fg.unwrap_or(Color::Black))
+                .add_modifier(Modifier::BOLD)
+        }
     } else {
-        Line::from(vec![
-            key_hint("←→", "Choose", theme),
-            Span::raw("  "),
-            key_hint("Enter", "Confirm", theme),
-            Span::raw("  "),
-            key_hint("Esc", "Back", theme),
-        ])
+        theme.subtext1
     };
-    frame.render_widget(
-        Paragraph::new(footer).alignment(Alignment::Center),
-        sections[2],
-    );
+
+    let cancel_btn_style = if !confirm_selected {
+        if basic_terminal {
+            theme.text.add_modifier(Modifier::REVERSED | Modifier::BOLD)
+        } else {
+            Style::default()
+                .bg(theme.surface1.fg.unwrap_or(Color::DarkGray))
+                .fg(theme.text.fg.unwrap_or(Color::White))
+                .add_modifier(Modifier::BOLD)
+        }
+    } else {
+        theme.subtext1
+    };
+
+    let actions = vec![
+        Span::styled(" [ Download ] ", confirm_btn_style),
+        Span::raw("    "),
+        Span::styled(" [ Cancel ] ", cancel_btn_style),
+    ];
+    crate::tui::widgets::render_modal_footer(frame, sections[1], actions, theme);
 }
 
 pub fn notifications(
@@ -210,8 +288,10 @@ pub fn notifications(
     notifications: &std::collections::VecDeque<Notification>,
     theme: &Theme,
     basic_terminal: bool,
+    download_active: bool,
 ) {
-    let mut y = area.bottom().saturating_sub(2);
+    let bottom_offset = if download_active { 5 } else { 2 };
+    let mut y = area.bottom().saturating_sub(bottom_offset);
 
     for notification in notifications.iter().rev().take(3) {
         let (badge, badge_style) = notification_style(notification.kind, theme, basic_terminal);
@@ -230,7 +310,7 @@ pub fn notifications(
         let target_card_width = title_w
             .max(badge_w)
             .max(raw_msg_w)
-            .clamp(36, max_card_width) as u16;
+            .clamp(20, max_card_width.max(20)) as u16;
 
         let inner_width = (target_card_width.saturating_sub(4) as usize).max(1);
 
@@ -275,11 +355,44 @@ pub fn notifications(
             )]));
         }
 
+        let total_duration = match notification.kind {
+            NotificationKind::Info => std::time::Duration::from_secs(4),
+            NotificationKind::Success => std::time::Duration::from_secs(5),
+            NotificationKind::Warning => std::time::Duration::from_secs(7),
+            NotificationKind::Error => std::time::Duration::from_secs(10),
+        };
+        let remaining = notification
+            .expires_at
+            .saturating_duration_since(std::time::Instant::now());
+        let ratio = (remaining.as_secs_f64() / total_duration.as_secs_f64()).clamp(0.0, 1.0);
+        let bar_width = inner_width.clamp(3, 16);
+        let filled = ((bar_width as f64) * ratio).round() as usize;
+        let countdown_bar = if basic_terminal {
+            format!(
+                "[{}{}]",
+                "=".repeat(filled),
+                "-".repeat(bar_width.saturating_sub(filled))
+            )
+        } else {
+            format!(
+                "{}{}",
+                "━".repeat(filled),
+                "─".repeat(bar_width.saturating_sub(filled))
+            )
+        };
+
         let block = Block::default()
             .title(Line::from(vec![Span::styled(
                 format!(" {badge} "),
                 badge_style.add_modifier(Modifier::BOLD),
             )]))
+            .title_bottom(
+                Line::from(vec![Span::styled(
+                    format!(" {countdown_bar} "),
+                    badge_style.add_modifier(Modifier::DIM),
+                )])
+                .alignment(Alignment::Right),
+            )
             .borders(Borders::ALL)
             .border_type(border_type(basic_terminal))
             .border_style(badge_style)
@@ -313,25 +426,8 @@ pub fn centered(
     )
 }
 
-pub fn clear_modal_area(frame: &mut Frame, bounds: Rect, popup: Rect, theme: &Theme) {
-    const HORIZONTAL_HALO: u16 = 3;
-    const VERTICAL_HALO: u16 = 1;
-
-    let x = popup.x.saturating_sub(HORIZONTAL_HALO).max(bounds.x);
-    let y = popup.y.saturating_sub(VERTICAL_HALO).max(bounds.y);
-    let right = popup
-        .right()
-        .saturating_add(HORIZONTAL_HALO)
-        .min(bounds.right());
-    let bottom = popup
-        .bottom()
-        .saturating_add(VERTICAL_HALO)
-        .min(bounds.bottom());
-    crate::tui::clear_area(
-        frame,
-        Rect::new(x, y, right.saturating_sub(x), bottom.saturating_sub(y)),
-        theme,
-    );
+pub fn clear_modal_area(frame: &mut Frame, _bounds: Rect, popup: Rect, theme: &Theme) {
+    crate::tui::clear_area(frame, popup, theme);
 }
 
 pub fn border_type(basic_terminal: bool) -> BorderType {
@@ -343,29 +439,136 @@ pub fn border_type(basic_terminal: bool) -> BorderType {
 }
 
 pub(crate) fn key_hint(key: &str, action: &str, theme: &Theme) -> Span<'static> {
-    Span::styled(format!("[{key}] {action}"), theme.text_dim)
+    if action.is_empty() {
+        Span::styled(format!("[{key}]"), theme.text_dim)
+    } else {
+        Span::styled(format!("[{key}] {action}"), theme.text_dim)
+    }
 }
 
 pub(crate) fn selection_style(theme: &Theme, basic_terminal: bool) -> Style {
-    let style = theme.text.add_modifier(Modifier::BOLD);
+    let style = if theme.is_light {
+        theme.text
+    } else {
+        theme.highlight
+    }
+    .add_modifier(Modifier::BOLD);
+    if crate::tui::theme::ColorSupport::current() == crate::tui::theme::ColorSupport::NoColor {
+        return style.add_modifier(Modifier::REVERSED);
+    }
     if basic_terminal {
         style.add_modifier(Modifier::UNDERLINED)
     } else {
-        style.bg(theme.surface0.fg.unwrap_or(theme.base))
+        let bg_color = if theme.is_light {
+            theme.surface1.fg.unwrap_or(ratatui::style::Color::DarkGray)
+        } else {
+            theme.surface1.fg.unwrap_or(theme.base)
+        };
+        style.bg(bg_color)
     }
 }
 
 fn notification_style(
     kind: NotificationKind,
     theme: &Theme,
-    _basic_terminal: bool,
+    basic_terminal: bool,
 ) -> (&'static str, Style) {
     match kind {
-        NotificationKind::Info => ("INFO", theme.sapphire),
-        NotificationKind::Success => ("SUCCESS", theme.success),
-        NotificationKind::Warning => ("WARNING", theme.rating),
-        NotificationKind::Error => ("ERROR", theme.error),
+        NotificationKind::Info => (
+            if basic_terminal { "i INFO" } else { "ℹ INFO" },
+            theme.sapphire,
+        ),
+        NotificationKind::Success => (
+            if basic_terminal {
+                "+ SUCCESS"
+            } else {
+                "✔ SUCCESS"
+            },
+            theme.success,
+        ),
+        NotificationKind::Warning => (
+            if basic_terminal {
+                "! WARNING"
+            } else {
+                "⚠ WARNING"
+            },
+            theme.rating,
+        ),
+        NotificationKind::Error => (
+            if basic_terminal {
+                "x ERROR"
+            } else {
+                "✖ ERROR"
+            },
+            theme.error,
+        ),
     }
+}
+
+pub fn notification_rects(
+    area: Rect,
+    notifications: &std::collections::VecDeque<Notification>,
+    basic_terminal: bool,
+    download_active: bool,
+) -> Vec<(usize, Rect)> {
+    let mut rects = Vec::new();
+    let bottom_offset = if download_active { 5 } else { 2 };
+    let mut y = area.bottom().saturating_sub(bottom_offset);
+    let theme_placeholder = Theme::default();
+
+    for (rev_idx, notification) in notifications.iter().rev().take(3).enumerate() {
+        let (badge, _) = notification_style(notification.kind, &theme_placeholder, basic_terminal);
+        let has_message =
+            !notification.message.is_empty() && notification.message != notification.title;
+
+        let max_card_width = (area.width.saturating_sub(4) as usize).min(72);
+        let title_w = crate::tui::text::width(&notification.title).saturating_add(6);
+        let badge_w = badge.len().saturating_add(6);
+        let raw_msg_w = if has_message {
+            crate::tui::text::width(&notification.message).saturating_add(6)
+        } else {
+            0
+        };
+
+        let target_card_width = title_w
+            .max(badge_w)
+            .max(raw_msg_w)
+            .clamp(20, max_card_width.max(20)) as u16;
+
+        let inner_width = (target_card_width.saturating_sub(4) as usize).max(1);
+
+        let msg_lines: Vec<String> = if has_message {
+            crate::tui::text::wrap_text(&notification.message, inner_width)
+                .into_iter()
+                .take(4)
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let height = 2 + 1 + msg_lines.len() as u16;
+
+        if target_card_width < 10 || y < area.y.saturating_add(height) {
+            break;
+        }
+
+        y = y.saturating_sub(height);
+
+        let toast_area = Rect::new(
+            area.right()
+                .saturating_sub(target_card_width)
+                .saturating_sub(2),
+            y,
+            target_card_width,
+            height,
+        );
+
+        let original_idx = notifications.len().saturating_sub(1 + rev_idx);
+        rects.push((original_idx, toast_area));
+
+        y = y.saturating_sub(1);
+    }
+    rects
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -387,27 +590,39 @@ pub fn update_modal_layout(area: Rect, notes: &str) -> UpdateModalLayout {
         .count();
 
     let min_w: u16 = 46;
-    let max_w: u16 = 72;
-    let desired_w = max_w.min(area.width.saturating_sub(4)).max(min_w);
+    let max_w: u16 = 76;
+    let available_w = area.width.saturating_sub(4);
+    let desired_w = max_w.min(available_w).max(min_w.min(available_w));
 
-    let header_rows: u16 = 5;
-    let footer_rows: u16 = 3;
+    let header_rows: u16 = 6;
+    let footer_rows: u16 = 4;
     let available_height = area.height.saturating_sub(4);
     let available_note_rows =
-        (available_height.saturating_sub(header_rows + footer_rows) as usize).clamp(2, 10);
+        (available_height.saturating_sub(header_rows + footer_rows) as usize).clamp(3, 12);
 
     let display_count = note_lines_count.min(available_note_rows);
     let has_more = note_lines_count > display_count;
-    let total_rows =
-        header_rows + (display_count as u16) + (if has_more { 1 } else { 0 }) + footer_rows;
-    let desired_h = total_rows.clamp(10, available_height.max(10));
+    let total_rows = header_rows + (display_count as u16) + footer_rows;
+    let desired_h = total_rows.clamp(12, available_height.max(12));
 
-    let popup_area = centered(area, desired_w, desired_h, min_w, max_w);
+    const UPDATE_SEGMENT: u16 = 18;
+    const OPEN_SEGMENT: u16 = 26;
+    const DISMISS_SEGMENT: u16 = 14;
+
+    let popup_area = centered(area, desired_w, desired_h, min_w.min(available_w), max_w);
+    let (update_seg, open_seg, dismiss_seg) = if popup_area.width < 60 {
+        (12, 10, 10)
+    } else {
+        (UPDATE_SEGMENT, OPEN_SEGMENT, DISMISS_SEGMENT)
+    };
+    let footer_width = update_seg + open_seg + dismiss_seg;
+
     let button_row_y = popup_area.y + popup_area.height.saturating_sub(2);
-    let update_btn_end_x = popup_area.x + popup_area.width / 3;
-    let open_btn_end_x = popup_area.x + (popup_area.width * 2) / 3;
-    let open_button_midpoint_x = popup_area.x + popup_area.width / 2;
-
+    let inner_width = popup_area.width.saturating_sub(2);
+    let footer_start = popup_area.x + 1 + inner_width.saturating_sub(footer_width) / 2;
+    let update_btn_end_x = footer_start + update_seg;
+    let open_btn_end_x = update_btn_end_x + open_seg;
+    let open_button_midpoint_x = update_btn_end_x + open_seg / 2;
     UpdateModalLayout {
         popup_area,
         display_count,
@@ -429,14 +644,38 @@ mod tests {
         let notes = "Line 1\nLine 2\nLine 3\nLine 4";
         let layout = update_modal_layout(area, notes);
 
-        assert_eq!(layout.popup_area.width, 72);
+        assert_eq!(layout.popup_area.width, 76);
         assert_eq!(layout.display_count, 4);
         assert!(!layout.has_more);
-        assert_eq!(layout.popup_area.height, 12);
-        assert_eq!(layout.popup_area.x, (80 - 72) / 2);
-        assert_eq!(layout.popup_area.y, (24 - 12) / 2);
-        assert_eq!(layout.button_row_y, layout.popup_area.y + 10);
-        assert_eq!(layout.open_button_midpoint_x, layout.popup_area.x + 36);
+        assert_eq!(layout.popup_area.height, 14);
+        assert_eq!(layout.popup_area.x, (80 - 76) / 2);
+        assert_eq!(layout.popup_area.y, (24 - 14) / 2);
+        assert_eq!(layout.button_row_y, layout.popup_area.y + 12);
+        let footer_start = layout.popup_area.x + 1 + (74 - 58) / 2;
+        assert_eq!(layout.update_btn_end_x, footer_start + 18);
+        assert_eq!(layout.open_btn_end_x, layout.update_btn_end_x + 26);
+        assert_eq!(layout.open_button_midpoint_x, layout.update_btn_end_x + 13);
+    }
+
+    #[test]
+    fn test_update_modal_zones_cover_visible_labels_only() {
+        let area = Rect::new(0, 0, 80, 24);
+        let layout = update_modal_layout(area, "notes");
+        let row = layout.button_row_y;
+
+        assert!(layout.popup_area.contains(ratatui::layout::Position::new(
+            layout.update_btn_end_x - 2,
+            row
+        )));
+        assert!(layout.popup_area.contains(ratatui::layout::Position::new(
+            layout.open_btn_end_x - 2,
+            row
+        )));
+
+        let gap_before_open = layout.update_btn_end_x;
+        assert!(gap_before_open < layout.open_btn_end_x);
+        let dismiss_center = layout.open_btn_end_x + 6;
+        assert!(dismiss_center > layout.open_btn_end_x);
     }
 
     #[test]
@@ -463,7 +702,7 @@ mod tests {
         let notes = "Feature A";
         let layout = update_modal_layout(area, notes);
 
-        let dismiss_x = layout.open_button_midpoint_x + 5;
+        let dismiss_x = layout.open_btn_end_x + 6;
         let dismiss_y = layout.button_row_y;
 
         assert!(
@@ -493,8 +732,108 @@ mod tests {
         assert!(compact.has_more);
 
         let large = update_modal_layout(Rect::new(0, 0, 160, 50), notes);
-        assert_eq!(large.popup_area.width, 72);
-        assert_eq!(large.display_count, 10);
-        assert!(large.has_more);
+        assert_eq!(large.popup_area.width, 76);
+        assert_eq!(large.display_count, 11);
+        assert!(!large.has_more);
+    }
+
+    #[test]
+    fn test_download_confirm_action_row_matches_rendered_button_section() {
+        let popup = Rect::new(10, 10, 40, 10);
+        let summary_lines = 3;
+        let action_row = download_confirm_action_row(popup, summary_lines);
+
+        assert_eq!(action_row, popup.y + 4);
+        assert!(popup.contains(ratatui::layout::Position::new(popup.x + 2, action_row)));
+    }
+
+    #[test]
+    fn test_download_confirm_zones_do_not_overlap() {
+        let area = Rect::new(0, 0, 80, 24);
+        let summary_lines = 4;
+        let longest = 30;
+        let popup = download_confirm_layout(area, summary_lines, longest);
+        let action_row = download_confirm_action_row(popup, summary_lines);
+
+        assert!(popup.contains(ratatui::layout::Position::new(popup.x + 1, action_row)));
+        assert!(action_row < popup.bottom() - 1);
+    }
+
+    #[test]
+    fn test_browse_category_badges() {
+        let theme = Theme::mocha();
+
+        let (movies_badge, _) = browse_category_badge("Popular Movies", &theme);
+        assert_eq!(movies_badge.content, "[MOVIES]");
+
+        let (top_rated_badge, _) = browse_category_badge("Top Rated Movies", &theme);
+        assert_eq!(top_rated_badge.content, "[MOVIES]");
+
+        let (series_badge, _) = browse_category_badge("Popular Series", &theme);
+        assert_eq!(series_badge.content, "[SERIES]");
+
+        let (airing_badge, _) = browse_category_badge("Airing Today", &theme);
+        assert_eq!(airing_badge.content, "[SERIES]");
+
+        let (trending_badge, _) = browse_category_badge("Trending Today", &theme);
+        assert_eq!(trending_badge.content, "[DISCOVER]");
+
+        let (anime_badge, _) = browse_category_badge("Anime", &theme);
+        assert_eq!(anime_badge.content, "[DISCOVER]");
+    }
+
+    #[test]
+    fn test_picker_with_lines_rendering() {
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let theme = Theme::mocha();
+        let mut list_state = ListState::default();
+        list_state.select(Some(0));
+
+        let raw_items = vec!["[MOVIES]   Popular Movies".to_string()];
+        let lines = vec![Line::from(vec![
+            Span::styled("[MOVIES]", theme.sapphire),
+            Span::raw("   "),
+            Span::styled("Popular Movies", theme.text),
+        ])];
+
+        terminal
+            .draw(|frame| {
+                picker_with_lines(
+                    frame,
+                    Rect::new(0, 0, 80, 24),
+                    &lines,
+                    &raw_items,
+                    &mut list_state,
+                    PickerSpec {
+                        title: "Browse",
+                        confirm_label: "Open",
+                        minimum_width: 36,
+                    },
+                    &theme,
+                    false,
+                );
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let content = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(content.contains("[MOVIES]"));
+        assert!(content.contains("Popular Movies"));
+    }
+    #[test]
+    fn test_picker_layout_height_tight_fit() {
+        let area = Rect::new(0, 0, 80, 24);
+        let items_single = vec!["Single Item".to_string()];
+        let layout_single = picker_layout(area, &items_single, "Open", 20);
+        assert_eq!(layout_single.height, 5);
+
+        let items_two = vec!["Item 1".to_string(), "Item 2".to_string()];
+        let layout_two = picker_layout(area, &items_two, "Use", 20);
+        assert_eq!(layout_two.height, 6);
     }
 }

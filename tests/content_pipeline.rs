@@ -1,10 +1,8 @@
 use moviebox_tui::{
-    providers::{
-        addons::{
-            adapter::{meta_detail_to_moviebox_json, metas_to_moviebox_search_json},
-            models::{MetaDetail, MetaItem, MetaVideo},
-        },
-        models::{ProviderKind, RequestContext},
+    models::SearchResult,
+    providers::models::{
+        CatalogItem, Episode, MediaDetails, MediaType, ProviderKind, ProviderMediaId,
+        RequestContext, Season,
     },
     tui::{
         action::Action,
@@ -12,98 +10,6 @@ use moviebox_tui::{
         state::{AppMode, InputMode, Screen},
     },
 };
-
-#[test]
-fn test_search_result_identity_and_similar_title_isolation() {
-    let metas = vec![
-        MetaItem {
-            id: "tt0096895".to_string(),
-            r#type: "movie".to_string(),
-            name: "Batman".to_string(),
-            title: None,
-            poster: Some("https://example.com/batman1989.jpg".to_string()),
-            cover: None,
-            description: Some(
-                "The Dark Knight of Gotham City begins his war on crime.".to_string(),
-            ),
-            overview: None,
-            synopsis: None,
-            release_info: Some("1989".to_string()),
-            year: Some("1989".to_string()),
-            released: None,
-            imdb_rating: Some("7.5".to_string()),
-            rating: None,
-            genres: vec!["Action".to_string(), "Adventure".to_string()],
-            genre: vec![],
-        },
-        MetaItem {
-            id: "tt1877830".to_string(),
-            r#type: "movie".to_string(),
-            name: "The Batman".to_string(),
-            title: None,
-            poster: Some("https://example.com/thebatman2022.jpg".to_string()),
-            cover: None,
-            description: Some("In his second year of fighting crime...".to_string()),
-            overview: None,
-            synopsis: None,
-            release_info: Some("2022".to_string()),
-            year: Some("2022".to_string()),
-            released: None,
-            imdb_rating: Some("7.8".to_string()),
-            rating: None,
-            genres: vec![
-                "Action".to_string(),
-                "Crime".to_string(),
-                "Drama".to_string(),
-            ],
-            genre: vec![],
-        },
-        MetaItem {
-            id: "tt0103359".to_string(),
-            r#type: "series".to_string(),
-            name: "Batman: The Animated Series".to_string(),
-            title: None,
-            poster: Some("https://example.com/batman_tas.jpg".to_string()),
-            cover: None,
-            description: Some("The Caped Crusader battles Gotham City criminals.".to_string()),
-            overview: None,
-            synopsis: None,
-            release_info: Some("1992-1995".to_string()),
-            year: Some("1992".to_string()),
-            released: None,
-            imdb_rating: Some("9.0".to_string()),
-            rating: None,
-            genres: vec!["Animation".to_string(), "Action".to_string()],
-            genre: vec![],
-        },
-    ];
-
-    let search_json = metas_to_moviebox_search_json(metas);
-    let subjects = search_json
-        .get("results")
-        .and_then(|r| r.as_array())
-        .and_then(|arr| arr.first())
-        .and_then(|first| first.get("subjects"))
-        .and_then(|s| s.as_array())
-        .expect("subjects array must exist");
-
-    assert_eq!(subjects.len(), 3);
-
-    assert_eq!(subjects[0]["subjectId"], "tt0096895");
-    assert_eq!(subjects[0]["title"], "Batman");
-    assert_eq!(subjects[0]["subjectType"], 1);
-    assert_eq!(subjects[0]["releaseDate"], "1989");
-
-    assert_eq!(subjects[1]["subjectId"], "tt1877830");
-    assert_eq!(subjects[1]["title"], "The Batman");
-    assert_eq!(subjects[1]["subjectType"], 1);
-    assert_eq!(subjects[1]["releaseDate"], "2022");
-
-    assert_eq!(subjects[2]["subjectId"], "tt0103359");
-    assert_eq!(subjects[2]["title"], "Batman: The Animated Series");
-    assert_eq!(subjects[2]["subjectType"], 2);
-    assert_eq!(subjects[2]["releaseDate"], "1992");
-}
 
 #[tokio::test]
 async fn test_stale_details_response_protection() {
@@ -118,10 +24,27 @@ async fn test_stale_details_response_protection() {
     };
     app.state_mut().active_details_request = 1;
     app.state_mut().active_subject_id = Some("movie_a".to_string());
-    app.state_mut().selected_details = Some(serde_json::json!({
-        "id": "movie_a",
-        "title": "Movie A",
-    }));
+    app.state_mut().selected_details = Some(MediaDetails {
+        id: ProviderMediaId {
+            provider: ProviderKind::MovieBox,
+            value: "movie_a".to_string(),
+        },
+        title: "Movie A".to_string(),
+        media_type: MediaType::Movie,
+        year: None,
+        description: None,
+        tagline: None,
+        imdb_rating: None,
+        director: None,
+        stars: None,
+        prints: None,
+        audios: None,
+        poster_url: None,
+        duration: None,
+        genres: vec![],
+        seasons: vec![],
+        dubs: vec![],
+    });
 
     let context_b = RequestContext {
         provider: ProviderKind::MovieBox,
@@ -129,16 +52,49 @@ async fn test_stale_details_response_protection() {
     };
     app.state_mut().active_details_request = 2;
     app.state_mut().active_subject_id = Some("movie_b".to_string());
-    app.state_mut().selected_details = Some(serde_json::json!({
-        "id": "movie_b",
-        "title": "Movie B Draft",
-    }));
-
-    let stale_payload = serde_json::json!({
-        "id": "movie_a",
-        "title": "Movie A Full Metadata",
-        "synopsis": "Stale synopsis from Movie A",
+    app.state_mut().selected_details = Some(MediaDetails {
+        id: ProviderMediaId {
+            provider: ProviderKind::MovieBox,
+            value: "movie_b".to_string(),
+        },
+        title: "Movie B Draft".to_string(),
+        media_type: MediaType::Movie,
+        year: None,
+        description: None,
+        tagline: None,
+        imdb_rating: None,
+        director: None,
+        stars: None,
+        prints: None,
+        audios: None,
+        poster_url: None,
+        duration: None,
+        genres: vec![],
+        seasons: vec![],
+        dubs: vec![],
     });
+
+    let stale_payload = MediaDetails {
+        id: ProviderMediaId {
+            provider: ProviderKind::MovieBox,
+            value: "movie_a".to_string(),
+        },
+        title: "Movie A Full Metadata".to_string(),
+        media_type: MediaType::Movie,
+        year: None,
+        description: Some("Stale synopsis from Movie A".to_string()),
+        tagline: None,
+        imdb_rating: None,
+        director: None,
+        stars: None,
+        prints: None,
+        audios: None,
+        poster_url: None,
+        duration: None,
+        genres: vec![],
+        seasons: vec![],
+        dubs: vec![],
+    };
     app.handle_action(Action::DetailsSuccess(
         context_a,
         1,
@@ -149,15 +105,31 @@ async fn test_stale_details_response_protection() {
 
     assert_eq!(app.state().active_subject_id.as_deref(), Some("movie_b"));
     assert_eq!(
-        app.state().selected_details.as_ref().unwrap()["title"],
+        app.state().selected_details.as_ref().unwrap().title,
         "Movie B Draft"
     );
 
-    let valid_payload = serde_json::json!({
-        "id": "movie_b",
-        "title": "Movie B Full Metadata",
-        "synopsis": "Correct synopsis for Movie B",
-    });
+    let valid_payload = MediaDetails {
+        id: ProviderMediaId {
+            provider: ProviderKind::MovieBox,
+            value: "movie_b".to_string(),
+        },
+        title: "Movie B Full Metadata".to_string(),
+        media_type: MediaType::Movie,
+        year: None,
+        description: Some("Correct synopsis for Movie B".to_string()),
+        tagline: None,
+        imdb_rating: None,
+        director: None,
+        stars: None,
+        prints: None,
+        audios: None,
+        poster_url: None,
+        duration: None,
+        genres: vec![],
+        seasons: vec![],
+        dubs: vec![],
+    };
     app.handle_action(Action::DetailsSuccess(
         context_b,
         2,
@@ -168,12 +140,17 @@ async fn test_stale_details_response_protection() {
 
     assert_eq!(app.state().active_subject_id.as_deref(), Some("movie_b"));
     assert_eq!(
-        app.state().selected_details.as_ref().unwrap()["title"],
+        app.state().selected_details.as_ref().unwrap().title,
         "Movie B Full Metadata"
     );
     assert_eq!(
-        app.state().selected_details.as_ref().unwrap()["synopsis"],
-        "Correct synopsis for Movie B"
+        app.state()
+            .selected_details
+            .as_ref()
+            .unwrap()
+            .description
+            .as_deref(),
+        Some("Correct synopsis for Movie B")
     );
 }
 
@@ -207,123 +184,13 @@ fn test_cache_key_isolation_across_providers_queries_and_dimensions() {
     assert_ne!(stream_s1_e1, stream_s2_e1);
 }
 
-#[test]
-fn test_addon_metadata_mapping_and_partial_data_degradation() {
-    let minimal = MetaDetail {
-        id: "tt9999999".to_string(),
-        r#type: "movie".to_string(),
-        name: "Minimal Indie Film".to_string(),
-        title: None,
-        poster: None,
-        cover: None,
-        background: None,
-        logo: None,
-        description: None,
-        overview: None,
-        synopsis: None,
-        release_info: None,
-        year: None,
-        released: None,
-        imdb_rating: None,
-        rating: None,
-        genres: vec![],
-        genre: vec![],
-        runtime: None,
-        cast: vec![],
-        director: vec![],
-        videos: vec![],
-    };
-
-    let json_output = meta_detail_to_moviebox_json(&minimal);
-
-    assert_eq!(json_output["id"], "tt9999999");
-    assert_eq!(json_output["title"], "Minimal Indie Film");
-    assert_eq!(json_output["subjectType"], 1);
-    assert_eq!(json_output["releaseDate"], "");
-    assert!(json_output["description"].is_null());
-    assert!(json_output["director"].is_null());
-    assert!(json_output["stars"].is_null());
-
-    let series_detail = MetaDetail {
-        id: "tt8888888".to_string(),
-        r#type: "series".to_string(),
-        name: "Test Drama".to_string(),
-        title: None,
-        poster: Some("https://example.com/poster.jpg".to_string()),
-        cover: None,
-        background: None,
-        logo: None,
-        description: Some("A gripping story.".to_string()),
-        overview: None,
-        synopsis: None,
-        release_info: Some("2021".to_string()),
-        year: Some("2021".to_string()),
-        released: None,
-        imdb_rating: Some("8.4".to_string()),
-        rating: None,
-        genres: vec!["Drama".to_string()],
-        genre: vec![],
-        runtime: Some("45 min".to_string()),
-        cast: vec!["Actor One".to_string(), "Actor Two".to_string()],
-        director: vec!["Director Name".to_string()],
-        videos: vec![
-            MetaVideo {
-                id: Some("ep1".to_string()),
-                title: Some("Pilot".to_string()),
-                name: None,
-                season: Some(1),
-                episode: Some(1),
-                number: Some(1),
-                released: None,
-                thumbnail: None,
-            },
-            MetaVideo {
-                id: Some("ep2".to_string()),
-                title: Some("Chapter 2".to_string()),
-                name: None,
-                season: Some(1),
-                episode: Some(2),
-                number: Some(2),
-                released: None,
-                thumbnail: None,
-            },
-            MetaVideo {
-                id: Some("ep3".to_string()),
-                title: Some("Season 2 Premiere".to_string()),
-                name: None,
-                season: Some(2),
-                episode: Some(1),
-                number: Some(1),
-                released: None,
-                thumbnail: None,
-            },
-        ],
-    };
-
-    let series_json = meta_detail_to_moviebox_json(&series_detail);
-
-    assert_eq!(series_json["subjectType"], 2);
-    assert_eq!(series_json["releaseDate"], "2021");
-    assert_eq!(series_json["director"], "Director Name");
-    assert_eq!(series_json["stars"], "Actor One, Actor Two");
-
-    let seasons = series_json["seasons"]["seasons"]
-        .as_array()
-        .expect("seasons array");
-    assert_eq!(seasons.len(), 2);
-    assert_eq!(seasons[0]["se"], 1);
-    assert_eq!(seasons[0]["maxEp"], 2);
-    assert_eq!(seasons[1]["se"], 2);
-    assert_eq!(seasons[1]["maxEp"], 1);
-}
-
 #[tokio::test]
 async fn test_search_failure_vs_empty_result_distinction() {
     let mut app = App::new();
     app.state_mut().update_available = None;
     app.state_mut().active_provider = ProviderKind::MovieBox;
     app.state_mut().input_mode = InputMode::Normal;
-    app.state_mut().search_query = "xyznonexistent".to_string();
+    app.state_mut().search_query.set_content("xyznonexistent");
 
     let context = RequestContext {
         provider: ProviderKind::MovieBox,
@@ -335,11 +202,7 @@ async fn test_search_failure_vs_empty_result_distinction() {
         request_id: app.state().active_search_request,
         query: "xyznonexistent".to_string(),
         page: 1,
-        payload: serde_json::json!({
-            "results": [{
-                "subjects": []
-            }]
-        }),
+        items: vec![],
     })
     .await;
 
@@ -375,30 +238,30 @@ async fn test_mode_switch_stale_response_protection() {
         generation: streaming_generation,
     };
     app.state_mut().active_search_request = 1;
-    app.state_mut().search_query = "avatar".to_string();
+    app.state_mut().search_query.set_content("avatar");
 
     app.handle_action(Action::ToggleAddonMode).await;
     assert_eq!(app.state().mode(), AppMode::Addon);
     assert_ne!(app.state().provider_generation, streaming_generation);
 
-    let moviebox_payload = serde_json::json!({
-        "results": [{
-            "subjects": [{
-                "subjectId": "mb_12345",
-                "title": "Avatar",
-                "subjectType": 1,
-                "releaseDate": "2009",
-                "cover": { "url": "https://example.com/avatar.jpg" }
-            }]
-        }]
-    });
+    let moviebox_items = vec![CatalogItem {
+        id: ProviderMediaId {
+            provider: ProviderKind::MovieBox,
+            value: "mb_12345".to_string(),
+        },
+        title: "Avatar".to_string(),
+        media_type: MediaType::Movie,
+        year: Some("2009".to_string()),
+        poster_url: Some("https://example.com/avatar.jpg".to_string()),
+        season_count: None,
+    }];
 
     app.handle_action(Action::SearchSuccess {
         context: streaming_context,
         request_id: 1,
         query: "avatar".to_string(),
         page: 1,
-        payload: moviebox_payload,
+        items: moviebox_items,
     })
     .await;
 
@@ -430,4 +293,293 @@ async fn test_poster_identity_isolation() {
     .await;
 
     assert!(app.state().poster_image.is_some());
+}
+
+#[tokio::test]
+async fn test_search_preview_and_details_metadata_isolation() {
+    let mut app = App::new();
+    app.state_mut().update_available = None;
+
+    let old_preview = MediaDetails {
+        id: ProviderMediaId {
+            provider: ProviderKind::Addons,
+            value: "tt_old_movie".to_string(),
+        },
+        title: "Old Movie Title".to_string(),
+        media_type: MediaType::Movie,
+        year: Some("2020".to_string()),
+        description: Some("Old Movie Description".to_string()),
+        tagline: None,
+        imdb_rating: Some("8.5".to_string()),
+        director: Some("Old Director".to_string()),
+        stars: Some("Old Star".to_string()),
+        prints: None,
+        audios: None,
+        poster_url: Some("https://example.com/old.jpg".to_string()),
+        duration: Some("120 min".to_string()),
+        genres: vec!["Action".to_string()],
+        seasons: vec![],
+        dubs: vec![],
+    };
+
+    let new_search_result = SearchResult {
+        id: "tt_new_movie".to_string(),
+        title: "New Movie Title".to_string(),
+        stype: 1,
+        release_year: "2025".to_string(),
+        cover_url: Some("https://example.com/new.jpg".to_string()),
+        season: 0,
+        episode: 0,
+        provider: ProviderKind::Addons,
+    };
+
+    // Mismatched preview should NOT leak description/director/stars/rating into fallback
+    let fallback = MediaDetails::from_search_result(&new_search_result, Some(&old_preview));
+    assert_eq!(fallback.id.value, "tt_new_movie");
+    assert_eq!(fallback.title, "New Movie Title");
+    assert_eq!(fallback.year.as_deref(), Some("2025"));
+    assert!(fallback.description.is_none());
+    assert!(fallback.director.is_none());
+    assert!(fallback.stars.is_none());
+    assert!(fallback.imdb_rating.is_none());
+
+    // Matching preview SHOULD preserve preview details
+    let matching_preview = MediaDetails {
+        id: ProviderMediaId {
+            provider: ProviderKind::Addons,
+            value: "tt_new_movie".to_string(),
+        },
+        title: "New Movie Title".to_string(),
+        media_type: MediaType::Movie,
+        year: Some("2025".to_string()),
+        description: Some("New Movie Description".to_string()),
+        tagline: None,
+        imdb_rating: Some("7.9".to_string()),
+        director: Some("New Director".to_string()),
+        stars: Some("New Star".to_string()),
+        prints: None,
+        audios: None,
+        poster_url: Some("https://example.com/new.jpg".to_string()),
+        duration: Some("140 min".to_string()),
+        genres: vec!["Drama".to_string()],
+        seasons: vec![],
+        dubs: vec![],
+    };
+    let matching_fallback =
+        MediaDetails::from_search_result(&new_search_result, Some(&matching_preview));
+    assert_eq!(matching_fallback.id.value, "tt_new_movie");
+    assert_eq!(
+        matching_fallback.description.as_deref(),
+        Some("New Movie Description")
+    );
+    assert_eq!(matching_fallback.director.as_deref(), Some("New Director"));
+}
+#[tokio::test]
+async fn test_series_details_defaults_to_season_one_when_no_history() {
+    let mut app = App::new();
+    app.state_mut().active_provider = ProviderKind::MovieBox;
+    app.state_mut().active_screen = Screen::Details;
+    app.state_mut().active_subject_id = Some("bb_series".to_string());
+    app.state_mut().selected_season = 1;
+    app.state_mut().selected_episode = 1;
+    app.state_mut().active_details_request = 1;
+
+    let context = RequestContext {
+        provider: ProviderKind::MovieBox,
+        generation: app.state().provider_generation,
+    };
+
+    let seasons = (1..=5)
+        .map(|s| Season {
+            number: s,
+            episodes: (1..=10)
+                .map(|e| Episode {
+                    season: s,
+                    number: e,
+                    title: None,
+                })
+                .collect(),
+        })
+        .collect();
+
+    let details = MediaDetails {
+        id: ProviderMediaId {
+            provider: ProviderKind::MovieBox,
+            value: "bb_series".to_string(),
+        },
+        title: "Breaking Bad".to_string(),
+        media_type: MediaType::Series,
+        year: Some("2008".to_string()),
+        description: None,
+        tagline: None,
+        imdb_rating: Some("9.5".to_string()),
+        director: None,
+        stars: None,
+        prints: None,
+        audios: None,
+        poster_url: None,
+        duration: None,
+        genres: vec![],
+        seasons,
+        dubs: vec![],
+    };
+
+    app.handle_action(Action::DetailsSuccess(
+        context,
+        1,
+        "bb_series".to_string(),
+        details,
+    ))
+    .await;
+
+    assert_eq!(app.state().selected_season, 1);
+    assert_eq!(app.state().selected_episode, 1);
+    assert_eq!(app.state().season_list_state.selected(), Some(0));
+    assert_eq!(app.state().episode_list_state.selected(), Some(0));
+}
+
+#[tokio::test]
+async fn test_series_details_resumes_watch_history() {
+    let mut app = App::new();
+    app.state_mut().active_provider = ProviderKind::MovieBox;
+    app.state_mut().active_screen = Screen::Details;
+    app.state_mut().selected_season = 1;
+    app.state_mut().selected_episode = 1;
+    app.state_mut()
+        .history
+        .recent
+        .push(moviebox_tui::history::WatchHistoryItem {
+            provider: "moviebox".to_string(),
+            subject_id: "bb_series".to_string(),
+            title: "Breaking Bad".to_string(),
+            stype: 2,
+            season: 3,
+            episode: 7,
+            duration_seconds: Some(3000),
+            progress_seconds: 500,
+            completed: false,
+            timestamp: 1000,
+            release_year: "2008".to_string(),
+            cover_url: None,
+        });
+    app.state_mut().active_details_request = 1;
+
+    let context = RequestContext {
+        provider: ProviderKind::MovieBox,
+        generation: app.state().provider_generation,
+    };
+
+    let seasons = (1..=5)
+        .map(|s| Season {
+            number: s,
+            episodes: (1..=10)
+                .map(|e| Episode {
+                    season: s,
+                    number: e,
+                    title: None,
+                })
+                .collect(),
+        })
+        .collect();
+
+    let details = MediaDetails {
+        id: ProviderMediaId {
+            provider: ProviderKind::MovieBox,
+            value: "bb_series".to_string(),
+        },
+        title: "Breaking Bad".to_string(),
+        media_type: MediaType::Series,
+        year: Some("2008".to_string()),
+        description: None,
+        tagline: None,
+        imdb_rating: Some("9.5".to_string()),
+        director: None,
+        stars: None,
+        prints: None,
+        audios: None,
+        poster_url: None,
+        duration: None,
+        genres: vec![],
+        seasons,
+        dubs: vec![],
+    };
+
+    app.handle_action(Action::DetailsSuccess(
+        context,
+        1,
+        "bb_series".to_string(),
+        details,
+    ))
+    .await;
+
+    assert_eq!(app.state().selected_season, 3);
+    assert_eq!(app.state().selected_episode, 7);
+    assert_eq!(app.state().season_list_state.selected(), Some(2));
+    assert_eq!(app.state().episode_list_state.selected(), Some(6));
+}
+
+#[tokio::test]
+async fn test_series_details_preserves_season_and_episode_on_language_switch() {
+    let mut app = App::new();
+    app.state_mut().active_provider = ProviderKind::MovieBox;
+    app.state_mut().active_screen = Screen::Details;
+    app.state_mut().active_subject_id = Some("bb_series".to_string());
+    app.state_mut().language_chosen = true;
+    app.state_mut().selected_season = 4;
+    app.state_mut().selected_episode = 2;
+
+    app.state_mut().active_details_request = 1;
+
+    let context = RequestContext {
+        provider: ProviderKind::MovieBox,
+        generation: app.state().provider_generation,
+    };
+
+    let seasons = (1..=5)
+        .map(|s| Season {
+            number: s,
+            episodes: (1..=10)
+                .map(|e| Episode {
+                    season: s,
+                    number: e,
+                    title: None,
+                })
+                .collect(),
+        })
+        .collect();
+
+    let details = MediaDetails {
+        id: ProviderMediaId {
+            provider: ProviderKind::MovieBox,
+            value: "bb_series".to_string(),
+        },
+        title: "Breaking Bad".to_string(),
+        media_type: MediaType::Series,
+        year: Some("2008".to_string()),
+        description: None,
+        tagline: None,
+        imdb_rating: Some("9.5".to_string()),
+        director: None,
+        stars: None,
+        prints: None,
+        audios: None,
+        poster_url: None,
+        duration: None,
+        genres: vec![],
+        seasons,
+        dubs: vec![],
+    };
+
+    app.handle_action(Action::DetailsSuccess(
+        context,
+        1,
+        "bb_series".to_string(),
+        details,
+    ))
+    .await;
+
+    assert_eq!(app.state().selected_season, 4);
+    assert_eq!(app.state().selected_episode, 2);
+    assert_eq!(app.state().season_list_state.selected(), Some(3));
+    assert_eq!(app.state().episode_list_state.selected(), Some(1));
 }

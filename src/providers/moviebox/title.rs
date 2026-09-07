@@ -87,6 +87,22 @@ pub fn clean_moviebox_title(raw_title: &str) -> String {
         title = title[..s_idx].trim();
     }
 
+    for sep in ['_', ' ', '.', '-'] {
+        if let Some(pos) = title.rfind(sep) {
+            let suffix = &title[pos + 1..];
+            let is_res = (suffix.ends_with('p') || suffix.ends_with('P'))
+                && suffix.len() > 1
+                && suffix[..suffix.len() - 1]
+                    .chars()
+                    .all(|c| c.is_ascii_digit())
+                && suffix[..suffix.len() - 1]
+                    .parse::<u32>()
+                    .is_ok_and(|r| (144..=8640).contains(&r));
+            if is_res {
+                title = title[..pos].trim();
+            }
+        }
+    }
     let cleaned = title
         .trim_end_matches(['-', ':', '_', '.', ' '])
         .trim()
@@ -186,8 +202,12 @@ mod tests {
         assert_eq!(clean_moviebox_title("Movie - Hindi Dub"), "Movie");
         assert_eq!(clean_moviebox_title("Breaking Bad S01"), "Breaking Bad");
         assert_eq!(clean_moviebox_title("Dark Season 2"), "Dark");
+        assert_eq!(
+            clean_moviebox_title("Ek Deewane Ki Deewaniyat_360P"),
+            "Ek Deewane Ki Deewaniyat"
+        );
+        assert_eq!(clean_moviebox_title("Interstellar_1080P"), "Interstellar");
     }
-
     #[test]
     fn test_clean_moviebox_title_empty_and_whitespace() {
         assert_eq!(clean_moviebox_title(""), "");

@@ -6,54 +6,80 @@ shared typed models in `providers/models.rs` and the moviebox JSON schema used b
 
 ## Provider kinds
 
-| Kind            | Module                     | Notes                                       |
-| --------------- | -------------------------- | ------------------------------------------- |
-| `MovieBox`      | `providers/moviebox`       | Primary. Requires request signing (crypto). |
-| `FourKHdHub`    | `providers/fourkhdhub`     | 4K releases; hubcloud mirror resolver.      |
-| `BdixCircleFtp` | `providers/bdix/circleftp` | BDIX FTP directory scrapes.                 |
-| `BdixDhakaFlix` | `providers/bdix/dhakaflix` | BDIX indexer.                               |
-| `Addons`        | `providers/addons`         | Community HTTP addons (Cinemeta, streams).  |
+| Provider | Module | Description |
+| :--- | :--- | :--- |
+| **MovieBox** | `providers/moviebox` | Primary provider. Requires request signing (crypto). |
+| **FourKHdHub** | `providers/fourkhdhub` | 4K releases; hubcloud mirror resolver. |
+| **BdixCircleFtp** | `providers/bdix/circleftp` | BDIX FTP directory scrapes. |
+| **BdixDhakaFlix** | `providers/bdix/dhakaflix` | BDIX indexer. |
+| **Addons** | `providers/addons` | Community HTTP addons (Cinemeta, streams). |
 
 BDIX sources are only reachable from supported Bangladeshi ISPs and are hidden by
-default (`bdix_enabled` in config; `/enable-bdix`).
+default (`bdix_enabled` in config; `/settings` → Content Modes → BDIX Sources).
 
-## Shared flow
+Active streaming providers can be cycled via `Ctrl+P` or visually selected by clicking the provider badge (`[MovieBox · ^P]`) on the landing search bar to open the anchored provider popup menu.
+## Shared Provider Contract
 
 Search, details, and episode-streams are dispatched per provider. Pluggable provider seams
-in `providers/mod.rs` give every client a shared async trait shape:
+in `providers/mod.rs` give every client a shared, strictly-typed async trait shape:
 
 - `Provider::id(&self) -> ProviderKind`: Returns the provider's unique identifier.
 - `Provider::capabilities(&self) -> ProviderCapabilities`: Reports supported capabilities (`supports_search`, `supports_pagination`, `supports_series`, `supports_subtitles`, `supports_homepage`).
-- `Provider::search` / `Provider::details`: Dispatches search and metadata queries. MovieBox provides it natively; other providers adapt typed models (`MediaDetails`) via adapters.
-- `ReleaseProvider::episode_streams`: Returns the typed `Release` list for release-based providers; MovieBox keeps its own paginated resource path.
+- `Provider::search(&self, query: &str, page: usize) -> Result<Vec<CatalogItem>, ProviderError>`: Dispatches search queries, returning strongly-typed `CatalogItem`s.
+- `Provider::details(&self, id: &str) -> Result<MediaDetails, ProviderError>`: Dispatches metadata queries, returning strongly-typed `MediaDetails`.
+- `ReleaseProvider::episode_streams(&self, id: &str, season: usize, episode: usize) -> Result<Vec<Release>, ProviderError>`: Returns the typed `Release` list for release-based providers.
 - `ProviderError`: Standardized error boundary (`Network`, `RateLimited`, `NotFound`, `Parsing`, `Unavailable`) with `.user_message(provider)` generating clean UI toast notifications.
+
+### Strongly Typed Architecture & Binary Disk Caching
+
+All internal state (`AppState`), UI screens (`details.rs`, `home.rs`), and the action event bus transport native Rust structs directly:
+- `CatalogItem` / `SearchResult` for search results and discover catalogs.
+- `MediaDetails` (with `Vec<Season>` and `Vec<AudioTrackOption>`) for media metadata.
+- `Release` (with `Vec<SourceMirror>` and optional `resource_id`) for streams.
+- `SubtitleOption` for external subtitles.
+
+Disk caching in `src/cache.rs` uses high-performance portable binary serialization via `rmp-serde` (MessagePack) with a 4-byte magic signature (`MBC1`) and versioned TTL envelope (`CacheEnvelope<T>`), eliminating all runtime JSON parsing and string allocation bottlenecks.
 
 Playback resolves to a `PlaybackSource { provider, url, headers, subtitle, source_label }`,
 which `app/playback.rs::launch_player` feeds to the external player.
 
+## Adding a New Provider
+
+Adding a new streaming or BDIX provider to MovieBox TUI takes 3 simple steps:
+
+1. **Define the Provider Variant (`src/providers/models.rs`)**:
+   Add the new variant to `ProviderKind` with its label, cache key, and serialization aliases.
+
+2. **Implement the `Provider` Trait (`src/providers/<new_provider>/`)**:
+   Implement `Provider::id`, `Provider::capabilities`, `Provider::search`, and `Provider::details` for your client struct, returning typed domain models (`CatalogItem`, `MediaDetails`). If your provider resolves release streams, also implement `ReleaseProvider`.
+
+3. **Register the Client in `MovieBoxService` (`src/service.rs`)**:
+   Add your client struct to `MovieBoxService`, instantiate it in `MovieBoxService::new()`, and map it in `capabilities`, `search_typed`, and `details_typed`. All search, details, and stream dispatches operate natively with zero JSON shims.
+
 ## MovieBox
-
 - Base host pool + per-request HMAC-MD5 signature, client token, and a spoofed Android
-  device identity (`crypto.rs`) to satisfy the anti-bot gateway.
+  device identity (`crypto.rs`) spoofing APK `v4.0.01.0813.03` (`version_codes: 50020117..50020121`)
+  to satisfy the backend gateway and prevent notice video substitution.
 - Hosts are retried; a shared runtime token is re-initialized when all hosts fail.
+- Mobile `User-Agent` generated by the crypto module is forwarded through playback and download
+  pipelines to satisfy CDN anti-bot checks.
+- Multi-resolution discovery (`fetch_collection_resolutions`) dynamically discovers available
+  stream resolutions with descending quality sorting.
+- Multi-resolution DASH manifests (`index.mpd`) and adaptive streams are labeled with a distinct
+  `[Multi]` badge, stripping confusing raw CDN resolution tags from release titles.
 - Title normalization lives in `moviebox/title.rs` (`clean_moviebox_title`).
-
+- **DASH Manifest Playback & Downloads**: Media streams are hosted on CloudFront as segmented MPEG-DASH manifests (`index.mpd`) protected by signed policy cookies. Stream playback forwards `Cookie`, `Referer`, and `User-Agent` headers to external players (`mpv`, `IINA`). Local downloads utilize `yt-dlp` with forwarded authentication headers to demux and assemble audio/video streams into `.mp4`.
 ## 4KHDHub
 
-- `client.rs::resolve_release` walks the release's mirrors; each candidate goes through
-  `preflight` which validates the URL and issues an **open-range** probe
-  (`Range: bytes=0-`) so probe-only trap mirrors (which answer a tiny bounded range but
-  refuse real streaming) are rejected. The 4KHD referer and a browser user-agent are
-  attached so referer-gated CDNs stream in the player too.
-- `hubcloud.rs` resolves hubcloud/hubdrive pages into candidate playable links and
-  selects a mirror by score.
+- `client.rs::resolve_release` resolves release mirrors concurrently using bounded-concurrency probing (`select_ok` in batches of 3) with a 3.5s per-probe timeout.
+- Direct links undergo automatic path percent-encoding normalization (`validate_playback_url`) to handle filenames containing unencoded spaces, brackets, and special characters.
+- Preflight probes issue a bounded range probe (`Range: bytes=0-8191`) and inspect response bodies for expired mirror errors (`"Failed to extract link"`, `"Token Expired"`, `"404"`) to fail fast on expired torrents.
+- `hubcloud.rs` scores and prioritizes candidate streams (Cloudflare R2 / S3 / Seekable Streams → Storage → PixelDrain API → Google UserContent / Direct Attachments), automatically decoding base64 `Watch Online` mirrors (`vdplay.pages.dev/?u=...`).
 - **Multilingual audio detection**: `parser.rs::detect_language` parses release titles and
   metadata for 30+ regional and international languages (Hindi, Tamil, Telugu, Kannada,
   Malayalam, Bengali, Marathi, Punjabi, Gujarati, Urdu, Japanese, Korean, Chinese, Spanish,
   French, German, Italian, etc.) and formats all available audio tracks for stream display.
-- Errors are surfaced as `FourKHdHubError`; mirror rejections and the final failure
-  reason are logged with the mirror label and a sanitized URL.
-
+- Errors are mapped into `ProviderError::Unavailable` with user-actionable instructions guiding selection of alternate releases.
 ## BDIX
 
 - `circleftp` and `dhakaflix` scrape FTP-style indexes; both are used behind the

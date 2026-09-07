@@ -7,17 +7,17 @@ Disk caching lives in `cache.rs`; in-memory caches live in `AppState`.
 ```
 <cache dir>/moviebox-tui/
   <provider>/            moviebox, fourkhdhub, bdix_circleftp, bdix_dhakaflix, addons
-    search/<hash>_<page>.json
-    details/details_<hash>.json
-    streams/v3_<hash>_<season>_<episode>.json   (v3_ prefix only for 4KHD)
-    images/<md5>.img
+    search/<hash>_<page>.cache
+    details/details_<schema><hash>.cache
+    streams/<schema><hash>_<season>_<episode>.cache
+    images/<hash>.img
   moviebox/
-    homepage/<tab>_<page>.json
-    captions/captions_<hash>.json
+    homepage/home_<tab>_<page>.cache
+    captions/captions_<hash>.cache
   addons/
-    catalogs/catalog_<hash>.json
-    manifests/manifest_<hash>.json
-    streams/<hash>_<season>_<episode>.json
+    catalogs/catalog_<hash>.cache
+    manifests/manifest_<hash>.cache
+    streams/<hash>_<season>_<episode>.cache
   tv_playlists/<md5>.m3u       cached remote playlist snapshots
 ```
 
@@ -26,22 +26,12 @@ The cache directory is `dirs::cache_dir()/moviebox-tui` (macOS
 
 ## Properties
 
-- **Provider namespacing**: keys include `provider.cache_key()`, so results from
-  different providers never collide. Image caches are namespaced by provider (or
-  `iptv` for channel logos) with fallback resolution across `posters`, `moviebox`,
-  `fourkhdhub`, `iptv`, `circleftp`, `dhakaflix`, and `addons`.
-- **TTL**: streams expire after 2h; search/details/captions/manifests after 24h;
-  homepage/catalogs after 1h; remote TV playlist snapshots after 24h; images after 30 days
-  (`IMAGE_CACHE_EXPIRY_SECS`). Local file playlists are reread directly instead of
-  being served from the cache.
-- **Atomic writes**: data is written to a temp file then renamed, so a crash never
-  leaves a corrupt cache entry.
-- **Validation**: search/stream entries are only cached (and only served) if they
-  contain real results, so empty responses are never reused.
-- **Purge**: `clean_old_cache_background` (startup) deletes entries older than 7 days.
-  `ClearCache` (`/clear-cache`) removes the whole cache tree, the legacy
-  `data_dir/moviebox-tui/iptv_cache` directory, and resets the in-memory caches so the
-  next fetch is genuinely fresh.
+- **Binary MessagePack Envelopes**: Cache entries are serialized with `rmp-serde` wrapped in a binary envelope starting with the 4-byte magic signature `MBC1` and an 8-byte TTL timestamp (`CacheEnvelope<T>`). Legacy JSON files are read and migrated on the fly.
+- **Fast Table-Lookup Hex Hashing**: Cache file naming and key hashing in `md5_hex` uses static 16-byte lookup table encoding, eliminating dynamic `core::fmt::write` formatting allocations and speeding up digest encoding by 2.51x.
+- **Provider namespacing**: Keys include `provider.cache_key()`, preventing collisions across sources.
+- **Atomic writes**: Entries are written to a unique temp file (`path.with_extension("tmp-PID-STAMP")`) and atomically replaced (`durable_replace`), preventing truncated or corrupt files on unexpected exits.
+- **Validation**: Empty search or stream results are never written or served from cache.
+- **Purge**: Background cleanup runs at startup to delete entries older than 7 days. `/settings` → Maintenance → Clear Disk Cache recursively empties all cached provider responses, images, TV playlists, temporary subtitles across Android/Windows/Unix, resets in-memory LRU caches, and cancels in-flight background request tasks.
 
 ## In-memory caches (AppState)
 

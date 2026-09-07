@@ -44,6 +44,7 @@ pub(crate) fn pick_best_os_candidate(candidates: &[OsCandidate]) -> Option<&OsCa
 /// season-subtitle preference. `ext_captions` is the raw `get-ext-captions`
 /// response object (`{ "extCaptions": [...] }`). Returns `None` when nothing
 /// matches so the episode downloads without a subtitle (existing default).
+#[allow(dead_code)]
 pub(crate) fn match_season_subtitle_preference(
     ext_captions: &serde_json::Value,
     preference: &str,
@@ -95,10 +96,12 @@ pub(crate) fn looks_like_subtitle(bytes: &[u8]) -> bool {
 /// Cap on a remote subtitle body downloaded to a temp file for VLC/IINA
 /// (~50 MB), mirroring `fetch_capped_image`: chunked, so a misbehaving CDN
 /// cannot stream the whole body into RAM before rejection.
+#[allow(dead_code)]
 const MAX_SUBTITLE_BYTES: usize = 50 * 1024 * 1024;
 
 /// Fetch a remote URL with a `MAX_SUBTITLE_BYTES` cap. Returns `None` when
 /// the request fails or the body exceeds the cap.
+#[allow(dead_code)]
 pub(crate) async fn fetch_capped_bytes(url: &str) -> Option<Vec<u8>> {
     let mut resp = reqwest::get(url).await.ok()?;
     if let Some(len) = resp.content_length()
@@ -245,61 +248,29 @@ pub(crate) async fn resolve_best_os_subtitle(ctx: &SubtitleContext) -> Option<St
 impl App {
     pub(crate) fn build_subtitle_context(&self) -> Option<SubtitleContext> {
         let details = self.state.selected_details.as_ref()?;
-        let title = details
-            .get("title")
-            .and_then(|t| t.as_str())
-            .map(crate::providers::moviebox::clean_moviebox_title)
-            .unwrap_or_default();
+        let title = crate::providers::moviebox::clean_moviebox_title(&details.title);
         if title.is_empty() {
             return None;
         }
         let subject_id = self.state.active_subject_id.clone().unwrap_or_default();
-        // Prefer the currently selected resource, falling back to the details payload.
-        let resource_id = self
-            .state
-            .selected_resources
-            .as_ref()
-            .and_then(|res| res.get("list"))
-            .and_then(|l| l.as_array())
-            .and_then(|list| {
-                let idx = self.state.resource_list_state.selected().unwrap_or(0);
-                list.get(idx)
-            })
-            .and_then(|file| file.get("resourceId"))
-            .and_then(|r| r.as_str())
-            .map(str::to_string)
-            .or_else(|| {
-                details
-                    .get("resourceId")
-                    .or_else(|| details.get("resource_id"))
-                    .and_then(|r| r.as_str())
-                    .map(str::to_string)
-            })
-            .unwrap_or_default();
-        let is_episode = details
-            .get("subjectType")
-            .or_else(|| details.get("stype"))
-            .and_then(|v| v.as_i64())
-            .is_some_and(|t| t == 2);
-        let year = details
-            .get("releaseDate")
-            .and_then(|y| y.as_str())
-            .or_else(|| details.get("year").and_then(|y| y.as_str()))
-            .and_then(|s| {
-                let digits: String = s.chars().filter(|c| c.is_ascii_digit()).take(4).collect();
-                if digits.len() == 4 {
-                    Some(digits)
-                } else {
-                    None
-                }
-            })
-            .or_else(|| {
-                details
-                    .get("year")
-                    .and_then(|y| y.as_u64())
-                    .map(|y| y.to_string())
-            });
-        let imdb_id = crate::providers::subtitles::extract_imdb_id(details);
+        let resource_id = self.get_selected_resource_id().unwrap_or_default();
+        let is_episode = details.is_series();
+        let year = details.year.as_ref().and_then(|s| {
+            let digits: String = s.chars().filter(|c| c.is_ascii_digit()).take(4).collect();
+            if digits.len() == 4 {
+                Some(digits)
+            } else {
+                None
+            }
+        });
+        let imdb_id = if details.id.value.starts_with("tt")
+            && details.id.value.len() > 2
+            && details.id.value[2..].chars().all(|c| c.is_ascii_digit())
+        {
+            Some(details.id.value.clone())
+        } else {
+            None
+        };
         let (season, episode) = if is_episode {
             (
                 Some(self.state.selected_season),
@@ -333,19 +304,8 @@ impl App {
                 // match the content the user is currently viewing.
                 let current_ctx = format!(
                     "{}:{}:{}",
-                    self.state.active_subject_id.clone().unwrap_or_default(),
-                    self.state
-                        .selected_resources
-                        .as_ref()
-                        .and_then(|res| res.get("list"))
-                        .and_then(|l| l.as_array())
-                        .and_then(|list| {
-                            let idx = self.state.resource_list_state.selected().unwrap_or(0);
-                            list.get(idx)
-                        })
-                        .and_then(|file| file.get("resourceId"))
-                        .and_then(|r| r.as_str())
-                        .unwrap_or(""),
+                    self.state.active_subject_id.as_deref().unwrap_or_default(),
+                    self.get_selected_resource_id().unwrap_or_default(),
                     self.state.selected_episode
                 );
                 if current_ctx != context_id {
@@ -360,15 +320,10 @@ impl App {
                     if candidates.is_empty() {
                         if is_download {
                             self.action_sender.send(Action::DownloadStream(None)).ok();
+                        } else if let Some(source) = self.state.pending_playback_source.take() {
+                            self.dispatch_playback_or_notify(source);
                         } else if let Some(link) = self.state.pending_play_link.take() {
-                            let open_with = self.state.pending_open_with;
-                            if open_with {
-                                self.action_sender
-                                    .send(Action::ShowPlayerPicker(link, None))
-                                    .ok();
-                            } else {
-                                self.action_sender.send(Action::LaunchMpv(link, None)).ok();
-                            }
+                            self.action_sender.send(Action::LaunchMpv(link, None)).ok();
                         }
                     } else {
                         // P4: reset the list to ["None"] + OS candidates, then
@@ -422,19 +377,8 @@ impl App {
                 self.state.subtitle_searching = false;
                 let current_ctx = format!(
                     "{}:{}:{}",
-                    self.state.active_subject_id.clone().unwrap_or_default(),
-                    self.state
-                        .selected_resources
-                        .as_ref()
-                        .and_then(|res| res.get("list"))
-                        .and_then(|l| l.as_array())
-                        .and_then(|list| {
-                            let idx = self.state.resource_list_state.selected().unwrap_or(0);
-                            list.get(idx)
-                        })
-                        .and_then(|file| file.get("resourceId"))
-                        .and_then(|r| r.as_str())
-                        .unwrap_or(""),
+                    self.state.active_subject_id.as_deref().unwrap_or_default(),
+                    self.get_selected_resource_id().unwrap_or_default(),
                     self.state.selected_episode
                 );
                 if current_ctx != context_id {
@@ -447,15 +391,10 @@ impl App {
                     self.state.os_waiting = false;
                     if is_download {
                         self.action_sender.send(Action::DownloadStream(None)).ok();
+                    } else if let Some(source) = self.state.pending_playback_source.take() {
+                        self.dispatch_playback_or_notify(source);
                     } else if let Some(link) = self.state.pending_play_link.take() {
-                        let open_with = self.state.pending_open_with;
-                        if open_with {
-                            self.action_sender
-                                .send(Action::ShowPlayerPicker(link, None))
-                                .ok();
-                        } else {
-                            self.action_sender.send(Action::LaunchMpv(link, None)).ok();
-                        }
+                        self.action_sender.send(Action::LaunchMpv(link, None)).ok();
                     }
                 }
                 self.state.notify(
@@ -474,19 +413,8 @@ impl App {
                 // match the content the user is currently viewing.
                 let current_ctx = format!(
                     "{}:{}:{}",
-                    self.state.active_subject_id.clone().unwrap_or_default(),
-                    self.state
-                        .selected_resources
-                        .as_ref()
-                        .and_then(|res| res.get("list"))
-                        .and_then(|l| l.as_array())
-                        .and_then(|list| {
-                            let idx = self.state.resource_list_state.selected().unwrap_or(0);
-                            list.get(idx)
-                        })
-                        .and_then(|file| file.get("resourceId"))
-                        .and_then(|r| r.as_str())
-                        .unwrap_or(""),
+                    self.state.active_subject_id.as_deref().unwrap_or_default(),
+                    self.get_selected_resource_id().unwrap_or_default(),
                     self.state.selected_episode
                 );
                 if current_ctx != context_id {
@@ -501,15 +429,10 @@ impl App {
                     if candidates.is_empty() {
                         if is_download {
                             self.action_sender.send(Action::DownloadStream(None)).ok();
+                        } else if let Some(source) = self.state.pending_playback_source.take() {
+                            self.dispatch_playback_or_notify(source);
                         } else if let Some(link) = self.state.pending_play_link.take() {
-                            let open_with = self.state.pending_open_with;
-                            if open_with {
-                                self.action_sender
-                                    .send(Action::ShowPlayerPicker(link, None))
-                                    .ok();
-                            } else {
-                                self.action_sender.send(Action::LaunchMpv(link, None)).ok();
-                            }
+                            self.action_sender.send(Action::LaunchMpv(link, None)).ok();
                         }
                     } else {
                         // P4: reset the list to ["None"] + SubDL candidates,
@@ -563,19 +486,8 @@ impl App {
                 self.state.subtitle_searching = false;
                 let current_ctx = format!(
                     "{}:{}:{}",
-                    self.state.active_subject_id.clone().unwrap_or_default(),
-                    self.state
-                        .selected_resources
-                        .as_ref()
-                        .and_then(|res| res.get("list"))
-                        .and_then(|l| l.as_array())
-                        .and_then(|list| {
-                            let idx = self.state.resource_list_state.selected().unwrap_or(0);
-                            list.get(idx)
-                        })
-                        .and_then(|file| file.get("resourceId"))
-                        .and_then(|r| r.as_str())
-                        .unwrap_or(""),
+                    self.state.active_subject_id.as_deref().unwrap_or_default(),
+                    self.get_selected_resource_id().unwrap_or_default(),
                     self.state.selected_episode
                 );
                 if current_ctx != context_id {
@@ -588,15 +500,10 @@ impl App {
                     self.state.os_waiting = false;
                     if is_download {
                         self.action_sender.send(Action::DownloadStream(None)).ok();
+                    } else if let Some(source) = self.state.pending_playback_source.take() {
+                        self.dispatch_playback_or_notify(source);
                     } else if let Some(link) = self.state.pending_play_link.take() {
-                        let open_with = self.state.pending_open_with;
-                        if open_with {
-                            self.action_sender
-                                .send(Action::ShowPlayerPicker(link, None))
-                                .ok();
-                        } else {
-                            self.action_sender.send(Action::LaunchMpv(link, None)).ok();
-                        }
+                        self.action_sender.send(Action::LaunchMpv(link, None)).ok();
                     }
                 }
                 self.state.notify(

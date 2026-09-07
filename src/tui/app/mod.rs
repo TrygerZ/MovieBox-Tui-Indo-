@@ -5,6 +5,7 @@ use crate::tui::{action::Action, state::AppState, theme::Theme};
 
 mod addons;
 mod download;
+mod favorites;
 mod keyboard;
 mod mouse;
 mod navigation;
@@ -17,12 +18,62 @@ mod subtitles;
 mod system;
 mod tv;
 
+#[derive(Default)]
+pub struct RequestTaskHandles {
+    pub search: Option<tokio::task::JoinHandle<()>>,
+    pub details: Option<tokio::task::JoinHandle<()>>,
+    pub streams: Option<tokio::task::JoinHandle<()>>,
+    pub suggest: Option<tokio::task::JoinHandle<()>>,
+    pub homepage: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl RequestTaskHandles {
+    pub fn cancel_search(&mut self) {
+        if let Some(h) = self.search.take() {
+            h.abort();
+        }
+    }
+
+    pub fn cancel_details(&mut self) {
+        if let Some(h) = self.details.take() {
+            h.abort();
+        }
+    }
+
+    pub fn cancel_streams(&mut self) {
+        if let Some(h) = self.streams.take() {
+            h.abort();
+        }
+    }
+
+    pub fn cancel_suggest(&mut self) {
+        if let Some(h) = self.suggest.take() {
+            h.abort();
+        }
+    }
+
+    pub fn cancel_homepage(&mut self) {
+        if let Some(h) = self.homepage.take() {
+            h.abort();
+        }
+    }
+
+    pub fn cancel_all(&mut self) {
+        self.cancel_search();
+        self.cancel_details();
+        self.cancel_streams();
+        self.cancel_suggest();
+        self.cancel_homepage();
+    }
+}
+
 pub struct App {
     state: AppState,
     theme: Theme,
     service: std::sync::Arc<crate::service::MovieBoxService>,
     action_sender: mpsc::UnboundedSender<Action>,
     action_receiver: mpsc::UnboundedReceiver<Action>,
+    request_tasks: RequestTaskHandles,
 }
 
 impl Default for App {
@@ -79,16 +130,28 @@ impl App {
         state.download_dir = config.download_dir.map(std::path::PathBuf::from);
         state.installed_addons = crate::config::load_addons();
 
-        let theme_str = std::env::var("MOVIEBOX_THEME").unwrap_or_else(|_| {
-            if state.active_theme_kind.is_empty() {
-                "Mocha".to_string()
-            } else {
-                state.active_theme_kind.clone()
+        let env_theme = std::env::var("MOVIEBOX_THEME")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let config_theme = if state.active_theme_kind.is_empty() {
+            None
+        } else {
+            Some(state.active_theme_kind.clone())
+        };
+        let theme = match env_theme.or(config_theme) {
+            Some(explicit) => {
+                state.theme_is_auto = false;
+                let theme_kind = crate::tui::theme::ThemeKind::parse(&explicit);
+                state.active_theme_kind = theme_kind.as_str().to_string();
+                crate::tui::theme::Theme::from_kind(theme_kind)
             }
-        });
-        let theme_kind = crate::tui::theme::ThemeKind::parse(&theme_str);
-        state.active_theme_kind = theme_kind.as_str().to_string();
-        let theme = crate::tui::theme::Theme::from_kind(theme_kind);
+            None => {
+                state.theme_is_auto = true;
+                state.active_theme_kind.clear();
+                crate::tui::theme::Theme::detect()
+            }
+        };
 
         let service = std::sync::Arc::new(crate::service::MovieBoxService::new());
         if service.fourk_client.is_none() {
@@ -101,6 +164,7 @@ impl App {
             service,
             action_sender,
             action_receiver,
+            request_tasks: RequestTaskHandles::default(),
         };
         if app.state.is_tv_mode {
             app.load_tv_playlists_from_config();
@@ -190,20 +254,38 @@ impl App {
         let Some(path) = crate::config::tv_path() else {
             return;
         };
-        if let Ok(content) = std::fs::read_to_string(&path)
-            && let Ok(list) = serde_json::from_str::<Vec<String>>(&content)
-        {
-            let mut seen = std::collections::HashSet::new();
-            self.state.tv_playlists = list
-                .into_iter()
-                .map(|item| item.trim().to_string())
-                .filter(|item| !item.is_empty() && seen.insert(item.clone()))
-                .collect();
-            if self.state.tv_playlists.is_empty() {
-                let _ = std::fs::remove_file(path);
+        if path.exists() {
+            match std::fs::read_to_string(&path) {
+                Ok(content) => match serde_json::from_str::<Vec<String>>(&content) {
+                    Ok(list) => {
+                        let mut seen = std::collections::HashSet::new();
+                        self.state.tv_playlists = list
+                            .into_iter()
+                            .map(|item| item.trim().to_string())
+                            .filter(|item| !item.is_empty() && seen.insert(item.clone()))
+                            .collect();
+                    }
+                    Err(e) => {
+                        let stamp = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        let corrupt_path = path.with_extension(format!("corrupt.{stamp}"));
+                        log::error!(
+                            "failed to parse tv playlists from {} ({e}), rotating to {}",
+                            crate::logging::sanitize_path(&path),
+                            crate::logging::sanitize_path(&corrupt_path)
+                        );
+                        let _ = std::fs::rename(&path, corrupt_path);
+                    }
+                },
+                Err(e) => {
+                    log::warn!(
+                        "failed to read tv playlists from {}: {e}",
+                        crate::logging::sanitize_path(&path)
+                    );
+                }
             }
-        } else if path.exists() {
-            let _ = std::fs::remove_file(path);
         }
     }
 

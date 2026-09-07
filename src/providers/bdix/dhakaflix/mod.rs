@@ -1,10 +1,18 @@
 pub mod client;
 
-use crate::providers::models::{ProviderKind, Release};
-use crate::providers::{
-    Provider, ProviderCapabilities, ReleaseProvider,
-    fourkhdhub::{details_to_moviebox_json, search_to_moviebox_json},
-};
+pub use client::{DhakaFlixClient, DhakaFlixError};
+
+use crate::providers::models::{CatalogItem, MediaDetails, ProviderError, ProviderKind, Release};
+use crate::providers::{Provider, ProviderCapabilities, ReleaseProvider};
+
+impl From<DhakaFlixError> for ProviderError {
+    fn from(err: DhakaFlixError) -> Self {
+        match err {
+            DhakaFlixError::Network(e) => ProviderError::Network(e.to_string()),
+            DhakaFlixError::Parse(p) => ProviderError::Parsing(p),
+        }
+    }
+}
 
 impl Provider for client::DhakaFlixClient {
     fn id(&self) -> ProviderKind {
@@ -21,18 +29,12 @@ impl Provider for client::DhakaFlixClient {
         }
     }
 
-    async fn search(&self, query: &str, _page: usize) -> Result<serde_json::Value, String> {
-        self.search(query)
-            .await
-            .map(|items| search_to_moviebox_json(&items))
-            .map_err(|error| error.to_string())
+    async fn search(&self, query: &str, _page: usize) -> Result<Vec<CatalogItem>, ProviderError> {
+        self.search(query).await.map_err(ProviderError::from)
     }
 
-    async fn details(&self, id: &str) -> Result<serde_json::Value, String> {
-        self.details(id)
-            .await
-            .map(|details| details_to_moviebox_json(&details))
-            .map_err(|error| error.to_string())
+    async fn details(&self, id: &str) -> Result<MediaDetails, ProviderError> {
+        self.details(id).await.map_err(ProviderError::from)
     }
 }
 
@@ -42,7 +44,7 @@ impl ReleaseProvider for client::DhakaFlixClient {
         id: &str,
         _season: usize,
         _episode: usize,
-    ) -> Result<Vec<Release>, String> {
-        self.streams(id).await.map_err(|error| error.to_string())
+    ) -> Result<Vec<Release>, ProviderError> {
+        self.streams(id).await.map_err(ProviderError::from)
     }
 }

@@ -8,7 +8,10 @@ pub mod tv;
 
 pub use tv as m3u;
 
-use models::{ProviderKind, Release};
+pub use models::{
+    AudioTrackOption, CatalogItem, Episode, MediaDetails, MediaType, PlaybackSource, ProviderError,
+    ProviderKind, ProviderMediaId, Release, Season, SourceMirror, SubtitleOption,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,45 +35,12 @@ impl Default for ProviderCapabilities {
     }
 }
 
-#[derive(Debug, thiserror::Error, Clone)]
-pub enum ProviderError {
-    #[error("Network connection failed: {0}")]
-    Network(String),
-
-    #[error("Rate limited by provider")]
-    RateLimited(Option<u64>),
-
-    #[error("Item not found on provider")]
-    NotFound,
-
-    #[error("Failed to parse response: {0}")]
-    Parsing(String),
-
-    #[error("Provider is temporarily unavailable: {0}")]
-    Unavailable(String),
-}
-
-impl ProviderError {
-    pub fn user_message(&self, provider: ProviderKind) -> String {
-        match self {
-            Self::Network(msg) => format!("Network error on {provider}: {msg}"),
-            Self::RateLimited(secs) => match secs {
-                Some(s) => format!("Rate limited on {provider}. Retry in {s}s."),
-                None => format!("Rate limited on {provider}."),
-            },
-            Self::NotFound => format!("Content not found on {provider}."),
-            Self::Parsing(msg) => format!("Parser error on {provider}: {msg}"),
-            Self::Unavailable(msg) => format!("{provider} unavailable: {msg}"),
-        }
-    }
-}
-
 #[allow(async_fn_in_trait)]
 pub trait Provider: Send + Sync {
     fn id(&self) -> ProviderKind;
     fn capabilities(&self) -> ProviderCapabilities;
-    async fn search(&self, query: &str, page: usize) -> Result<serde_json::Value, String>;
-    async fn details(&self, id: &str) -> Result<serde_json::Value, String>;
+    async fn search(&self, query: &str, page: usize) -> Result<Vec<CatalogItem>, ProviderError>;
+    async fn details(&self, id: &str) -> Result<MediaDetails, ProviderError>;
 }
 
 #[allow(async_fn_in_trait)]
@@ -80,5 +50,5 @@ pub trait ReleaseProvider: Send + Sync {
         id: &str,
         season: usize,
         episode: usize,
-    ) -> Result<Vec<Release>, String>;
+    ) -> Result<Vec<Release>, ProviderError>;
 }

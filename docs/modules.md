@@ -8,8 +8,8 @@ responsibility.
 src/
   main.rs            Entry point. Logging init, panic hook, raw mode, alternate
                      screen, TerminalGuard, App::new + App::run.
-  lib.rs             Crate root: declares pub mod cache/config/download/history/
-                     logging/models/player/providers/service/tui/updater.
+  lib.rs             Crate root: declares pub mod cache/config/download/favorites/
+                     history/logging/models/net/player/providers/service/tui/updater.
 
   cache.rs           Disk cache: provider-namespaced directories, TTL expiry,
                      atomic temp-file writes, payload validation, background purge.
@@ -22,6 +22,9 @@ src/
                      HTTP ranges, optional multi-segment download, retries, cancel
                      via an AtomicBool, Windows-safe file stems.
 
+  favorites.rs       Starred titles: read/write favorites.json, whole-title identity
+                     dedupe via SubjectIdentity, no cap.
+
   history.rs         Watch history: read/write history.json, dedupe exact
                      provider/subject/episode entries, cap 100.
 
@@ -29,7 +32,14 @@ src/
                      MOVIEBOX_LOG level, URL/path sanitization for sharing.
 
   models.rs          Pure domain data models: SearchResult, BrowseMetric,
-                     BrowsePreset, BrowseMetrics, SubjectStreamPool, Notification.
+                     BrowsePreset, BrowseMetrics, SubjectStreamPool, Notification,
+                     SubjectIdentity (cross-provider identity rules shared by
+                     history and favorites).
+
+  net.rs             Shared HTTP plumbing: FallbackResolver (hickory DNS reading the
+                     OS configuration, falling back to Cloudflare/Google/Quad9 when
+                     absent) wired into every reqwest client via
+                     net::http_client_builder().
 
   player.rs          Player detection (OnceLock) and command construction for
                      mpv / VLC / IINA / Android intent, subtitle args, headers,
@@ -40,8 +50,9 @@ src/
 
   providers/
     mod.rs           Module declarations.
-    models.rs        Shared types: ProviderKind, CatalogItem, MediaDetails,
-                     Release, PlaybackSource, RequestContext, SourceMirror.
+    models.rs        Shared typed models (ProviderKind, CatalogItem, MediaDetails,
+                     Release, PlaybackSource, RequestContext, SourceMirror) and
+                     canonical JSON domain adapters.
     moviebox/        Primary provider.
       client.rs      Async reqwest client with signed requests (anti-bot).
       crypto.rs      Request signing: HMAC-MD5 signature, client token,
@@ -50,8 +61,7 @@ src/
     fourkhdhub/      Secondary provider.
       client.rs      Search/details/stream resolution + preflight validation.
       hubcloud.rs    Mirror resolver: fetch drive pages, extract playable links.
-      parser.rs      HTML parsing into typed CatalogItem/MediaDetails/Release,
-                     plus moviebox-JSON adapters.
+      parser.rs      HTML parsing into typed CatalogItem/MediaDetails/Release.
     bdix/
       circleftp/     BDIX CircleFTP provider (client + parser).
       dhakaflix/     BDIX DhakaFlix provider (client + parser).
@@ -62,7 +72,14 @@ src/
                      engine (suggest, search, details, homepage, resolutions,
                      captions, subtitle download, path resolution).
 
-  updater.rs         GitHub release update check.
+  updater/           GitHub release update check.
+    mod.rs           Module declarations, re-exports, perform_self_update orchestration.
+    check.rs         GitHub release API query (with redirect fallback) and version compare.
+    download.rs      Release asset download (https-only) with retry.
+    verify.rs        SHA-256 hashing and sha256sums parsing for artifact verification.
+    extract.rs       tar.gz / archive extraction for the staged binary.
+    apply.rs         Swap in the new binary, install-environment detection, restart.
+    artifact.rs      Release/ReleaseAsset types, target-platform matching.
 
   tui/
     action.rs        The Action enum: every UI event/message (input, network
@@ -80,7 +97,14 @@ src/
       help.rs        Keybinding help (mode-aware).
     terminal.rs      Terminal capability probes (basic UI, image querying).
     theme.rs         Color themes + terminal color detection.
-    text.rs          Grapheme-safe width/truncation helpers.
+    text.rs          Grapheme-safe text input buffer (TextInputBuffer) and width/truncation helpers.
+    widgets/         Centralized UI widgets subsystem.
+      badge.rs       Resolution pill badges and audio/video media tag extraction.
+      input.rs       Single-line text input field rendering with grapheme cursor and truncation.
+      modal.rs       Modal dialog frame builder (ModalFrame) and centered footer key action bars.
+      scrollbar.rs   Viewport-accurate vertical scrollbars.
+      poster.rs      Standardized poster placeholder container with in-flight loading animation.
+      settings.rs    Interactive 4-tab Settings Hub modal widget.
 
   tui/app/           The application object (App) and all behavior.
     mod.rs           App struct, App::new, and small helpers.
@@ -95,6 +119,8 @@ src/
     playback.rs      handle_playback: play/subtitle/picker/launch/crash actions
                      + launch_player.
     download.rs      handle_download: download orchestration + start_resilient_download.
+    favorites.rs     handle_favorites: toggle/open favorite actions, /favorites virtual
+                     list builder.
     navigation.rs    handle_navigation + provider/nav helpers.
     keyboard.rs      handle_key: raw key-event handling.
     mouse.rs         handle_mouse: mouse click routing and hitboxes across screens,

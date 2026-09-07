@@ -6,14 +6,16 @@ impl App {
         self.state.show_help = false;
         self.state.show_theme_popup = false;
         self.state.show_browse_popup = false;
+        self.state.show_provider_popup = false;
+        self.state.provider_list_state.select(None);
+        self.state.show_settings_popup = false;
+        self.state.settings_download_dir_input = None;
         self.state.player_picker_popup = false;
-        self.state.player_picker_link = None;
-        self.state.player_picker_subtitle = None;
-        self.state.player_picker_playback = None;
+        self.state.settings_player_picker = false;
+
         self.state.subtitle_popup = false;
         self.state.is_download_subtitle_popup = false;
         self.state.pending_play_link = None;
-        self.state.pending_open_with = false;
         self.state.subtitle_list.clear();
         self.state.subtitle_list_state.select(None);
         self.state.show_season_download_confirm = false;
@@ -45,20 +47,16 @@ impl App {
     pub(super) fn announce_mode(&mut self) {
         match self.state.mode() {
             crate::tui::state::AppMode::Streaming => {
-                self.state.set_status(
-                    format!(
-                        "Streaming mode active ({}).",
-                        self.state.active_provider.label()
-                    ),
-                    150,
-                );
+                self.state.set_status_default(format!(
+                    "Streaming mode active ({}).",
+                    self.state.active_provider.label()
+                ));
             }
             crate::tui::state::AppMode::Tv => {
-                self.state
-                    .set_status("Loading TV playlists...".to_string(), 200);
+                self.state.set_status_long("Loading TV playlists...");
             }
             crate::tui::state::AppMode::Addon => {
-                self.state.set_status("Addon mode active.".to_string(), 150);
+                self.state.set_status_default("Addon mode active.");
             }
         }
     }
@@ -146,8 +144,7 @@ impl App {
             }
 
             Action::TvReloadPlaylists => {
-                self.state
-                    .set_status("Reloading TV playlists...".to_string(), 150);
+                self.state.set_status_default("Reloading TV playlists...");
                 self.reload_tv_playlists();
             }
 
@@ -187,7 +184,7 @@ impl App {
                     } else {
                         "No TV channels found. Add a playlist (/config).".to_string()
                     };
-                    self.state.set_status(status, 200);
+                    self.state.set_status_long(status);
                 } else {
                     let mut status = format!(
                         "{} TV channels imported from {} playlist(s).",
@@ -197,7 +194,7 @@ impl App {
                     if failed > 0 {
                         status.push_str(&format!(" {failed} playlist(s) failed to load."));
                     }
-                    self.state.set_status(status, 200);
+                    self.state.set_status_long(status);
                 }
             }
             _ => return None,

@@ -21,3 +21,6 @@ debug_*.json
 *.log
 dist/
 research
+book/
+docs/changelog.md
+docs/contributing.md

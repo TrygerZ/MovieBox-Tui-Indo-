@@ -16,6 +16,7 @@ jobs:
   hygiene:
     name: Hygiene
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -26,7 +27,20 @@ jobs:
         with:
           prefix-key: "ci-hygiene"
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Validate Unix installer syntax
+        run: bash -n install.sh
+      - name: Validate Windows installer syntax
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile("install.ps1", [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors.Count -gt 0) {
+            $errors | Format-List
+            exit 1
+          }
+      - run: cargo check --all-targets --all-features --locked
+      - run: cargo clippy --all-targets --all-features --locked -- -D warnings
       - name: Audit dependencies
         uses: taiki-e/install-action@v2
         with:
@@ -34,10 +48,19 @@ jobs:
       - run: cargo audit
       - name: Verify package
         run: cargo package --locked
+      - name: Verify documentation build
+        uses: taiki-e/install-action@v2
+        with:
+          tool: mdbook
+      - name: Test mdBook build
+        run: |
+          cp CHANGELOG.md docs/changelog.md && cp CONTRIBUTING.md docs/contributing.md
+          mdbook build
 
   build-and-test:
     name: Build and test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -50,5 +73,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "ci-build-test-${{ matrix.os }}"
-      - run: cargo build --locked
-      - run: cargo test --locked
+      - run: cargo build --all-features --locked
+      - run: cargo test --all-features --locked
+      - name: Smoke-test binary startup
+        run: cargo run --all-features --locked -- --version

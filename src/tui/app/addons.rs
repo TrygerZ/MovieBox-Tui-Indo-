@@ -65,8 +65,7 @@ impl App {
                     return None;
                 }
 
-                self.state
-                    .set_status("Verifying addon manifest...".to_string(), 200);
+                self.state.set_status_long("Verifying addon manifest...");
                 let client = self.service.addon_client.clone();
                 let sender = self.action_sender.clone();
 

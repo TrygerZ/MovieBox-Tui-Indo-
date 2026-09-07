@@ -5,21 +5,24 @@ use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use url::Url;
 
-use crate::providers::moviebox::client::ScraperError;
-
 const SECRET_KEY_DEFAULT: &str = "76iRl07s0xSN9jqmEWAt79EBJZulIQIsV64FZr2O";
 const SIGNATURE_BODY_MAX_BYTES: usize = 102_400;
+
+static DEFAULT_SECRET_BYTES: std::sync::LazyLock<Vec<u8>> =
+    std::sync::LazyLock::new(|| b64_decode(SECRET_KEY_DEFAULT));
 
 type HmacMd5 = Hmac<Md5>;
 
 fn md5_hex(data: &[u8]) -> String {
     let mut hasher = Md5::new();
     hasher.update(data);
-    hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{:02x}", b))
-        .collect()
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(32);
+    for b in digest {
+        use std::fmt::Write;
+        let _ = write!(&mut hex, "{:02x}", b);
+    }
+    hex
 }
 
 fn b64_decode(val: &str) -> Vec<u8> {
@@ -90,14 +93,17 @@ pub fn build_canonical_string(
     url: &str,
     body: Option<&str>,
     timestamp_ms: u64,
-) -> Result<String, ScraperError> {
-    let parsed = Url::parse(url).map_err(|e| ScraperError::InvalidUrl(e.to_string()))?;
-    let path = parsed.path();
-    let query = sorted_query_string(url);
-    let canonical_url = if query.is_empty() {
-        path.to_string()
+) -> String {
+    let canonical_url = if let Ok(parsed) = Url::parse(url) {
+        let path = parsed.path();
+        let query = sorted_query_string(url);
+        if query.is_empty() {
+            path.to_string()
+        } else {
+            format!("{}?{}", path, query)
+        }
     } else {
-        format!("{}?{}", path, query)
+        url.to_string()
     };
 
     let body_bytes = body.map(|b| b.as_bytes());
@@ -113,7 +119,7 @@ pub fn build_canonical_string(
         (String::new(), String::new())
     };
 
-    Ok(format!(
+    format!(
         "{}\n{}\n{}\n{}\n{}\n{}\n{}",
         method.to_uppercase(),
         accept.unwrap_or(""),
@@ -122,7 +128,7 @@ pub fn build_canonical_string(
         timestamp_ms,
         body_hash,
         canonical_url
-    ))
+    )
 }
 
 pub fn generate_x_tr_signature(
@@ -132,18 +138,16 @@ pub fn generate_x_tr_signature(
     url: &str,
     body: Option<&str>,
     timestamp_ms: u64,
-) -> Result<String, ScraperError> {
-    let canonical = build_canonical_string(method, accept, content_type, url, body, timestamp_ms)?;
-    let secret_bytes = b64_decode(SECRET_KEY_DEFAULT);
-
-    let Ok(mut mac) = HmacMd5::new_from_slice(&secret_bytes) else {
+) -> String {
+    let canonical = build_canonical_string(method, accept, content_type, url, body, timestamp_ms);
+    let Ok(mut mac) = HmacMd5::new_from_slice(&DEFAULT_SECRET_BYTES) else {
         log::warn!("moviebox signature fallback: invalid HMAC key material");
-        return Ok(format!("{}|2|", timestamp_ms));
+        return format!("{}|2|", timestamp_ms);
     };
     mac.update(canonical.as_bytes());
     let sig_b64 = b64_encode(&mac.finalize().into_bytes());
 
-    Ok(format!("{}|2|{}", timestamp_ms, sig_b64))
+    format!("{}|2|{}", timestamp_ms, sig_b64)
 }
 
 pub fn build_signed_headers(
@@ -154,7 +158,7 @@ pub fn build_signed_headers(
     user_agent: &str,
     client_info: &str,
     spoofed_ip: &str,
-) -> Result<reqwest::header::HeaderMap, ScraperError> {
+) -> reqwest::header::HeaderMap {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -165,7 +169,7 @@ pub fn build_signed_headers(
 
     let client_token = generate_x_client_token(ts);
     let signature =
-        generate_x_tr_signature(method, Some(accept), Some(content_type), url, body, ts)?;
+        generate_x_tr_signature(method, Some(accept), Some(content_type), url, body, ts);
 
     let mut headers = reqwest::header::HeaderMap::new();
 
@@ -200,15 +204,11 @@ pub fn build_signed_headers(
     );
 
     if let Some(token) = auth_token {
-        let auth_value = format!("Bearer {}", token);
-        headers.insert(
-            reqwest::header::AUTHORIZATION,
-            reqwest::header::HeaderValue::from_str(&auth_value)
-                .map_err(|e| ScraperError::InvalidHeader(e.to_string()))?,
-        );
+        let bearer = format!("Bearer {}", token);
+        insert_header(&mut headers, reqwest::header::AUTHORIZATION, &bearer);
     }
 
-    Ok(headers)
+    headers
 }
 
 pub(crate) fn generate_client_info_and_ua() -> (String, String) {
@@ -231,7 +231,7 @@ pub(crate) fn generate_client_info_and_ua() -> (String, String) {
         ("M2012K11AG", "Redmi"),
         ("M2007J20CG", "Redmi"),
     ];
-    let version_codes = [50020042, 50020043, 50020044, 50020045, 50020046];
+    let version_codes = [50020117, 50020118, 50020119, 50020120, 50020121];
     let network_types = ["NETWORK_WIFI", "NETWORK_MOBILE"];
     let timezones = [
         "Asia/Kolkata",
@@ -255,7 +255,7 @@ pub(crate) fn generate_client_info_and_ua() -> (String, String) {
     );
 
     let client_info = format!(
-        r#"{{"package_name":"com.community.oneroom","version_name":"3.0.03.0529.03","version_code":{},"os":"android","os_version":"{}","install_ch":"ps","device_id":"{}","install_store":"ps","gaid":"{}","brand":"{}","model":"{}","system_language":"en","net":"{}","region":"US","timezone":"{}","sp_code":"40401","X-Play-Mode":"2"}}"#,
+        r#"{{"package_name":"com.community.oneroom","version_name":"4.0.01.0813.03","version_code":{},"os":"android","os_version":"{}","install_ch":"ps","device_id":"{}","install_store":"ps","gaid":"{}","brand":"{}","model":"{}","system_language":"en","net":"{}","region":"US","timezone":"{}","sp_code":"40401","X-Play-Mode":"2"}}"#,
         version_code, android.0, device_id, gaid, device.1, device.0, network, timezone
     );
 
@@ -300,37 +300,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn control_char_token_returns_error_instead_of_panicking() {
-        // Regression: a server-controlled `x-user` token with control chars
-        // used to panic on `HeaderValue::parse().expect("Valid ASCII")`.
-        let result = build_signed_headers(
-            "GET",
-            "https://api6.aoneroom.com/path?q=1",
-            None,
-            Some("tok\x01en\x1b"),
-            "user-agent",
-            "client-info",
-            "1.2.3.4",
-        );
-        assert!(matches!(result, Err(ScraperError::InvalidHeader(_))));
-    }
-
-    #[test]
-    fn invalid_url_returns_error_instead_of_panicking() {
-        // Regression: a URL that fails to parse used to panic in
-        // `Url::parse(...).expect(...)`.
-        let result = build_canonical_string(
-            "GET",
-            Some("application/json"),
-            Some("application/json"),
-            "https://api6.aoneroom.com:99999/path?q=1",
-            None,
-            1,
-        );
-        assert!(matches!(result, Err(ScraperError::InvalidUrl(_))));
-    }
-
-    #[test]
     fn test_sorted_query_string() {
         let url = "https://api.example.com/endpoint?b=2&a=1&c=3";
         assert_eq!(sorted_query_string(url), "a=1&b=2&c=3");
@@ -357,12 +326,29 @@ mod tests {
             "https://api.example.com/path?tab=1&page=2",
             None,
             1700000000000,
-        )
-        .unwrap();
+        );
         let parts: Vec<&str> = sig.split('|').collect();
         assert_eq!(parts.len(), 3);
         assert_eq!(parts[0], "1700000000000");
         assert_eq!(parts[1], "2");
         assert!(!parts[2].is_empty());
+    }
+
+    #[test]
+    fn test_generate_client_info_and_ua() {
+        let (ua, client_info) = generate_client_info_and_ua();
+        assert!(ua.contains("com.community.oneroom/500201"));
+        assert!(ua.contains("Cronet/135.0.7012.3"));
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&client_info).expect("valid JSON client_info");
+        assert_eq!(parsed["version_name"], "4.0.01.0813.03");
+        assert_eq!(parsed["package_name"], "com.community.oneroom");
+        let code = parsed["version_code"]
+            .as_i64()
+            .expect("version_code is number");
+        assert!((50020117..=50020121).contains(&code));
+        assert_eq!(parsed["sp_code"], "40401");
+        assert_eq!(parsed["X-Play-Mode"], "2");
     }
 }

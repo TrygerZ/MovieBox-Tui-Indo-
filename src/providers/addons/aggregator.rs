@@ -71,7 +71,32 @@ pub async fn aggregate_streams(
         }
     }
 
-    all_releases.sort_by(|a, b| {
+    let mut deduplicated: Vec<Release> = Vec::new();
+    for rel in all_releases {
+        let direct = rel.direct_url().unwrap_or("").to_string();
+        if direct.is_empty() {
+            deduplicated.push(rel);
+            continue;
+        }
+        if let Some(existing) = deduplicated
+            .iter_mut()
+            .find(|r| r.direct_url() == Some(&direct))
+        {
+            for m in rel.mirrors {
+                if !existing
+                    .mirrors
+                    .iter()
+                    .any(|em| em.resolver_url == m.resolver_url && em.label == m.label)
+                {
+                    existing.mirrors.push(m);
+                }
+            }
+        } else {
+            deduplicated.push(rel);
+        }
+    }
+
+    deduplicated.sort_by(|a, b| {
         let q_a = quality_score(a.quality.as_deref());
         let q_b = quality_score(b.quality.as_deref());
         match q_b.cmp(&q_a) {
@@ -91,7 +116,7 @@ pub async fn aggregate_streams(
         }
     });
 
-    (all_releases, blocked_addons)
+    (deduplicated, blocked_addons)
 }
 
 fn quality_score(quality: Option<&str>) -> u32 {

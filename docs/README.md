@@ -1,32 +1,71 @@
-# MovieBox-Tui Documentation
+# Introduction
 
-This folder documents the project so that anyone — human or AI — can understand how it
-works without reading the whole codebase. The documents summarize the current module
-layout, runtime behavior, and operational workflows in prose tied to the source tree.
+A fast, lightweight terminal client for streaming and downloading movies, TV shows, anime, and live TV — powered by your local media player.
 
-## Index
+[moviebox-tui walkthrough.webm](https://github.com/user-attachments/assets/51802c09-abb1-46dd-bd04-d96a9cf836bb)
 
-| Document                                     | What it covers                                                                  | Status  |
-| -------------------------------------------- | ------------------------------------------------------------------------------- | ------- |
-| [architecture.md](architecture.md)           | Crate/module map, event loop, async model, data flow                            | current |
-| [controls.md](controls.md)                   | Keyboard shortcuts, mouse controls, and slash commands                          | current |
-| [modules.md](modules.md)                     | Crate/module tree with responsibilities                                         | current |
-| [providers.md](providers.md)                 | MovieBox, 4KHDHub, BDIX protocols, signing, resolvers, errors                   | current |
-| [players.md](players.md)                     | Player detection, mpv/VLC/IINA/AndroidIntent, headers, subtitles, window sizing | current |
-| [cache.md](cache.md)                         | Cache layout, namespaces, TTLs, atomic writes, purge                            | current |
-| [logging.md](logging.md)                     | File logging, `MOVIEBOX_LOG`, rotation, sanitization, sharing logs              | current |
-| [tv-mode.md](tv-mode.md)                     | User-owned M3U playlists, manager, search, playback, config                     | current |
-| [addons-mode.md](addons-mode.md)             | Community HTTP addons, Addon Manager, streams aggregation, config               | current |
-| [config.md](config.md)                       | `config.json` fields and `MOVIEBOX_*` environment variables                     | current |
-| [downloads.md](downloads.md)                 | Download engine: resume, ranges, segments, retry, cancel                        | current |
-| [cross-platform.md](cross-platform.md)       | OS support, terminal protocols, Termux, focus handling                          | current |
-| [release-checklist.md](release-checklist.md) | Static gates plus required real-environment release verification                | current |
-| [testing.md](testing.md)                     | Test architecture, unit/integration tests, fixtures, and QA guidelines           | current |
-| [debugging.md](debugging.md)                 | Reproducing issues and what to include in GitHub reports                        | current |
-| [known-issues.md](known-issues.md)           | Known limitations and how they are tracked                                      | current |
+MovieBox-TUI replaces ad-heavy streaming websites and clunky browser players with a clean, keyboard-driven terminal interface. It scrapes stream links directly from multiple sources and launches playback in your native media player with hardware acceleration, audio track switching, and automatic subtitle synchronization.
 
-> Contribution guidance lives in the repository-root `CONTRIBUTING.md` (the canonical
-> doc GitHub surfaces for PRs), not in this folder.
+## Features
 
-> Keep this index accurate: when a behavior change lands, update the matching doc in
-> the same change and flip its status to current.
+- **Multi-Source Streaming**: Search and stream titles across MovieBox, 4KHDHub, BDIX mirrors, custom IPTV playlists, and community Stremio HTTP addons. Press `Ctrl+P` on the Details screen to switch providers in-place.
+- **Hardware-Accelerated Playback**: Direct playback in `mpv`, `IINA` (macOS), or `VLC` with stream authentication headers forwarded automatically.
+- **Automatic Subtitles**: Automatically searches, downloads, and syncs subtitles in your preferred language directly into your player.
+- **Season Batch Downloads**: Download individual episodes or entire seasons with one keypress (`d`), with HTTP range resume support and clean folder structure (`Movies/` and `Series/`).
+- **Interactive Settings Hub**: Configure your default media player, download folder, content modes, and themes inside an in-app visual modal via `/settings` (`Ctrl+S`).
+- **Modes**: Switch instantly between standard Streaming, Live TV (`Ctrl+T`), and Addon Mode (`Ctrl+A`).
+- **Ergonomics & Themes**: Full keyboard navigation (vim-style `j`/`k`, `/`, `Tab`) and mouse support (click, scroll, drag) with 6 built-in themes (Catppuccin, TokyoNight, Nord, Dracula, Gruvbox, Rosé Pine) and terminal theme autodetection.
+
+## Prerequisites
+
+MovieBox-TUI delegates video decoding to an external media player. Install at least one of the following:
+
+| Player | Platform | Quick Install |
+| :--- | :--- | :--- |
+| **mpv** *(Recommended)* | Linux, macOS, Windows | `brew install mpv` / `sudo apt install mpv` / `winget install mpv` |
+| **IINA** | macOS (Native GUI) | `brew install --cask iina` |
+| **VLC** | Cross-platform | `brew install --cask vlc` / `sudo apt install vlc` / `winget install VideoLAN.VLC` |
+| **Android Player** | Android (Termux) | `pkg install -y termux-tools termux-am` *(launches external player)* |
+
+---
+
+## Documentation Directory Map
+
+### Getting Started
+
+| Guide | Description |
+| :--- | :--- |
+| [Installation](installation.md) | Platform installation instructions, package managers, and binary verification |
+| [Keyboard & Controls](controls.md) | Complete keybindings, vim navigation, text editing, and slash commands |
+| [Configuration Guide](config.md) | `config.json` schema, settings hub options, and environment variables |
+
+### Features & Modes
+
+| Guide | Description |
+| :--- | :--- |
+| [Content Providers](providers.md) | Built-in providers, scrapers, stream extractors, and authentication headers |
+| [Hardware Players](players.md) | Media player detection, launch flags, stream headers, and watch tracking |
+| [Batch Downloads](downloads.md) | Multi-segment download engine, range resume, and folder layout |
+| [Stremio Addons](addons-mode.md) | Addon manifest installation, catalog browsing, and stream resolution |
+| [Live TV & IPTV](tv-mode.md) | M3U playlist manager, channel parsing, and live stream playback |
+
+### Architecture & Internals
+
+| Guide | Description |
+| :--- | :--- |
+| [System Architecture](architecture.md) | Subsystem diagrams, async event loop, and task cancellation |
+| [Module Breakdown](modules.md) | Crate structure, module responsibilities, and call boundaries |
+| [Caching Strategy](cache.md) | Binary disk caching, TTL policies, and LRU memory management |
+| [Logging System](logging.md) | File logging, log rotation, and tracing diagnostics |
+| [Cross-Platform Operations](cross-platform.md) | Platform compatibility matrix across macOS, Linux, Windows, and Termux |
+
+### Reference & Maintenance
+
+| Guide | Description |
+| :--- | :--- |
+| [Testing Suite](testing.md) | Unit tests, integration tests, and verification gates |
+| [Debugging Guide](debugging.md) | Troubleshooting common issues, terminal rendering, and player errors |
+| [Release Checklist](release-checklist.md) | Pre-release validation, binary packaging, and deployment workflow |
+| [Known Issues](known-issues.md) | Tracked limitations, terminal quirks, and workarounds |
+| [Contributing Guide](contributing.md) | Contribution guidelines, code standards, and PR process |
+| [Changelog](changelog.md) | Complete release history and unreleased changes |
