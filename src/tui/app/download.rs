@@ -160,86 +160,110 @@ impl App {
                 return;
             }
             if let Some(subtitle_url) = subtitle_url {
-                let subtitle_extension = crate::service::subtitle_extension_from_url(&subtitle_url);
-
-                let lang_code = sub_lang
-                    .as_deref()
-                    .and_then(crate::providers::moviebox::title::language_to_code)
-                    .or_else(|| subtitle_language_from_url(&subtitle_url));
-
-                let final_ext = if let Some(code) = lang_code {
-                    format!("{code}.{subtitle_extension}")
-                } else {
-                    subtitle_extension.to_string()
-                };
-
-                let subtitle_path = destination.with_extension(final_ext);
-                let mut sub_req = sub_http_client.get(&subtitle_url);
-                let sub_host = crate::proxy::extract_host_authority(&subtitle_url);
-                let referer_host = sub_headers
-                    .iter()
-                    .find(|(name, _)| name.eq_ignore_ascii_case("referer"))
-                    .and_then(|(_, val)| crate::proxy::extract_host_authority(val));
-                let same_host = sub_host.is_some() && sub_host == referer_host;
-                for (name, val) in &sub_headers {
-                    if crate::proxy::should_forward_header(same_host, name) {
-                        sub_req = sub_req.header(name.as_str(), val.as_str());
-                    }
-                }
-                let result =
-                    tokio::time::timeout(std::time::Duration::from_secs(30), sub_req.send()).await;
-                match result {
-                    Ok(Ok(response)) => {
-                        let status = response.status();
-                        if !status.is_success() {
-                            sender
-                                .send(Action::SetStatus(format!(
-                                    "Warning: Subtitle unavailable (HTTP {}).",
-                                    status.as_u16()
-                                )))
-                                .ok();
-                        } else {
-                            match response.bytes().await {
-                                Ok(bytes) => {
-                                    if let Err(io_err) =
-                                        tokio::fs::write(subtitle_path, bytes).await
-                                    {
-                                        sender
-                                            .send(Action::SetStatus(format!(
-                                                "Warning: Subtitle save failed ({}).",
-                                                io_err.kind()
-                                            )))
-                                            .ok();
-                                    }
-                                }
-                                Err(_) => {
-                                    sender
-                                        .send(Action::SetStatus(
-                                            "Warning: Subtitle read interrupted.".to_string(),
-                                        ))
-                                        .ok();
-                                }
-                            }
-                        }
-                    }
-                    Ok(Err(req_err)) => {
-                        let reason = if req_err.is_timeout() {
-                            "timed out"
-                        } else {
-                            "connection failed"
-                        };
+                let sub_path_buf = std::path::PathBuf::from(&subtitle_url);
+                if sub_path_buf.is_file() {
+                    let subtitle_extension = sub_path_buf
+                        .extension()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("srt");
+                    let lang_code = sub_lang
+                        .as_deref()
+                        .and_then(crate::providers::moviebox::title::language_to_code);
+                    let final_ext = if let Some(code) = lang_code {
+                        format!("{code}.{subtitle_extension}")
+                    } else {
+                        subtitle_extension.to_string()
+                    };
+                    let subtitle_path = destination.with_extension(final_ext);
+                    if let Err(io_err) = tokio::fs::copy(&subtitle_url, &subtitle_path).await {
                         sender
                             .send(Action::SetStatus(format!(
-                                "Warning: Subtitle download {reason}."
+                                "Warning: Subtitle copy failed ({io_err})."
                             )))
                             .ok();
                     }
-                    Err(_) => {
-                        sender
-                            .send(Action::SetStatus(
-                                "Warning: Subtitle download timed out.".to_string(),
-                            ))
-                            .ok();
+                } else {
+                    let subtitle_extension = crate::service::subtitle_extension_from_url(&subtitle_url);
+
+                    let lang_code = sub_lang
+                        .as_deref()
+                        .and_then(crate::providers::moviebox::title::language_to_code)
+                        .or_else(|| subtitle_language_from_url(&subtitle_url));
+
+                    let final_ext = if let Some(code) = lang_code {
+                        format!("{code}.{subtitle_extension}")
+                    } else {
+                        subtitle_extension.to_string()
+                    };
+
+                    let subtitle_path = destination.with_extension(final_ext);
+                    let mut sub_req = sub_http_client.get(&subtitle_url);
+                    let sub_host = crate::proxy::extract_host_authority(&subtitle_url);
+                    let referer_host = sub_headers
+                        .iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case("referer"))
+                        .and_then(|(_, val)| crate::proxy::extract_host_authority(val));
+                    let same_host = sub_host.is_some() && sub_host == referer_host;
+                    for (name, val) in &sub_headers {
+                        if crate::proxy::should_forward_header(same_host, name) {
+                            sub_req = sub_req.header(name.as_str(), val.as_str());
+                        }
+                    }
+                    let result =
+                        tokio::time::timeout(std::time::Duration::from_secs(30), sub_req.send()).await;
+                    match result {
+                        Ok(Ok(response)) => {
+                            let status = response.status();
+                            if !status.is_success() {
+                                sender
+                                    .send(Action::SetStatus(format!(
+                                        "Warning: Subtitle unavailable (HTTP {}).",
+                                        status.as_u16()
+                                    )))
+                                    .ok();
+                            } else {
+                                match response.bytes().await {
+                                    Ok(bytes) => {
+                                        if let Err(io_err) =
+                                            tokio::fs::write(subtitle_path, bytes).await
+                                        {
+                                            sender
+                                                .send(Action::SetStatus(format!(
+                                                    "Warning: Subtitle save failed ({}).",
+                                                    io_err.kind()
+                                                )))
+                                                .ok();
+                                        }
+                                    }
+                                    Err(_) => {
+                                        sender
+                                            .send(Action::SetStatus(
+                                                "Warning: Subtitle read interrupted.".to_string(),
+                                            ))
+                                            .ok();
+                                    }
+                                }
+                            }
+                        }
+                        Ok(Err(req_err)) => {
+                            let reason = if req_err.is_timeout() {
+                                "timed out"
+                            } else {
+                                "connection failed"
+                            };
+                            sender
+                                .send(Action::SetStatus(format!(
+                                    "Warning: Subtitle download {reason}."
+                                )))
+                                .ok();
+                        }
+                        Err(_) => {
+                            sender
+                                .send(Action::SetStatus(
+                                    "Warning: Subtitle download timed out.".to_string(),
+                                ))
+                                .ok();
+                        }
                     }
                 }
             }
@@ -746,11 +770,15 @@ impl App {
                         {
                             sender.send(Action::ShowDownloadSubtitlePopup(res)).ok();
                         } else {
-                            sender.send(Action::DownloadStream(None)).ok();
+                            sender
+                                .send(Action::ShowDownloadSubtitlePopup(Vec::new()))
+                                .ok();
                         }
                     });
                 } else {
-                    self.action_sender.send(Action::DownloadStream(None)).ok();
+                    self.action_sender
+                        .send(Action::ShowDownloadSubtitlePopup(Vec::new()))
+                        .ok();
                 }
             }
             Action::DownloadSeason => {

@@ -963,7 +963,25 @@ impl App {
                             || release.provider == ProviderKind::BdixCircleFtp
                             || release.provider == ProviderKind::BdixDhakaFlix
                         {
-                            self.dispatch_playback_or_notify(direct_source);
+                            let native_subs = direct_source
+                                .subtitle
+                                .as_ref()
+                                .map(|s| {
+                                    vec![crate::providers::models::SubtitleOption {
+                                        name: "Default".into(),
+                                        url: s.clone(),
+                                    }]
+                                })
+                                .unwrap_or_default();
+                            self.state.pending_playback_source = Some(direct_source.clone());
+                            let url = direct_source.url.clone();
+                            self.action_sender
+                                .send(Action::ShowSubtitlePopup(
+                                    Some(Box::new(direct_source)),
+                                    url,
+                                    native_subs,
+                                ))
+                                .ok();
                             return None;
                         } else {
                             match self.service.fourk_client.clone() {
@@ -991,7 +1009,23 @@ impl App {
                             .await;
                             match result {
                                 Ok(Ok(source)) => {
-                                    sender.send(Action::DispatchPlayback(source)).ok();
+                                    let native_subs = source
+                                        .subtitle
+                                        .as_ref()
+                                        .map(|s| {
+                                            vec![crate::providers::models::SubtitleOption {
+                                                name: "Default".into(),
+                                                url: s.clone(),
+                                            }]
+                                        })
+                                        .unwrap_or_default();
+                                    sender
+                                        .send(Action::ShowSubtitlePopup(
+                                            Some(Box::new(source.clone())),
+                                            source.url.clone(),
+                                            native_subs,
+                                        ))
+                                        .ok();
                                 }
                                 Ok(Err(error)) => {
                                     log::error!("4KHDHub resolve failed: {error}");
@@ -1076,46 +1110,68 @@ impl App {
                             match result {
                                 Ok(Ok(res)) => {
                                     sender
-                                        .send(Action::ShowSubtitlePopup(source_clone.url, res))
+                                        .send(Action::ShowSubtitlePopup(
+                                            Some(Box::new(source_clone.clone())),
+                                            source_clone.url,
+                                            res,
+                                        ))
                                         .ok();
                                 }
                                 Err(_) => {
                                     log::warn!(
                                         "[playback] Subtitle resolution timed out after 15s for rid={rid}"
                                     );
-                                    sender.send(Action::DispatchPlayback(source_clone)).ok();
+                                    sender
+                                        .send(Action::ShowSubtitlePopup(
+                                            Some(Box::new(source_clone.clone())),
+                                            source_clone.url,
+                                            Vec::new(),
+                                        ))
+                                        .ok();
                                 }
                                 Ok(Err(err)) => {
                                     log::warn!(
                                         "[playback] Subtitle resolution failed for rid={rid}: {err}"
                                     );
-                                    sender.send(Action::DispatchPlayback(source_clone)).ok();
+                                    sender
+                                        .send(Action::ShowSubtitlePopup(
+                                            Some(Box::new(source_clone.clone())),
+                                            source_clone.url,
+                                            Vec::new(),
+                                        ))
+                                        .ok();
                                 }
                             }
                         });
                     } else {
-                        self.dispatch_playback_or_notify(direct_source);
+                        let url = direct_source.url.clone();
+                        self.action_sender
+                            .send(Action::ShowSubtitlePopup(
+                                Some(Box::new(direct_source)),
+                                url,
+                                Vec::new(),
+                            ))
+                            .ok();
                     }
                 } else {
                     self.state.is_resolving_playback = false;
                 }
             }
-            Action::ShowSubtitlePopup(link, subtitles) => {
+            Action::ShowSubtitlePopup(source_opt, link, subtitles) => {
                 self.state.is_resolving_playback = false;
+                if let Some(src) = source_opt {
+                    self.state.pending_playback_source = Some(*src);
+                }
                 let mut options = vec![("None".to_string(), "".to_string())];
-                let mut has_indonesian = false;
                 for cap in subtitles {
                     if !cap.url.is_empty() {
-                        if crate::providers::subtitles::is_indonesian_label(&cap.name) {
-                            has_indonesian = true;
-                        }
                         options.push((cap.name, cap.url));
                     }
                 }
                 let subdl_enabled =
                     crate::providers::subtitles::subdl::SubdlClient::from_env().enabled();
-                let os_enabled = !has_indonesian
-                    && crate::providers::subtitles::opensubtitles::OpenSubtitlesConfig::from_env()
+                let os_enabled =
+                    crate::providers::subtitles::opensubtitles::OpenSubtitlesConfig::from_env()
                         .enabled();
                 let os_auto_resolve = self.state.os_quota_gate(os_enabled).allows_resolve();
                 let search_any = subdl_enabled || (os_enabled && os_auto_resolve);
@@ -1128,10 +1184,7 @@ impl App {
                             "Searching SubDL & OpenSubtitles...",
                         );
                         let sender = self.action_sender.clone();
-                        let context_id = format!(
-                            "{}:{}:{}",
-                            ctx.subject_id, ctx.resource_id, self.state.selected_episode
-                        );
+                        let context_id = self.current_subtitle_context_id();
                         tokio::spawn(search_and_dispatch_subtitles(
                             sender,
                             ctx,
@@ -1180,19 +1233,15 @@ impl App {
             Action::ShowDownloadSubtitlePopup(subtitles) => {
                 self.state.is_resolving_playback = false;
                 let mut options = vec![("None".to_string(), "".to_string())];
-                let mut has_indonesian = false;
                 for cap in subtitles {
                     if !cap.url.is_empty() {
-                        if crate::providers::subtitles::is_indonesian_label(&cap.name) {
-                            has_indonesian = true;
-                        }
                         options.push((cap.name, cap.url));
                     }
                 }
                 let subdl_enabled =
                     crate::providers::subtitles::subdl::SubdlClient::from_env().enabled();
-                let os_enabled = !has_indonesian
-                    && crate::providers::subtitles::opensubtitles::OpenSubtitlesConfig::from_env()
+                let os_enabled =
+                    crate::providers::subtitles::opensubtitles::OpenSubtitlesConfig::from_env()
                         .enabled();
                 let os_auto_resolve = self.state.os_quota_gate(os_enabled).allows_resolve();
                 let search_any = subdl_enabled || (os_enabled && os_auto_resolve);
@@ -1205,10 +1254,7 @@ impl App {
                             "Searching SubDL & OpenSubtitles...",
                         );
                         let sender = self.action_sender.clone();
-                        let context_id = format!(
-                            "{}:{}:{}",
-                            ctx.subject_id, ctx.resource_id, self.state.selected_episode
-                        );
+                        let context_id = self.current_subtitle_context_id();
                         tokio::spawn(search_and_dispatch_subtitles(
                             sender,
                             ctx,
@@ -1442,6 +1488,7 @@ mod tests {
         ];
 
         app.handle_playback(crate::tui::action::Action::ShowSubtitlePopup(
+            None,
             "https://example.com/video.mp4".to_string(),
             ext_captions,
         ))

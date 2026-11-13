@@ -1692,11 +1692,12 @@ impl App {
 
                     let is_season_queue = self.state.download_queue_total > 0;
                     if is_season_queue {
+                        let pref = self.state.season_subtitle_preference.clone();
                         let subject_id = self.state.active_subject_id.clone().unwrap_or_default();
                         if let Some(rid) = self.get_selected_resource_id() {
                             let service = self.service.clone();
                             let sender = self.action_sender.clone();
-                            let pref = self.state.season_subtitle_preference.clone();
+                            let pref = pref.clone();
                             let sibling_ids: Vec<String> = self
                                 .state
                                 .selected_details
@@ -1735,10 +1736,22 @@ impl App {
                                     } else {
                                         sender.send(Action::DownloadStream(None)).ok();
                                     }
+                                } else if pref.is_none() {
+                                    sender
+                                        .send(Action::ShowDownloadSubtitlePopup(Vec::new()))
+                                        .ok();
                                 } else {
                                     sender.send(Action::DownloadStream(None)).ok();
                                 }
                             });
+                            return None;
+                        } else if pref.is_none() {
+                            self.action_sender
+                                .send(Action::ShowDownloadSubtitlePopup(Vec::new()))
+                                .ok();
+                            return None;
+                        } else {
+                            self.action_sender.send(Action::DownloadStream(None)).ok();
                             return None;
                         }
                     }

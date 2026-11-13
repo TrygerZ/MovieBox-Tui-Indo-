@@ -66,7 +66,11 @@ pub enum Action {
     PreviewSuccess(u64, String, Box<crate::providers::models::MediaDetails>),
     PreviewFailure(u64, String),
     PlayStream,
-    ShowSubtitlePopup(String, Vec<crate::providers::models::SubtitleOption>),
+    ShowSubtitlePopup(
+        Option<Box<crate::providers::models::PlaybackSource>>,
+        String,
+        Vec<crate::providers::models::SubtitleOption>,
+    ),
     ShowDownloadSubtitlePopup(Vec<crate::providers::models::SubtitleOption>),
     ToggleThemePopup,
     SelectTheme(String),

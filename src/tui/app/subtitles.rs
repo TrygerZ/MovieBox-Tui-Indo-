@@ -245,32 +245,109 @@ pub(crate) async fn resolve_best_os_subtitle(ctx: &SubtitleContext) -> Option<St
     .ok()
 }
 
+/// Clean title string for subtitle search and optionally extract 4-digit year.
+pub(crate) fn clean_subtitle_query_title(raw: &str) -> (String, Option<String>) {
+    let base = crate::providers::moviebox::clean_moviebox_title(raw);
+    let normalized = if base.contains('.') && !base.contains(' ') {
+        base.replace('.', " ")
+    } else {
+        base.to_string()
+    };
+    let mut year = None;
+    let mut title = normalized.as_str();
+    if let Some(pos) = title.rfind('(') {
+        let inside = title[pos + 1..].split(')').next().unwrap_or("").trim();
+        if inside.len() == 4 && inside.chars().all(|c| c.is_ascii_digit()) {
+            year = Some(inside.to_string());
+            title = title[..pos].trim();
+        }
+    }
+    let parts: Vec<&str> = title.split_whitespace().collect();
+    if year.is_none() {
+        if let Some(idx) = parts.iter().position(|p| {
+            p.len() == 4
+                && p.chars().all(|c| c.is_ascii_digit())
+                && (p.starts_with('1') || p.starts_with('2'))
+        }) {
+            year = Some(parts[idx].to_string());
+            if idx > 0 {
+                title = title.split(parts[idx]).next().unwrap_or(title).trim();
+            }
+        }
+    }
+    let cleaned = title.trim_end_matches(['-', ':', '_', '.', ' ']).trim();
+    (cleaned.to_string(), year)
+}
+
 impl App {
+    pub(crate) fn current_subtitle_resource_id(&self) -> String {
+        if let Some(rid) = self.get_selected_resource_id().filter(|s| !s.is_empty()) {
+            rid
+        } else if let Some(release) = self.get_selected_release() {
+            if !release.filename.is_empty() {
+                release.filename.clone()
+            } else {
+                self.state
+                    .resource_list_state
+                    .selected()
+                    .map(|i| i.to_string())
+                    .unwrap_or_default()
+            }
+        } else {
+            String::new()
+        }
+    }
+
+    pub(crate) fn current_subtitle_context_id(&self) -> String {
+        format!(
+            "{}:{}:{}",
+            self.state.active_subject_id.as_deref().unwrap_or_default(),
+            self.current_subtitle_resource_id(),
+            self.state.selected_episode
+        )
+    }
+
     pub(crate) fn build_subtitle_context(&self) -> Option<SubtitleContext> {
+        if self.state.is_tv_mode || self.state.mode() == crate::tui::state::AppMode::Tv {
+            return None;
+        }
         let details = self.state.selected_details.as_ref()?;
-        let title = crate::providers::moviebox::clean_moviebox_title(&details.title);
+        let (title, extracted_year) = clean_subtitle_query_title(&details.title);
         if title.is_empty() {
             return None;
         }
         let subject_id = self.state.active_subject_id.clone().unwrap_or_default();
-        let resource_id = self.get_selected_resource_id().unwrap_or_default();
+        let resource_id = self.current_subtitle_resource_id();
         let is_episode = details.is_series();
-        let year = details.year.as_ref().and_then(|s| {
-            let digits: String = s.chars().filter(|c| c.is_ascii_digit()).take(4).collect();
-            if digits.len() == 4 {
-                Some(digits)
-            } else {
-                None
-            }
-        });
-        let imdb_id = if details.id.value.starts_with("tt")
-            && details.id.value.len() > 2
-            && details.id.value[2..].chars().all(|c| c.is_ascii_digit())
+        let year = details
+            .year
+            .as_ref()
+            .and_then(|s| {
+                let digits: String = s.chars().filter(|c| c.is_ascii_digit()).take(4).collect();
+                if digits.len() == 4 {
+                    Some(digits)
+                } else {
+                    None
+                }
+            })
+            .or(extracted_year);
+
+        let raw_id = details
+            .id
+            .value
+            .strip_prefix("movie:")
+            .or_else(|| details.id.value.strip_prefix("series:"))
+            .unwrap_or(&details.id.value);
+        let id_token = raw_id.split(':').next().unwrap_or(raw_id);
+        let imdb_id = if id_token.starts_with("tt")
+            && id_token.len() > 2
+            && id_token[2..].chars().all(|c| c.is_ascii_digit())
         {
-            Some(details.id.value.clone())
+            Some(id_token.to_string())
         } else {
             None
         };
+
         let (season, episode) = if is_episode {
             (
                 Some(self.state.selected_season),
@@ -283,7 +360,7 @@ impl App {
             provider: self.state.active_provider,
             subject_id,
             resource_id,
-            title: title.to_string(),
+            title,
             year,
             is_episode,
             season,
@@ -302,12 +379,7 @@ impl App {
                 self.state.subtitle_searching = false;
                 // P5: strict equality guard. Discard results that no longer
                 // match the content the user is currently viewing.
-                let current_ctx = format!(
-                    "{}:{}:{}",
-                    self.state.active_subject_id.as_deref().unwrap_or_default(),
-                    self.get_selected_resource_id().unwrap_or_default(),
-                    self.state.selected_episode
-                );
+                let current_ctx = self.current_subtitle_context_id();
                 if current_ctx != context_id {
                     self.state.os_waiting = false;
                     return None;
@@ -386,12 +458,7 @@ impl App {
                 error,
             } => {
                 self.state.subtitle_searching = false;
-                let current_ctx = format!(
-                    "{}:{}:{}",
-                    self.state.active_subject_id.as_deref().unwrap_or_default(),
-                    self.get_selected_resource_id().unwrap_or_default(),
-                    self.state.selected_episode
-                );
+                let current_ctx = self.current_subtitle_context_id();
                 if current_ctx != context_id {
                     // Stale failure from a previous search — ignore it.
                     return None;
@@ -433,12 +500,7 @@ impl App {
                 self.state.subtitle_searching = false;
                 // P5: strict equality guard. Discard results that no longer
                 // match the content the user is currently viewing.
-                let current_ctx = format!(
-                    "{}:{}:{}",
-                    self.state.active_subject_id.as_deref().unwrap_or_default(),
-                    self.get_selected_resource_id().unwrap_or_default(),
-                    self.state.selected_episode
-                );
+                let current_ctx = self.current_subtitle_context_id();
                 if current_ctx != context_id {
                     self.state.os_waiting = false;
                     return None;
@@ -517,12 +579,7 @@ impl App {
                 error,
             } => {
                 self.state.subtitle_searching = false;
-                let current_ctx = format!(
-                    "{}:{}:{}",
-                    self.state.active_subject_id.as_deref().unwrap_or_default(),
-                    self.get_selected_resource_id().unwrap_or_default(),
-                    self.state.selected_episode
-                );
+                let current_ctx = self.current_subtitle_context_id();
                 if current_ctx != context_id {
                     // Stale failure from a previous search — ignore it.
                     return None;
@@ -676,5 +733,58 @@ mod tests {
             match_season_subtitle_preference(&serde_json::json!({ "extCaptions": [] }), "English"),
             None
         );
+    }
+
+    #[test]
+    fn test_clean_subtitle_query_title() {
+        let (t1, y1) = clean_subtitle_query_title("Inception (2010)");
+        assert_eq!(t1, "Inception");
+        assert_eq!(y1, Some("2010".into()));
+
+        let (t2, y2) = clean_subtitle_query_title("Oppenheimer.2023.1080p.WEBRip");
+        assert_eq!(t2, "Oppenheimer");
+        assert_eq!(y2, Some("2023".into()));
+
+        let (t3, y3) = clean_subtitle_query_title("Avatar: The Way of Water");
+        assert_eq!(t3, "Avatar: The Way of Water");
+        assert_eq!(y3, None);
+    }
+
+    #[test]
+    fn test_build_subtitle_context_addons_and_tv_mode() {
+        let mut app = crate::tui::app::App::new();
+
+        app.state.selected_details = Some(crate::providers::models::MediaDetails {
+            id: crate::providers::models::ProviderMediaId {
+                provider: crate::providers::models::ProviderKind::Addons,
+                value: "movie:tt1375666".to_string(),
+            },
+            title: "Inception".to_string(),
+            media_type: crate::providers::models::MediaType::Movie,
+            year: Some("2010".to_string()),
+            description: None,
+            tagline: None,
+            imdb_rating: None,
+            director: None,
+            stars: None,
+            prints: None,
+            audios: None,
+            poster_url: None,
+            duration: None,
+            genres: vec![],
+            seasons: vec![],
+            dubs: vec![],
+        });
+
+        // TV mode must return None
+        app.state.is_tv_mode = true;
+        assert!(app.build_subtitle_context().is_none());
+
+        // VOD mode with Addons ID prefix must extract raw IMDb ID tt1375666
+        app.state.is_tv_mode = false;
+        let ctx = app.build_subtitle_context().unwrap();
+        assert_eq!(ctx.title, "Inception");
+        assert_eq!(ctx.year, Some("2010".to_string()));
+        assert_eq!(ctx.imdb_id, Some("tt1375666".to_string()));
     }
 }
