@@ -14,12 +14,57 @@ pub enum SelfUpdateOutcome {
 pub enum InstallationEnvironment {
     DirectReplace,
     Homebrew,
+    Scoop,
     Termux,
+    Flatpak,
+    Snap,
     ReadOnly,
     WindowsHelper,
 }
 
+impl InstallationEnvironment {
+    pub fn upgrade_instruction(&self) -> Option<&'static str> {
+        match self {
+            Self::Homebrew => {
+                Some("This installation is managed by Homebrew. Run: brew upgrade moviebox-tui")
+            }
+            Self::Scoop => {
+                Some("This installation is managed by Scoop. Run: scoop update moviebox-tui")
+            }
+            Self::Termux => Some(
+                "Android / Termux update: run 'curl -fsSL https://raw.githubusercontent.com/mesamirh/MovieBox-Tui/main/install.sh | bash'",
+            ),
+            Self::Flatpak => Some("Running inside Flatpak. Update via: flatpak update"),
+            Self::Snap => Some("Running inside Snap. Update via: sudo snap refresh moviebox-tui"),
+            Self::ReadOnly => {
+                Some("Binary directory is not user-writable. Update via system package manager.")
+            }
+            Self::DirectReplace | Self::WindowsHelper => None,
+        }
+    }
+
+    pub fn has_managed_notice(&self) -> bool {
+        self.upgrade_instruction().is_some()
+    }
+}
+
 pub fn detect_environment(exe_path: &Path) -> InstallationEnvironment {
+    if std::env::var_os("FLATPAK_ID").is_some() || Path::new("/.flatpak-info").exists() {
+        return InstallationEnvironment::Flatpak;
+    }
+
+    if let Some(snap_dir) = std::env::var_os("SNAP") {
+        let snap_dir_str = snap_dir.to_string_lossy();
+        let exe_str = exe_path.to_string_lossy();
+        let is_moviebox_snap = std::env::var("SNAP_NAME")
+            .is_ok_and(|name| name.contains("moviebox"))
+            || exe_str.starts_with(snap_dir_str.as_ref())
+            || exe_str.contains("/snap/moviebox");
+        if is_moviebox_snap {
+            return InstallationEnvironment::Snap;
+        }
+    }
+
     if super::artifact::is_termux_environment() {
         return InstallationEnvironment::Termux;
     }
@@ -27,7 +72,9 @@ pub fn detect_environment(exe_path: &Path) -> InstallationEnvironment {
     if is_homebrew_managed(exe_path) {
         return InstallationEnvironment::Homebrew;
     }
-
+    if is_scoop_managed(exe_path) {
+        return InstallationEnvironment::Scoop;
+    }
     if cfg!(windows) {
         return InstallationEnvironment::WindowsHelper;
     }
@@ -46,6 +93,25 @@ pub fn is_homebrew_managed(exe_path: &Path) -> bool {
             || s.contains("/opt/homebrew/")
             || s.contains("/usr/local/Cellar/")
             || s.contains("/home/linuxbrew/.linuxbrew/Cellar/")
+    };
+
+    if check_path(exe_path) {
+        return true;
+    }
+
+    if let Ok(canonical) = exe_path.canonicalize() {
+        if check_path(&canonical) {
+            return true;
+        }
+    }
+
+    false
+}
+
+pub fn is_scoop_managed(exe_path: &Path) -> bool {
+    let check_path = |p: &Path| -> bool {
+        let s = p.to_string_lossy().to_lowercase().replace('\\', "/");
+        s.contains("/scoop/apps/") || s.contains("/scoop/shims/")
     };
 
     if check_path(exe_path) {
@@ -83,22 +149,13 @@ pub fn apply_staged_binary(
 ) -> Result<SelfUpdateOutcome, String> {
     let env = detect_environment(current_exe);
 
+    if let Some(instruction) = env.upgrade_instruction() {
+        return Ok(SelfUpdateOutcome::RequiresManualUpgrade(
+            instruction.to_string(),
+        ));
+    }
+
     match env {
-        InstallationEnvironment::Homebrew => {
-            Ok(SelfUpdateOutcome::RequiresManualUpgrade(
-                "This installation is managed by Homebrew. Run: brew upgrade moviebox-tui".to_string(),
-            ))
-        }
-        InstallationEnvironment::Termux => {
-            Ok(SelfUpdateOutcome::RequiresManualUpgrade(
-                "Android / Termux update: run 'curl -fsSL https://raw.githubusercontent.com/mesamirh/MovieBox-Tui/main/install.sh | bash'".to_string(),
-            ))
-        }
-        InstallationEnvironment::ReadOnly => {
-            Ok(SelfUpdateOutcome::RequiresManualUpgrade(
-                "MovieBox-Tui binary is not user-writable. Please update via your system package manager.".to_string(),
-            ))
-        }
         InstallationEnvironment::DirectReplace => {
             replace_binary_with_backup(staged_path, current_exe)?;
             Ok(SelfUpdateOutcome::Success)
@@ -110,6 +167,7 @@ pub fn apply_staged_binary(
             }
             result.map(|_| SelfUpdateOutcome::Success)
         }
+        _ => unreachable!(),
     }
 }
 
@@ -125,9 +183,6 @@ pub fn stale_update_artifacts(current_exe: &Path) -> Vec<PathBuf> {
 }
 
 pub fn cleanup_stale_update_artifacts(current_exe: &Path) {
-    if !cfg!(windows) {
-        return;
-    }
     for path in stale_update_artifacts(current_exe) {
         let _ = std::fs::remove_file(path);
     }
@@ -160,6 +215,9 @@ fn replace_binary_with_backup(staged_path: &Path, current_exe: &Path) -> Result<
 
     if let Err(err) = install_result {
         if backup_path.exists() {
+            if current_exe.exists() {
+                let _ = std::fs::remove_file(current_exe);
+            }
             let _ = std::fs::rename(&backup_path, current_exe);
         }
         return Err(err);
@@ -232,7 +290,11 @@ fn spawn_windows_helper(staged_path: &Path, current_exe: &Path) -> Result<(), St
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        cmd.creation_flags(crate::player::CREATE_NO_WINDOW);
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(
+            crate::player::CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+        );
     }
     cmd.spawn()
         .map_err(|e| format!("failed to spawn Windows update helper: {e}"))?;
@@ -240,13 +302,48 @@ fn spawn_windows_helper(staged_path: &Path, current_exe: &Path) -> Result<(), St
     Ok(())
 }
 
+pub fn resolve_executable_path(path: &Path) -> PathBuf {
+    if path.exists() {
+        return path.to_path_buf();
+    }
+
+    let raw = path.to_string_lossy();
+    let without_deleted = raw.strip_suffix(" (deleted)").unwrap_or(&raw);
+    let candidate = PathBuf::from(without_deleted);
+    if candidate.exists() {
+        return candidate;
+    }
+
+    if candidate.extension().and_then(|ext| ext.to_str()) == Some("old") {
+        let stripped = candidate.with_extension("");
+        if stripped.exists() {
+            return stripped;
+        }
+    }
+
+    if let Some(file_name) = candidate.file_name().and_then(|s| s.to_str()) {
+        if let Some(base_name) = file_name.strip_suffix(".old") {
+            let stripped = candidate.with_file_name(base_name);
+            if stripped.exists() {
+                return stripped;
+            }
+        }
+    }
+
+    path.to_path_buf()
+}
+
 pub fn restart_process(exe_path: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
+        let resolved = resolve_executable_path(exe_path);
         let args: Vec<String> = std::env::args().skip(1).collect();
-        let err = Command::new(exe_path).args(&args).exec();
-        Err(format!("failed to exec restarted process: {err}"))
+        let err = Command::new(&resolved).args(&args).exec();
+        Err(format!(
+            "failed to exec restarted process {}: {err}",
+            resolved.display()
+        ))
     }
 
     #[cfg(windows)]
@@ -286,6 +383,21 @@ mod tests {
     }
 
     #[test]
+    fn detects_scoop_managed_environment() {
+        let win_path =
+            Path::new("C:\\Users\\user\\scoop\\apps\\moviebox-tui\\0.1.23\\moviebox-tui.exe");
+        assert!(is_scoop_managed(win_path));
+        assert_eq!(detect_environment(win_path), InstallationEnvironment::Scoop);
+
+        let shim_path = Path::new("C:\\Users\\user\\scoop\\shims\\moviebox-tui.exe");
+        assert!(is_scoop_managed(shim_path));
+        assert_eq!(
+            detect_environment(shim_path),
+            InstallationEnvironment::Scoop
+        );
+    }
+
+    #[test]
     fn helper_script_waits_moves_and_cleans_up() {
         let script = render_helper_script(
             Path::new("C:\\App\\update dir\\.moviebox_update_staged.exe"),
@@ -309,7 +421,6 @@ mod tests {
         assert_eq!(*lines.last().expect("non-empty"), "del \"%~f0\"");
     }
 
-    #[cfg(windows)]
     #[test]
     fn cleanup_removes_only_known_artifacts() {
         let dir = std::env::temp_dir().join(format!("mbx_apply_test_{}", std::process::id()));
@@ -322,5 +433,27 @@ mod tests {
         assert!(!staged.exists());
         assert!(exe.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_executable_path_handles_existing_and_deleted_suffixes() {
+        let temp = tempfile::tempdir().unwrap();
+        let real_exe = temp.path().join("moviebox-tui");
+        std::fs::write(&real_exe, b"test-bin").unwrap();
+
+        // Exact match
+        assert_eq!(resolve_executable_path(&real_exe), real_exe);
+
+        // Linux deleted suffix
+        let deleted_path = temp.path().join("moviebox-tui (deleted)");
+        assert_eq!(resolve_executable_path(&deleted_path), real_exe);
+
+        // Linux old.deleted suffix
+        let old_deleted_path = temp.path().join("moviebox-tui.old (deleted)");
+        assert_eq!(resolve_executable_path(&old_deleted_path), real_exe);
+
+        // Linux old suffix
+        let old_path = temp.path().join("moviebox-tui.old");
+        assert_eq!(resolve_executable_path(&old_path), real_exe);
     }
 }

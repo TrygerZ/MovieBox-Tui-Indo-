@@ -98,7 +98,7 @@ This remains mandatory because chooser behavior is device/environment dependent.
 
 Verify the published release contains:
 
-- expected archives for macOS, Linux x64, Linux arm64, Windows x64, and Windows arm64
+- expected archives for macOS, Linux x64, Linux arm64, Android arm64, Windows x64, and Windows arm64
 - `SHA256SUMS`
 - working install scripts / formula references
 

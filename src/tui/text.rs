@@ -224,6 +224,52 @@ impl TextInputBuffer {
     pub fn move_end(&mut self) {
         self.cursor = self.len_graphemes();
     }
+    pub fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> bool {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        match key.code {
+            KeyCode::Left => {
+                self.move_left();
+                true
+            }
+            KeyCode::Right => {
+                self.move_right();
+                true
+            }
+            KeyCode::Home => {
+                self.move_home();
+                true
+            }
+            KeyCode::End => {
+                self.move_end();
+                true
+            }
+            KeyCode::Backspace => {
+                self.delete_backwards();
+                true
+            }
+            KeyCode::Delete => {
+                self.delete_forwards();
+                true
+            }
+            KeyCode::Char('u') | KeyCode::Char('U')
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.clear();
+                true
+            }
+            KeyCode::Char('w') | KeyCode::Char('W')
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.delete_word_backwards();
+                true
+            }
+            KeyCode::Char(c) if !c.is_control() => {
+                self.insert(c);
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 impl From<&str> for TextInputBuffer {
@@ -451,38 +497,7 @@ pub fn format_subtitle_label(name: &str) -> String {
     }
 }
 
-pub fn strip_emojis(input: &str) -> String {
-    input
-        .chars()
-        .filter(|&c| {
-            let u = c as u32;
-            !((0x1F000..=0x1FAFF).contains(&u)
-                || (0x2600..=0x27BF).contains(&u)
-                || (0x2300..=0x23FF).contains(&u)
-                || (0x2B00..=0x2BFF).contains(&u)
-                || (0xFE00..=0xFE0F).contains(&u)
-                || u == 0x200D)
-        })
-        .collect::<String>()
-}
-
-pub fn clean_stream_text(input: &str) -> String {
-    let without_emojis = strip_emojis(input);
-    let mut cleaned = String::new();
-    let mut last_was_space = false;
-    for c in without_emojis.chars() {
-        if c.is_whitespace() {
-            if !last_was_space && !cleaned.is_empty() {
-                cleaned.push(' ');
-                last_was_space = true;
-            }
-        } else {
-            cleaned.push(c);
-            last_was_space = false;
-        }
-    }
-    cleaned.trim().to_string()
-}
+pub use crate::providers::models::{clean_stream_text, strip_emojis};
 
 pub const CTRL_S_STR: &str = if cfg!(target_os = "macos") {
     "^S"
@@ -493,11 +508,6 @@ pub const CTRL_T_STR: &str = if cfg!(target_os = "macos") {
     "^T"
 } else {
     "Ctrl+T"
-};
-pub const CTRL_A_STR: &str = if cfg!(target_os = "macos") {
-    "^A"
-} else {
-    "Ctrl+A"
 };
 pub const CTRL_P_STR: &str = if cfg!(target_os = "macos") {
     "^P"
@@ -551,14 +561,7 @@ pub fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
 }
 
 pub use crate::net::is_http_url;
-pub fn extract_4digit_year(raw: &str) -> String {
-    raw.as_bytes()
-        .windows(4)
-        .find(|window| window.iter().all(u8::is_ascii_digit) && matches!(window[0], b'1' | b'2'))
-        .and_then(|window| std::str::from_utf8(window).ok())
-        .map(str::to_string)
-        .unwrap_or_default()
-}
+pub use crate::providers::models::extract_4digit_year;
 
 pub fn format_duration(secs: u64) -> String {
     let h = secs / 3600;

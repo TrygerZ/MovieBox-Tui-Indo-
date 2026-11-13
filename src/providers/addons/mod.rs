@@ -4,8 +4,8 @@ pub mod client;
 pub mod models;
 
 pub use adapter::{
-    meta_detail_to_media_details, meta_to_catalog_item, meta_to_search_result,
-    release_to_playback_source, stream_item_to_release,
+    meta_detail_to_media_details, meta_to_catalog_item, release_to_playback_source,
+    stream_item_to_release,
 };
 pub use aggregator::aggregate_streams;
 pub use client::AddonClient;
@@ -30,7 +30,9 @@ impl Provider for AddonClient {
     }
 
     async fn search(&self, query: &str, _page: usize) -> Result<Vec<CatalogItem>, ProviderError> {
-        let addons = crate::config::load_addons();
+        let addons = tokio::task::spawn_blocking(crate::config::load_addons)
+            .await
+            .unwrap_or_default();
         let catalog_addons: Vec<_> = addons
             .iter()
             .filter(|a| a.enabled && (a.provides_meta || a.provides_catalog))
@@ -45,25 +47,19 @@ impl Provider for AddonClient {
         let mut combined = Vec::new();
         for addon in catalog_addons {
             let base_url = Self::base_addon_url(&addon.manifest_url);
-            if let Ok(movies) = self
-                .fetch_catalog_search(&base_url, "movie", "top", query)
-                .await
-            {
+            let (movies_res, series_res) = tokio::join!(
+                self.fetch_catalog_search(&base_url, "movie", "top", query),
+                self.fetch_catalog_search(&base_url, "series", "top", query),
+            );
+            if let Ok(movies) = movies_res {
                 combined.extend(movies);
             }
-            if let Ok(series) = self
-                .fetch_catalog_search(&base_url, "series", "top", query)
-                .await
-            {
+            if let Ok(series) = series_res {
                 combined.extend(series);
             }
             if !combined.is_empty() {
                 break;
             }
-        }
-
-        if combined.is_empty() {
-            return Err(ProviderError::NotFound);
         }
 
         let mut seen = std::collections::HashSet::new();
@@ -75,29 +71,72 @@ impl Provider for AddonClient {
     }
 
     async fn details(&self, id: &str) -> Result<MediaDetails, ProviderError> {
-        let addons = crate::config::load_addons();
-        let meta_addons: Vec<_> = addons
+        let (type_hint, clean_id) = match id.split_once(':') {
+            Some((prefix, rest))
+                if ["movie", "series", "tv", "anime", "other"]
+                    .contains(&prefix.to_ascii_lowercase().as_str()) =>
+            {
+                (Some(prefix.to_ascii_lowercase()), rest)
+            }
+            _ => (None, id),
+        };
+
+        let addons = tokio::task::spawn_blocking(crate::config::load_addons)
+            .await
+            .unwrap_or_default();
+        let mut target_addons: Vec<_> = addons
             .iter()
             .filter(|a| a.enabled && a.provides_meta)
             .collect();
 
-        let types_to_try = ["movie", "series", "tv", "anime", "other"];
+        for addon in &addons {
+            if addon.enabled
+                && !target_addons
+                    .iter()
+                    .any(|m| m.manifest_url == addon.manifest_url)
+            {
+                target_addons.push(addon);
+            }
+        }
+
+        let types_to_try: Vec<&str> = if let Some(hint) = &type_hint {
+            let mut types = vec![hint.as_str()];
+            for t in ["series", "movie", "tv", "anime", "other"] {
+                if !types.contains(&t) {
+                    types.push(t);
+                }
+            }
+            types
+        } else {
+            vec!["series", "movie", "tv", "anime", "other"]
+        };
+
         let mut best_detail: Option<models::MetaDetail> = None;
 
-        for addon in &meta_addons {
+        for addon in &target_addons {
             let base_url = Self::base_addon_url(&addon.manifest_url);
-            for t in types_to_try {
-                if let Ok(d) = self.fetch_meta(&base_url, t, id).await {
-                    let has_valid_id = d.id == id;
+            for t in &types_to_try {
+                if let Ok(d) = self.fetch_meta(&base_url, t, clean_id).await {
+                    let has_valid_id = d.id == clean_id;
                     let has_title = !d.name.trim().is_empty()
                         || d.title.as_deref().is_some_and(|t| !t.trim().is_empty());
                     if has_valid_id && has_title {
                         if !d.videos.is_empty()
                             || d.r#type.eq_ignore_ascii_case("series")
                             || d.r#type.eq_ignore_ascii_case("tv")
-                            || d.r#type.eq_ignore_ascii_case("movie")
                         {
-                            return Ok(adapter::meta_detail_to_media_details(&d));
+                            let mut details = adapter::meta_detail_to_media_details(&d);
+                            if let Some(hint) = &type_hint {
+                                details.id.value = format!("{hint}:{clean_id}");
+                            }
+                            return Ok(details);
+                        }
+                        if type_hint.as_deref() == Some("movie")
+                            && d.r#type.eq_ignore_ascii_case("movie")
+                        {
+                            let mut details = adapter::meta_detail_to_media_details(&d);
+                            details.id.value = format!("movie:{clean_id}");
+                            return Ok(details);
                         }
                         if best_detail.is_none() {
                             best_detail = Some(d);
@@ -107,37 +146,12 @@ impl Provider for AddonClient {
             }
         }
 
-        for addon in &addons {
-            if addon.enabled
-                && !meta_addons
-                    .iter()
-                    .any(|m| m.manifest_url == addon.manifest_url)
-            {
-                let base_url = Self::base_addon_url(&addon.manifest_url);
-                for t in types_to_try {
-                    if let Ok(d) = self.fetch_meta(&base_url, t, id).await {
-                        let has_valid_id = d.id == id;
-                        let has_title = !d.name.trim().is_empty()
-                            || d.title.as_deref().is_some_and(|t| !t.trim().is_empty());
-                        if has_valid_id && has_title {
-                            if !d.videos.is_empty()
-                                || d.r#type.eq_ignore_ascii_case("series")
-                                || d.r#type.eq_ignore_ascii_case("tv")
-                                || d.r#type.eq_ignore_ascii_case("movie")
-                            {
-                                return Ok(adapter::meta_detail_to_media_details(&d));
-                            }
-                            if best_detail.is_none() {
-                                best_detail = Some(d);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
         if let Some(d) = best_detail {
-            return Ok(adapter::meta_detail_to_media_details(&d));
+            let mut details = adapter::meta_detail_to_media_details(&d);
+            if let Some(hint) = &type_hint {
+                details.id.value = format!("{hint}:{clean_id}");
+            }
+            return Ok(details);
         }
 
         Err(ProviderError::NotFound)

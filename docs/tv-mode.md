@@ -1,44 +1,35 @@
 # TV Mode
 
-TV mode streams live channels from M3U playlists. You add playlists by URL or local
-file path, and the app parses, groups, dedupes, and lets you search and play them.
+TV mode streams live television channels from M3U playlists. Playlists can be loaded from remote URLs or local files.
 
-## Entering TV mode
+## Entering TV Mode
 
-- `Ctrl+T` toggles Streaming / TV mode.
-- On first entry with no playlists, the playlist manager opens.
-- While in TV mode, type to filter channels by name or group, `Enter` to play,
-  `/list` for all channels, `/config` to manage playlists, `[r]` to reload.
+- Press **`Ctrl+T`** to switch to TV mode (and **`Ctrl+S`** to switch back to Streaming mode).
+- If no playlists are loaded on entry, the playlist manager opens automatically.
+- Type in the search bar to filter channels by name or group; press `Enter` to play.
 
-## Adding playlists
+## Managing Playlists
 
-1. `/config` opens the playlist manager, split into **URL playlists** and
-   **File playlists**.
-2. Select `[ Add URL ]` or `[ Add file ]`, type the source, `Enter` to add.
-   - URL example: `https://example.com/playlist.m3u`
-   - File example: `~/playlists/mine.m3u`
-3. Sources persist in `tv_config.json` (under the config dir). Local file playlists are
-   reread directly on every TV-mode entry; remote URL playlists may reuse a recent
-   cached snapshot for up to 24 hours. If `tv_config.json` encounters corrupt data on disk,
-   it is safely rotated to `tv_config.json.corrupt.{timestamp}` rather than deleted.
-4. Highlight a source and press `d` (or `Enter`) to remove it; the list reloads.
+1. Enter **`/config`** while in TV mode to open the playlist manager.
+2. Select **`+ Add playlist`**, enter the URL or local file path, and press `Enter`.
+   - **URL**: `https://example.com/playlist.m3u`
+   - **File**: `~/playlists/channels.m3u` (supports `~/` tilde expansion and Windows paths)
+3. Press **`r`** inside the manager to reload all playlist sources.
+4. Highlight an entry and press **`d`** (or `Delete`) to remove it.
+5. Press **`Esc`** to close the manager.
 
-## Parsing and search
+Playlists are saved to `tv_config.json` in your configuration directory.
 
-`src/providers/tv/` parses each source (http(s) or local file), extracting channel id,
-name, logo, `group-title`, and stream URL. Playlist lines are pre-counted to preallocate vector capacity, eliminating dynamic heap reallocations during large 50,000+ channel imports. Channels are **deduped by stream URL**
-across all playlists. The search box filters by name or group; the status bar reports
-how many channels were imported and which playlists failed.
+## Channel Parsing & Safeguards
 
-## Playback
+- **Size Limits**: Files and downloads larger than 15 MB are rejected to prevent excessive memory consumption.
+- **Deduplication**: Channels sharing identical stream URLs across multiple playlists are deduplicated.
+- **Attributes**: Parses `#EXTINF:` tags for `tvg-id`, `tvg-logo`, `group-title`, and channel name.
 
-`Enter` on a channel launches the default player with the channel URL (via the same
-`launch_player` path as movies). Channel logos are cached under the `iptv` image
-namespace.
+## Playback & Commands
 
-## Commands in TV mode
-
-- `/list` — display all loaded TV channels.
-- `[r]` key — reload all active M3U playlist sources.
-- Global commands (`/settings`, `/clear`, `/help`, `/exit`) are active across all modes.
-- Streaming/Addon-only commands (e.g. `/browse`, `/history`, `/favorites`) display friendly guidance notifications prompting you to switch modes (`Ctrl+S` or `Ctrl+A`).
+- **Playback**: Press `Enter` on a channel to launch your default media player. Live streams without fixed durations are exempted from watch history.
+- **Commands**:
+  - **`/list`**: View all loaded TV channels.
+  - **`r`**: Reload all active playlists.
+  - **`/config`**: Open the playlist manager.

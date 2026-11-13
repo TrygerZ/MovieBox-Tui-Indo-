@@ -162,3 +162,46 @@ fn validate_and_set_permissions(path: &Path) -> Result<(), String> {
 
     Ok(())
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use zip::write::{SimpleFileOptions, ZipWriter};
+
+    #[test]
+    fn test_extract_zip_success() {
+        let temp = tempfile::tempdir().unwrap();
+        let zip_path = temp.path().join("archive.zip");
+        let output_path = temp.path().join("moviebox-tui.exe");
+
+        let file = File::create(&zip_path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let options =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        zip.start_file("moviebox-tui.exe", options).unwrap();
+        zip.write_all(b"binary-content-windows").unwrap();
+        zip.finish().unwrap();
+
+        extract_zip(&zip_path, "moviebox-tui.exe", &output_path).unwrap();
+        let content = std::fs::read(&output_path).unwrap();
+        assert_eq!(content, b"binary-content-windows");
+    }
+
+    #[test]
+    fn test_extract_zip_missing_binary() {
+        let temp = tempfile::tempdir().unwrap();
+        let zip_path = temp.path().join("archive.zip");
+        let output_path = temp.path().join("output.exe");
+
+        let file = File::create(&zip_path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let options =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        zip.start_file("other.exe", options).unwrap();
+        zip.write_all(b"other-content").unwrap();
+        zip.finish().unwrap();
+
+        let err = extract_zip(&zip_path, "moviebox-tui.exe", &output_path).unwrap_err();
+        assert!(err.contains("not found inside zip"));
+    }
+}

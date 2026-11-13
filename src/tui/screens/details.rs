@@ -10,9 +10,9 @@ use crate::tui::{
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Paragraph, Wrap},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,7 +80,7 @@ impl DetailsLayoutTier {
                 .clamp(1, synopsis_limit)
         };
         let content_rows = if show_poster {
-            (meta_lines + synopsis_rows).max(5)
+            6
         } else {
             meta_lines + synopsis_rows
         };
@@ -95,7 +95,7 @@ impl DetailsLayoutTier {
     }
 }
 
-pub const DETAILS_FOOTER_SPLIT_THRESHOLD: u16 = 106;
+pub const DETAILS_FOOTER_SPLIT_THRESHOLD: u16 = 80;
 
 pub(crate) fn visible_selector_panes(
     available_panes: &[crate::tui::state::DetailsPane],
@@ -171,6 +171,7 @@ pub(crate) fn selector_pane_constraints(
 pub struct DetailsScreenLayout {
     pub tier: DetailsLayoutTier,
     pub header_area: Rect,
+    pub synopsis_area: Rect,
     pub workflow_area: Rect,
     pub bottom_area: Rect,
     pub footer_area: Rect,
@@ -192,13 +193,138 @@ pub fn details_screen_layout(
     ])
     .split(area);
 
+    let header_area = chunks[0];
+    let synopsis_area = compute_synopsis_area(header_area, tier, selected_details);
+
     DetailsScreenLayout {
         tier,
-        header_area: chunks[0],
+        header_area,
+        synopsis_area,
         workflow_area: chunks[1],
         bottom_area: chunks[2],
         footer_area: chunks[3],
     }
+}
+
+fn compute_synopsis_area(
+    header_area: Rect,
+    tier: DetailsLayoutTier,
+    selected_details: Option<&MediaDetails>,
+) -> Rect {
+    let Some(details) = selected_details else {
+        return Rect::default();
+    };
+    let intro = details
+        .description
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("");
+    if intro.is_empty() {
+        return Rect::default();
+    }
+
+    let details_block =
+        Block::default()
+            .borders(Borders::ALL)
+            .padding(ratatui::widgets::Padding::new(
+                if matches!(tier, DetailsLayoutTier::Wide) {
+                    2
+                } else {
+                    1
+                },
+                1,
+                0,
+                0,
+            ));
+    let inner_area = details_block.inner(header_area);
+    let show_poster = !matches!(tier, DetailsLayoutTier::Tiny | DetailsLayoutTier::Narrow)
+        && inner_area.height >= 5
+        && inner_area.width >= 75;
+
+    let poster_width = if show_poster {
+        let default_w = ((inner_area.height as f32 * (4.0 / 3.0)).round() as u16).max(6);
+        default_w.clamp(12, 22)
+    } else {
+        0
+    };
+
+    let meta_constraints = if show_poster {
+        vec![
+            Constraint::Length(poster_width),
+            Constraint::Length(2),
+            Constraint::Min(20),
+        ]
+    } else {
+        vec![Constraint::Min(20)]
+    };
+
+    let meta_area = if show_poster {
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints(meta_constraints)
+            .split(inner_area);
+        chunks[2]
+    } else {
+        inner_area
+    };
+
+    let text_width = meta_area.width as usize;
+    let total_height = meta_area.height as usize;
+    if text_width == 0 || total_height == 0 {
+        return Rect::default();
+    }
+
+    let mut fixed_lines = 0;
+    let title = &details.title;
+    let title_w = crate::tui::text::width(title);
+    if title_w <= text_width {
+        fixed_lines += 1;
+    } else {
+        let wrapped_title = crate::tui::text::wrap_text(title, text_width);
+        fixed_lines += wrapped_title.len().min(2);
+    }
+    fixed_lines += 1;
+    if details
+        .tagline
+        .as_deref()
+        .is_some_and(|t| !t.trim().is_empty())
+    {
+        fixed_lines += 1;
+    }
+
+    let has_extra_meta = !details.genres.is_empty()
+        || details
+            .director
+            .as_ref()
+            .is_some_and(|d| !d.trim().is_empty() && *d != "N/A")
+        || details
+            .stars
+            .as_ref()
+            .is_some_and(|s| !s.trim().is_empty() && *s != "N/A");
+
+    let reserved_bottom = if has_extra_meta { 1 } else { 0 };
+    let remaining_height = total_height.saturating_sub(fixed_lines + reserved_bottom);
+    let (include_spacer, max_synopsis_lines) = if remaining_height >= 2 {
+        (true, remaining_height.saturating_sub(1))
+    } else {
+        (false, remaining_height)
+    };
+
+    if max_synopsis_lines == 0 {
+        return Rect::default();
+    }
+
+    let wrapped_synopsis = crate::tui::text::wrap_text(intro, text_width);
+    let actual_synopsis_lines = wrapped_synopsis.len().min(max_synopsis_lines);
+    if actual_synopsis_lines == 0 {
+        return Rect::default();
+    }
+
+    let synopsis_rel_y = fixed_lines + if include_spacer { 1 } else { 0 };
+
+    let abs_y = meta_area.y + synopsis_rel_y as u16;
+    let height = actual_synopsis_lines as u16;
+    Rect::new(meta_area.x, abs_y, meta_area.width, height)
 }
 
 pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
@@ -222,24 +348,47 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
                 let error_block = Block::default()
                     .borders(Borders::ALL)
                     .border_type(crate::tui::overlay::border_type(state.basic_terminal))
-                    .border_style(theme.error)
+                    .border_style(if modal_active {
+                        theme.muted
+                    } else {
+                        theme.error
+                    })
                     .title(Line::from(vec![Span::styled(
                         " Error Loading Details ",
-                        theme.error.add_modifier(Modifier::BOLD),
+                        if modal_active {
+                            theme.muted
+                        } else {
+                            theme.error.add_modifier(Modifier::BOLD)
+                        },
                     )]));
 
                 let err_msg =
                     crate::tui::text::truncate_width(err, (box_width.saturating_sub(4)) as usize);
-                let text = vec![
+                let mut text = vec![
                     Line::from(""),
-                    Line::from(Span::styled(err_msg, theme.text)),
+                    Line::from(Span::styled(
+                        err_msg,
+                        if modal_active {
+                            theme.muted
+                        } else {
+                            theme.text
+                        },
+                    )),
                     Line::from(""),
-                    Line::from(vec![
-                        crate::tui::overlay::key_hint("r", "Retry fetch", theme),
-                        Span::raw("   "),
-                        crate::tui::overlay::key_hint("Esc", "Back", theme),
-                    ]),
                 ];
+                let hint_spans = if modal_active {
+                    vec![
+                        Span::styled("[r] Retry", theme.muted),
+                        Span::raw("   "),
+                        Span::styled("[Esc] Back", theme.muted),
+                    ]
+                } else {
+                    let mut s = crate::tui::overlay::key_hint("r", "Retry", theme);
+                    s.push(Span::raw("   "));
+                    s.extend(crate::tui::overlay::key_hint("Esc", "Back", theme));
+                    s
+                };
+                text.push(Line::from(hint_spans));
 
                 let error_p = Paragraph::new(text)
                     .block(error_block)
@@ -260,7 +409,16 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
                 ])
                 .split(area);
 
-            let loading_spans = if state.basic_terminal {
+            let loading_spans = if modal_active {
+                vec![Span::styled(
+                    if state.basic_terminal {
+                        format!("Loading details {spinner}")
+                    } else {
+                        format!("{spinner}   Loading details...")
+                    },
+                    theme.muted,
+                )]
+            } else if state.basic_terminal {
                 vec![Span::styled(
                     format!("Loading details {spinner}"),
                     theme.lavender,
@@ -326,6 +484,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
         })
         .unwrap_or("N/A");
     let is_series = details.is_series() && !state.available_seasons.is_empty();
+    let has_languages = details.has_languages();
     let type_str = if is_series { "Series" } else { "Movie" };
 
     let genres = if !details.genres.is_empty() {
@@ -452,6 +611,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
                 state.basic_terminal,
                 is_in_flight,
                 state.tick_count,
+                modal_active,
             );
         }
 
@@ -465,21 +625,21 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
 
     let mut rendered_lines: Vec<Line> = Vec::new();
     let title_style = if modal_active {
-        theme.overlay0.add_modifier(Modifier::BOLD)
+        theme.muted
     } else {
         theme.title.add_modifier(Modifier::BOLD)
     };
-    let title_w = crate::tui::text::width(&title);
+    let title_w = crate::tui::text::width(title);
     if title_w <= text_width {
-        rendered_lines.push(Line::from(vec![Span::styled(title.clone(), title_style)]));
+        rendered_lines.push(Line::from(vec![Span::styled(title, title_style)]));
     } else {
-        let wrapped_title = crate::tui::text::wrap_text(&title, text_width);
+        let wrapped_title = crate::tui::text::wrap_text(title, text_width);
         for line in wrapped_title.into_iter().take(2) {
             rendered_lines.push(Line::from(vec![Span::styled(line, title_style)]));
         }
     }
 
-    let bullet_sep = if state.basic_terminal { " - " } else { " · " };
+    let bullet_sep = if state.basic_terminal { " - " } else { "  " };
     let (b_year_s, b_sep_s, b_type_s, b_dur_s, b_rating_s, b_audio_lbl_s, b_audio_val_s, b_prov_s) =
         if modal_active {
             (
@@ -504,11 +664,11 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
                 theme.subtext1,
             )
         };
-    let mut badge_spans = vec![
-        Span::styled(year, b_year_s),
-        Span::styled(bullet_sep, b_sep_s),
-        Span::styled(type_str, b_type_s),
-    ];
+    let mut badge_spans = vec![Span::styled(type_str, b_type_s)];
+    if !year.is_empty() && year != "N/A" {
+        badge_spans.insert(0, Span::styled(bullet_sep, b_sep_s));
+        badge_spans.insert(0, Span::styled(year, b_year_s));
+    }
 
     if !duration.trim().is_empty() && duration != "N/A" {
         badge_spans.push(Span::styled(bullet_sep, b_sep_s));
@@ -525,16 +685,8 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
         badge_spans.push(Span::styled(imdb_rating, b_rating_s));
     }
 
-    let audio_str = if details.has_languages() {
-        let count = details.dubs.len();
-        if count > 1 {
-            Some(format!("{count} Tracks"))
-        } else {
-            details
-                .dubs
-                .first()
-                .map(|d| clean_language_name(&d.language))
-        }
+    let audio_str = if has_languages {
+        None
     } else {
         details
             .audios
@@ -598,7 +750,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
             theme.subtext1.add_modifier(Modifier::BOLD),
             Style::default().fg(theme_color(
                 theme.subtext1,
-                theme.text.fg.unwrap_or(Color::White),
+                theme.text.fg.unwrap_or(theme.base),
             )),
             theme.overlay1,
         )
@@ -690,13 +842,14 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
         if wrapped_synopsis.len() > max_synopsis_lines {
             wrapped_synopsis.truncate(max_synopsis_lines);
             if let Some(last) = wrapped_synopsis.last_mut() {
-                let last_w = crate::tui::text::width(last);
-                if last_w + 3 <= text_width {
-                    last.push_str("...");
+                let hint = " ... [i: More]";
+                let hint_w = crate::tui::text::width(hint);
+                if crate::tui::text::width(last) + hint_w <= text_width {
+                    last.push_str(hint);
                 } else {
                     let truncated =
-                        crate::tui::text::truncate_width(last, text_width.saturating_sub(3));
-                    *last = format!("{truncated}...");
+                        crate::tui::text::truncate_width(last, text_width.saturating_sub(hint_w));
+                    *last = format!("{truncated}{hint}");
                 }
             }
         }
@@ -716,22 +869,8 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
         rendered_lines.push(Line::from(extra_meta_spans));
     }
 
-    let top_offset = total_height.saturating_sub(rendered_lines.len()) / 2;
-    let final_lines = if top_offset > 0 {
-        let mut padded = Vec::with_capacity(total_height);
-        for _ in 0..top_offset {
-            padded.push(Line::from(""));
-        }
-        padded.extend(rendered_lines);
-        padded
-    } else {
-        rendered_lines
-    };
-
-    let meta_p = Paragraph::new(final_lines);
+    let meta_p = Paragraph::new(rendered_lines);
     frame.render_widget(meta_p, meta_area);
-
-    let has_languages = details.has_languages();
     let streams_count = state.selected_resources.len();
 
     render_workflow(
@@ -766,14 +905,29 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
             .get(state.season_list_state.selected().unwrap_or(0))
             .map_or(0, Vec::len);
         let language_count = details.dubs.len();
-        language_count
-            .max(state.available_seasons.len())
-            .max(episode_count)
-            .min((bottom_area.height / 3).clamp(4, 10) as usize) as u16
-            + 2
+        let max_visible_items = visible_selector_panes
+            .iter()
+            .map(|pane| match pane {
+                crate::tui::state::DetailsPane::Languages => language_count,
+                crate::tui::state::DetailsPane::Seasons => state.available_seasons.len(),
+                crate::tui::state::DetailsPane::Episodes => episode_count,
+                crate::tui::state::DetailsPane::Streams => 0,
+            })
+            .max()
+            .unwrap_or(0);
+        let max_rows = (bottom_area.height / 3).clamp(4, 10) as usize;
+        (max_visible_items.min(max_rows) as u16) + 2
     };
 
-    let lower_chunks = Layout::vertical([Constraint::Length(selector_height), Constraint::Min(3)])
+    let streams_height_cap = if state.has_streams_settled && streams_count > 0 {
+        let capped =
+            (streams_count as u16 + 3).min(bottom_area.height.saturating_sub(selector_height));
+        Constraint::Length(capped)
+    } else {
+        Constraint::Min(3)
+    };
+
+    let lower_chunks = Layout::vertical([Constraint::Length(selector_height), streams_height_cap])
         .split(bottom_area);
     let selector_area = lower_chunks[0];
     let streams_area = lower_chunks[1];
@@ -807,11 +961,19 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
 
     if has_languages {
         use ratatui::widgets::{List, ListItem};
+        let language_focused =
+            !modal_active && state.details_pane == crate::tui::state::DetailsPane::Languages;
+        let selected_lang = state.language_list_state.selected();
         let mut lang_items = Vec::new();
-        for dub in &details.dubs {
+        for (i, dub) in details.dubs.iter().enumerate() {
             let name = clean_language_name(&dub.language);
+            let is_selected = Some(i) == selected_lang;
             let item_style = if modal_active {
                 theme.muted
+            } else if is_selected && language_focused {
+                crate::tui::overlay::selection_style(theme, state.basic_terminal)
+            } else if is_selected {
+                theme.subtext1.add_modifier(Modifier::BOLD)
             } else {
                 theme.text
             };
@@ -819,30 +981,25 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
         }
         let language_count = lang_items.len();
 
-        let language_focused =
-            !modal_active && state.details_pane == crate::tui::state::DetailsPane::Languages;
-        let (lang_border, lang_title_style, lang_highlight_style, lang_highlight_symbol) =
+        let (lang_border, lang_title_style, _lang_highlight_style, _lang_highlight_symbol) =
             pane_styles(language_focused, modal_active, state.basic_terminal, theme);
-        let lang_list = List::new(lang_items)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(crate::tui::overlay::border_type(state.basic_terminal))
-                    .title(pane_title(
-                        "Audio",
-                        language_count,
-                        crate::tui::state::DetailsPane::Languages,
-                        language_focused,
-                        state,
-                        lang_area.map_or(0, |a| a.width),
-                        modal_active,
-                    ))
-                    .title_style(lang_title_style)
-                    .border_style(lang_border)
-                    .padding(ratatui::widgets::Padding::horizontal(1)),
-            )
-            .highlight_style(lang_highlight_style)
-            .highlight_symbol(lang_highlight_symbol);
+        let lang_list = List::new(lang_items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(crate::tui::overlay::border_type(state.basic_terminal))
+                .title(pane_title(
+                    "Audio",
+                    language_count,
+                    crate::tui::state::DetailsPane::Languages,
+                    language_focused,
+                    state,
+                    lang_area.map_or(0, |a| a.width),
+                    modal_active,
+                ))
+                .title_style(lang_title_style)
+                .border_style(lang_border)
+                .padding(ratatui::widgets::Padding::horizontal(1)),
+        );
 
         if let Some(area) = lang_area {
             frame.render_stateful_widget(lang_list, area, &mut state.language_list_state);
@@ -853,53 +1010,57 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
                 state.language_list_state.selected().unwrap_or(0),
                 theme,
                 state.basic_terminal,
+                modal_active,
             );
         }
     }
 
     if is_series {
         use ratatui::widgets::{List, ListItem};
+        let seasons_focused =
+            !modal_active && state.details_pane == crate::tui::state::DetailsPane::Seasons;
+        let selected_season = state.season_list_state.selected();
         let seasons_items: Vec<ListItem> = state
             .available_seasons
             .iter()
-            .map(|s| {
+            .enumerate()
+            .map(|(i, s)| {
+                let is_selected = Some(i) == selected_season;
                 let item_style = if modal_active {
                     theme.muted
+                } else if is_selected && seasons_focused {
+                    crate::tui::overlay::selection_style(theme, state.basic_terminal)
+                } else if is_selected {
+                    theme.subtext1.add_modifier(Modifier::BOLD)
                 } else {
                     theme.text
                 };
                 ListItem::new(format!("Season {}", s.number)).style(item_style)
             })
             .collect();
-
-        let seasons_focused =
-            !modal_active && state.details_pane == crate::tui::state::DetailsPane::Seasons;
         let (
             seasons_border,
             seasons_title_style,
-            seasons_highlight_style,
-            seasons_highlight_symbol,
+            _seasons_highlight_style,
+            _seasons_highlight_symbol,
         ) = pane_styles(seasons_focused, modal_active, state.basic_terminal, theme);
-        let seasons_list = List::new(seasons_items)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(crate::tui::overlay::border_type(state.basic_terminal))
-                    .title(pane_title(
-                        "Seasons",
-                        state.available_seasons.len(),
-                        crate::tui::state::DetailsPane::Seasons,
-                        seasons_focused,
-                        state,
-                        seasons_area.map_or(0, |a| a.width),
-                        modal_active,
-                    ))
-                    .title_style(seasons_title_style)
-                    .border_style(seasons_border)
-                    .padding(ratatui::widgets::Padding::horizontal(1)),
-            )
-            .highlight_style(seasons_highlight_style)
-            .highlight_symbol(seasons_highlight_symbol);
+        let seasons_list = List::new(seasons_items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(crate::tui::overlay::border_type(state.basic_terminal))
+                .title(pane_title(
+                    "Seasons",
+                    state.available_seasons.len(),
+                    crate::tui::state::DetailsPane::Seasons,
+                    seasons_focused,
+                    state,
+                    seasons_area.map_or(0, |a| a.width),
+                    modal_active,
+                ))
+                .title_style(seasons_title_style)
+                .border_style(seasons_border)
+                .padding(ratatui::widgets::Padding::horizontal(1)),
+        );
 
         if let Some(area) = seasons_area {
             frame.render_stateful_widget(seasons_list, area, &mut state.season_list_state);
@@ -910,8 +1071,15 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
                 state.season_list_state.selected().unwrap_or(0),
                 theme,
                 state.basic_terminal,
+                modal_active,
             );
         }
+
+        let episodes_focused =
+            !modal_active && state.details_pane == crate::tui::state::DetailsPane::Episodes;
+        let (eps_border, eps_title_style, _eps_highlight_style, _eps_highlight_symbol) =
+            pane_styles(episodes_focused, modal_active, state.basic_terminal, theme);
+        let selected_ep = state.episode_list_state.selected();
 
         let ep_items: Vec<ListItem> = if let Some(ep_numbers) = state
             .available_episode_numbers
@@ -932,7 +1100,9 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
             let ep_max_w = eps_area.map_or(40, |a| a.width.saturating_sub(6)) as usize;
             ep_numbers
                 .iter()
-                .map(|&ep| {
+                .enumerate()
+                .map(|(i, &ep)| {
+                    let is_selected = Some(i) == selected_ep;
                     let ep_title_opt = details
                         .seasons
                         .iter()
@@ -945,39 +1115,69 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
                                 && !trim.eq_ignore_ascii_case(&format!("Episode {ep}"))
                                 && !trim.eq_ignore_ascii_case(&format!("EP {ep}"))
                         });
-                    let ep_base = if let Some(t) = ep_title_opt {
-                        let candidate = format!("EP {ep:02} · {t}");
-                        crate::tui::text::truncate_width(&candidate, ep_max_w).into_owned()
+                    let sym = if let Some(hist) =
+                        state
+                            .history
+                            .get_item(provider, subject_id, se_num, ep, Some(title))
+                    {
+                        if hist.completed {
+                            check_sym
+                        } else if hist.is_in_progress() {
+                            play_sym
+                        } else {
+                            unwatched_sym
+                        }
+                    } else if state.history.is_watched(provider, subject_id, se_num, ep) {
+                        check_sym
                     } else {
-                        format!("EP {ep:02}")
+                        unwatched_sym
                     };
-                    if modal_active {
-                        ListItem::new(format!("{unwatched_sym}{ep_base}")).style(theme.muted)
+                    let progress_info = state
+                        .history
+                        .get_item(provider, subject_id, se_num, ep, Some(title))
+                        .filter(|h| !h.completed && h.is_in_progress())
+                        .map(
+                            |h| match (h.progress_percentage(), h.formatted_remaining()) {
+                                (Some(p), Some(r)) => format!(" ({:.0}% · {r})", p),
+                                (Some(p), None) => format!(" ({:.0}%)", p),
+                                (None, Some(r)) => format!(" ({r})"),
+                                (None, None) => String::new(),
+                            },
+                        )
+                        .unwrap_or_default();
+                    let sym_w = crate::tui::text::width(sym);
+                    let prog_w = crate::tui::text::width(&progress_info);
+                    let title_budget = ep_max_w.saturating_sub(sym_w + prog_w).max(8);
+                    let ep_base = if let Some(t) = ep_title_opt {
+                        let candidate = format!("Episode {ep:02} · {t}");
+                        crate::tui::text::truncate_width(&candidate, title_budget).into_owned()
+                    } else {
+                        format!("Episode {ep:02}")
+                    };
+                    let item_style = if modal_active {
+                        theme.muted
+                    } else if is_selected && episodes_focused {
+                        crate::tui::overlay::selection_style(theme, state.basic_terminal)
+                    } else if is_selected {
+                        theme.subtext1.add_modifier(Modifier::BOLD)
                     } else if let Some(hist) =
                         state
                             .history
-                            .get_item(provider, subject_id, se_num, ep, Some(&title))
+                            .get_item(provider, subject_id, se_num, ep, Some(title))
                     {
                         if hist.completed {
-                            ListItem::new(format!("{check_sym}{ep_base}")).style(theme.text_dim)
+                            theme.text_dim
                         } else if hist.is_in_progress() {
-                            let progress_info =
-                                match (hist.progress_percentage(), hist.formatted_remaining()) {
-                                    (Some(p), Some(r)) => format!(" ({:.0}% · {r})", p),
-                                    (Some(p), None) => format!(" ({:.0}%)", p),
-                                    (None, Some(r)) => format!(" ({r})"),
-                                    (None, None) => String::new(),
-                                };
-                            ListItem::new(format!("{play_sym}{ep_base}{progress_info}"))
-                                .style(theme.accent)
+                            theme.accent
                         } else {
-                            ListItem::new(format!("{unwatched_sym}{ep_base}")).style(theme.text)
+                            theme.text
                         }
                     } else if state.history.is_watched(provider, subject_id, se_num, ep) {
-                        ListItem::new(format!("{check_sym}{ep_base}")).style(theme.text_dim)
+                        theme.text_dim
                     } else {
-                        ListItem::new(format!("{unwatched_sym}{ep_base}")).style(theme.text)
-                    }
+                        theme.text
+                    };
+                    ListItem::new(format!("{sym}{ep_base}{progress_info}")).style(item_style)
                 })
                 .collect()
         } else {
@@ -985,31 +1185,23 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
         };
         let episode_count = ep_items.len();
 
-        let episodes_focused =
-            !modal_active && state.details_pane == crate::tui::state::DetailsPane::Episodes;
-        let (eps_border, eps_title_style, eps_highlight_style, eps_highlight_symbol) =
-            pane_styles(episodes_focused, modal_active, state.basic_terminal, theme);
-        let eps_list = List::new(ep_items)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(crate::tui::overlay::border_type(state.basic_terminal))
-                    .title(pane_title(
-                        "Episodes",
-                        episode_count,
-                        crate::tui::state::DetailsPane::Episodes,
-                        episodes_focused,
-                        state,
-                        eps_area.map_or(0, |a| a.width),
-                        modal_active,
-                    ))
-                    .title_style(eps_title_style)
-                    .border_style(eps_border)
-                    .padding(ratatui::widgets::Padding::horizontal(1)),
-            )
-            .highlight_style(eps_highlight_style)
-            .highlight_symbol(eps_highlight_symbol);
-
+        let eps_list = List::new(ep_items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(crate::tui::overlay::border_type(state.basic_terminal))
+                .title(pane_title(
+                    "Episodes",
+                    episode_count,
+                    crate::tui::state::DetailsPane::Episodes,
+                    episodes_focused,
+                    state,
+                    eps_area.map_or(0, |a| a.width),
+                    modal_active,
+                ))
+                .title_style(eps_title_style)
+                .border_style(eps_border)
+                .padding(ratatui::widgets::Padding::horizontal(1)),
+        );
         if let Some(area) = eps_area {
             frame.render_stateful_widget(eps_list, area, &mut state.episode_list_state);
             let episode_count = state
@@ -1023,6 +1215,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
                 state.episode_list_state.selected().unwrap_or(0),
                 theme,
                 state.basic_terminal,
+                modal_active,
             );
         }
     }
@@ -1082,7 +1275,79 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
     if !list.is_empty() {
         let selected_idx = state.resource_list_state.selected();
 
-        let list_items: Vec<ListItem> = list
+        use ratatui::widgets::{Cell, Row, Table};
+
+        let is_ultra_compact = streams_area.width < 65;
+        let is_compact = streams_area.width < 85;
+        let is_wide = streams_area.width >= 115;
+
+        let header_style = if modal_active {
+            theme.muted
+        } else {
+            theme.subtext1.add_modifier(Modifier::BOLD)
+        };
+
+        let (header_cells, widths): (Vec<Cell<'static>>, Vec<Constraint>) = if is_ultra_compact {
+            (
+                vec![Cell::from("RES"), Cell::from("SIZE"), Cell::from("RELEASE")],
+                vec![
+                    Constraint::Length(8),
+                    Constraint::Length(7),
+                    Constraint::Min(15),
+                ],
+            )
+        } else if is_compact {
+            (
+                vec![
+                    Cell::from("RES"),
+                    Cell::from("SIZE"),
+                    Cell::from("CODEC"),
+                    Cell::from("RELEASE"),
+                ],
+                vec![
+                    Constraint::Length(8),
+                    Constraint::Length(8),
+                    Constraint::Length(8),
+                    Constraint::Min(20),
+                ],
+            )
+        } else if is_wide {
+            (
+                vec![
+                    Cell::from("RES"),
+                    Cell::from("SIZE"),
+                    Cell::from("MEDIA TAGS"),
+                    Cell::from("SOURCE"),
+                    Cell::from("RELEASE"),
+                ],
+                vec![
+                    Constraint::Length(8),
+                    Constraint::Length(9),
+                    Constraint::Length(18),
+                    Constraint::Length(16),
+                    Constraint::Min(24),
+                ],
+            )
+        } else {
+            (
+                vec![
+                    Cell::from("RES"),
+                    Cell::from("SIZE"),
+                    Cell::from("MEDIA TAGS"),
+                    Cell::from("RELEASE"),
+                ],
+                vec![
+                    Constraint::Length(8),
+                    Constraint::Length(9),
+                    Constraint::Length(18),
+                    Constraint::Min(20),
+                ],
+            )
+        };
+
+        let header = Row::new(header_cells).style(header_style).bottom_margin(0);
+
+        let table_rows: Vec<Row> = list
             .iter()
             .enumerate()
             .map(|(i, file)| {
@@ -1119,9 +1384,33 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
                     metadata_style(theme)
                 };
 
-                let release_title = clean_stream_release_title(&file.filename);
                 let clean_source = crate::tui::text::clean_stream_text(file.source_label());
-                let upload_by = if !clean_source.is_empty() && clean_source != "Direct" {
+                let is_redundant_source = {
+                    let l = clean_source.to_ascii_lowercase();
+                    let parts: Vec<&str> = l
+                        .split(|c: char| c == '-' || c.is_whitespace())
+                        .filter(|p| !p.is_empty())
+                        .collect();
+                    !parts.is_empty()
+                        && parts.iter().all(|p| {
+                            matches!(
+                                *p,
+                                "multi"
+                                    | "res"
+                                    | "hevc"
+                                    | "h264"
+                                    | "x265"
+                                    | "x264"
+                                    | "1080p"
+                                    | "720p"
+                                    | "480p"
+                                    | "360p"
+                                    | "4k"
+                                    | "direct"
+                            )
+                        })
+                };
+                let upload_by = if !clean_source.is_empty() && !is_redundant_source {
                     clean_source
                 } else {
                     match file.provider {
@@ -1136,128 +1425,95 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
                             "DhakaFlix".to_string()
                         }
                         crate::providers::models::ProviderKind::Addons => "Addon".to_string(),
+                        crate::providers::models::ProviderKind::Dramachi => {
+                            "Dramachi CDN".to_string()
+                        }
                     }
                 };
-                let is_ultra_compact = streams_area.width < 58;
-                let is_compact = streams_area.width < 85;
-                let is_wide = streams_area.width >= 115;
-                let stream_width = streams_area.width.saturating_sub(6) as usize;
 
-                let mut stream_spans = Vec::new();
+                let media_title = state
+                    .selected_details
+                    .as_ref()
+                    .map(|d| d.title.as_str())
+                    .unwrap_or("");
+                let raw_release = clean_stream_release_title(&file.filename);
+                let is_duplicate_media_title =
+                    !media_title.is_empty() && raw_release.eq_ignore_ascii_case(media_title);
+                let release_title = if is_duplicate_media_title {
+                    if is_wide {
+                        "-".to_string()
+                    } else {
+                        upload_by.clone()
+                    }
+                } else {
+                    raw_release
+                };
 
-                stream_spans.extend(resolution_badge_spans(
+                let res_badge = resolution_badge_spans(
                     resolution,
                     theme,
                     state.basic_terminal,
                     modal_active,
-                ));
-
-                stream_spans.push(Span::styled(
-                    format!("{size_formatted:>7}  "),
-                    primary_style,
-                ));
+                    is_selected && streams_focused,
+                );
 
                 let codec_str = codec.to_uppercase();
                 let tags = extract_media_tags(&file.filename, &codec_str);
-                let mut tag_parts = Vec::new();
-                if let Some(hdr) = tags.hdr {
-                    tag_parts.push(hdr);
-                }
-                if let Some(codec_tag) = tags.codec {
-                    tag_parts.push(codec_tag);
+                let media_tag_spans = crate::tui::widgets::render_media_tag_spans(
+                    &tags,
+                    theme,
+                    state.basic_terminal,
+                    modal_active,
+                );
+                let tags_cell = if !media_tag_spans.is_empty() {
+                    Cell::from(ratatui::text::Line::from(media_tag_spans))
                 } else if codec != "None" && !codec.is_empty() {
-                    tag_parts.push(codec_str.as_str());
-                }
-                if let Some(audio) = tags.audio {
-                    tag_parts.push(audio);
-                }
-                if let Some(source) = tags.source {
-                    tag_parts.push(source);
-                }
-                let sep = if state.basic_terminal { " - " } else { " · " };
-                let tags_or_codec = tag_parts.join(sep);
-
-                if is_ultra_compact {
-                    stream_spans.push(Span::styled(
-                        crate::tui::text::truncate_width(&release_title, stream_width).into_owned(),
-                        primary_style,
-                    ));
-                } else if is_compact {
-                    stream_spans.push(Span::styled(format!("{codec:<6}  "), secondary_style));
-                    stream_spans.push(Span::styled(
-                        crate::tui::text::truncate_width(&release_title, stream_width).into_owned(),
-                        primary_style,
-                    ));
-                } else if is_wide {
-                    let tags_col = if tags_or_codec.is_empty() {
-                        "-".to_string()
-                    } else {
-                        tags_or_codec
-                    };
-                    stream_spans.push(Span::styled(
-                        format!("{:<20}  ", crate::tui::text::truncate_width(&tags_col, 20)),
-                        secondary_style,
-                    ));
-                    stream_spans.push(Span::styled(
-                        format!("{:<14}  ", crate::tui::text::truncate_width(&upload_by, 14)),
-                        secondary_style,
-                    ));
-                    stream_spans.push(Span::styled(
-                        crate::tui::text::truncate_width(&release_title, stream_width).into_owned(),
-                        primary_style,
-                    ));
+                    Cell::from(Span::styled(codec_str, secondary_style))
                 } else {
-                    let tags_col = if tags_or_codec.is_empty() {
-                        "-".to_string()
-                    } else {
-                        tags_or_codec
-                    };
-                    stream_spans.push(Span::styled(
-                        format!("{:<20}  ", crate::tui::text::truncate_width(&tags_col, 20)),
-                        secondary_style,
-                    ));
-                    stream_spans.push(Span::styled(
-                        crate::tui::text::truncate_width(&release_title, stream_width).into_owned(),
-                        primary_style,
-                    ));
-                }
-                ListItem::new(ratatui::text::Line::from(stream_spans)).style(row_style)
+                    Cell::from(Span::styled("-", secondary_style))
+                };
+
+                let cells: Vec<Cell> = if is_ultra_compact {
+                    vec![
+                        Cell::from(ratatui::text::Line::from(res_badge)),
+                        Cell::from(Span::styled(size_formatted.clone(), primary_style)),
+                        Cell::from(Span::styled(release_title, primary_style)),
+                    ]
+                } else if is_compact {
+                    vec![
+                        Cell::from(ratatui::text::Line::from(res_badge)),
+                        Cell::from(Span::styled(size_formatted.clone(), primary_style)),
+                        Cell::from(Span::styled(format!("{codec:<6}"), secondary_style)),
+                        Cell::from(Span::styled(release_title, primary_style)),
+                    ]
+                } else if is_wide {
+                    vec![
+                        Cell::from(ratatui::text::Line::from(res_badge)),
+                        Cell::from(Span::styled(size_formatted.clone(), primary_style)),
+                        tags_cell.clone(),
+                        Cell::from(Span::styled(upload_by, secondary_style)),
+                        Cell::from(Span::styled(release_title, primary_style)),
+                    ]
+                } else {
+                    vec![
+                        Cell::from(ratatui::text::Line::from(res_badge)),
+                        Cell::from(Span::styled(size_formatted.clone(), primary_style)),
+                        tags_cell,
+                        Cell::from(Span::styled(release_title, primary_style)),
+                    ]
+                };
+
+                Row::new(cells).style(row_style)
             })
             .collect();
 
-        frame.render_widget(streams_block.clone(), streams_area);
-        let inner_streams = streams_block.inner(streams_area);
+        let streams_table = Table::new(table_rows, widths)
+            .header(header)
+            .block(streams_block)
+            .row_highlight_style(streams_highlight_style)
+            .highlight_symbol(streams_highlight_symbol);
 
-        if inner_streams.height >= 2 {
-            let stream_chunks =
-                Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(inner_streams);
-
-            let header_spans = stream_table_header_spans(streams_area.width, theme, modal_active);
-            frame.render_widget(
-                Paragraph::new(ratatui::text::Line::from(header_spans)),
-                stream_chunks[0],
-            );
-
-            let streams_list = List::new(list_items.clone())
-                .highlight_style(streams_highlight_style)
-                .highlight_symbol(streams_highlight_symbol);
-
-            frame.render_stateful_widget(
-                streams_list,
-                stream_chunks[1],
-                &mut state.resource_list_state,
-            );
-        } else {
-            let streams_list = List::new(list_items)
-                .highlight_style(streams_highlight_style)
-                .highlight_symbol(streams_highlight_symbol);
-
-            frame.render_stateful_widget(
-                streams_list,
-                inner_streams,
-                &mut state.resource_list_state,
-            );
-        }
+        frame.render_stateful_widget(streams_table, streams_area, &mut state.resource_list_state);
 
         render_scroll_indicator(
             frame,
@@ -1266,6 +1522,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
             selected_idx.unwrap_or(0),
             theme,
             state.basic_terminal,
+            modal_active,
         );
     } else {
         let has_multiple_dubs = details.has_languages();
@@ -1282,12 +1539,14 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
         let msg = if waiting_for_language {
             "Choose an audio track to load streams.".to_string()
         } else if let Some(error) = &state.stream_error {
-            if state.is_addon_mode {
-                error.clone()
-            } else if error.contains("No stream sources") || error.contains("not listed") {
-                format!("{error}.\nPress Ctrl+P to try another provider, or r to refresh.")
+            if error.contains("No stream sources") || error.contains("No streams available") {
+                format!("No streams available on {provider_label}.")
+            } else if let Some(stripped) =
+                error.strip_prefix("Provider is temporarily unavailable: ")
+            {
+                stripped.trim_end_matches('.').to_string()
             } else {
-                format!("{error} — press r to retry or Ctrl+P to switch provider.")
+                error.trim_end_matches('.').to_string()
             }
         } else if is_loading_streams {
             let spinner = stream_loading_spinner(state.tick_count, state.basic_terminal);
@@ -1297,9 +1556,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
                 format!("{spinner}  Loading streams...")
             }
         } else if state.has_streams_settled && state.selected_resources.is_empty() {
-            format!(
-                "No stream sources found on {provider_label} (Ctrl+P to switch provider, r to retry)"
-            )
+            format!("No stream sources found on {provider_label}.")
         } else {
             let spinner = stream_loading_spinner(state.tick_count, state.basic_terminal);
             if state.basic_terminal {
@@ -1309,7 +1566,9 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
             }
         };
 
-        let style = if has_error {
+        let style = if modal_active {
+            theme.muted
+        } else if has_error {
             theme.error
         } else if waiting_for_language {
             theme.text_dim
@@ -1318,7 +1577,6 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
         } else {
             theme.text_dim
         };
-
         let inner = streams_block.inner(streams_area);
         let pad = "\n".repeat((inner.height.saturating_sub(1) / 2) as usize);
         let p = Paragraph::new(format!("{}{}", pad, msg))
@@ -1346,138 +1604,24 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
     .alignment(Alignment::Center);
     frame.render_widget(footer_p, footer_area);
 
-    if state.show_season_download_confirm {
-        let summary_strings = season_confirm_summary(state);
-        let summary_lines: Vec<Line<'_>> = summary_strings
-            .iter()
-            .map(|s| Line::from(s.as_str()))
-            .collect();
-        crate::tui::overlay::confirmation(
+    if state.show_overview_modal {
+        crate::tui::overlay::overview_modal(
             frame,
             area,
-            " Confirm Season Download ",
-            &summary_lines,
-            state.season_download_confirm_yes_selected,
-            theme,
-            state.basic_terminal,
-        );
-    } else if state.show_episode_download_confirm {
-        let summary_strings = episode_confirm_summary(state);
-        let summary_lines: Vec<Line<'_>> = summary_strings
-            .iter()
-            .map(|s| Line::from(s.as_str()))
-            .collect();
-        crate::tui::overlay::confirmation(
-            frame,
-            area,
-            " Confirm Episode Download ",
-            &summary_lines,
-            state.episode_download_confirm_yes_selected,
+            &state.overview_modal_title,
+            &state.overview_modal_content,
+            state.overview_modal_scroll,
             theme,
             state.basic_terminal,
         );
     }
-}
-
-pub(crate) fn season_confirm_summary(state: &AppState) -> Vec<String> {
-    let title = state
-        .selected_details
-        .as_ref()
-        .map(|d| d.title.as_str())
-        .unwrap_or("Series");
-    let season_idx = state.selected_season;
-    let eps_count = if season_idx > 0 && season_idx <= state.available_episode_numbers.len() {
-        state.available_episode_numbers[season_idx - 1].len()
-    } else {
-        0
-    };
-    let mut summary = vec![format!(
-        "{title} • Season {season_idx} ({eps_count} Episodes)"
-    )];
-    if let Some(stream) = selected_stream_summary(state) {
-        summary.push(format!("Quality: {stream}"));
-    }
-    let dest = state
-        .download_dir
-        .as_ref()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| {
-            crate::service::resolve_download_dir(None)
-                .to_string_lossy()
-                .to_string()
-        });
-    summary.push(format!("Save to: {dest}"));
-    summary
-}
-
-pub(crate) fn episode_confirm_summary(state: &AppState) -> Vec<String> {
-    let title = state
-        .selected_details
-        .as_ref()
-        .map(|d| d.title.as_str())
-        .unwrap_or("Media");
-    let year = state
-        .selected_details
-        .as_ref()
-        .and_then(|d| d.year.as_deref())
-        .unwrap_or("");
-    let season_idx = state.selected_season;
-    let ep_idx = state.selected_episode;
-    let is_series = state
-        .selected_details
-        .as_ref()
-        .is_some_and(|d| d.is_series());
-    let mut summary = if is_series {
-        vec![format!("{title} • Season {season_idx} Episode {ep_idx}")]
-    } else if !year.is_empty() && year != "N/A" {
-        vec![format!("{title} ({year}) • Movie")]
-    } else {
-        vec![format!("{title} • Movie")]
-    };
-    if let Some(stream) = selected_stream_summary(state) {
-        summary.push(format!("Quality: {stream}"));
-    }
-    let dest = state
-        .download_dir
-        .as_ref()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| {
-            crate::service::resolve_download_dir(None)
-                .to_string_lossy()
-                .to_string()
-        });
-    summary.push(format!("Save to: {dest}"));
-    summary
-}
-
-fn selected_stream_summary(state: &AppState) -> Option<String> {
-    let idx = state.resource_list_state.selected().unwrap_or(0);
-    let resource = state.selected_resources.get(idx)?;
-    let resolution = if resource.is_multi_resolution() {
-        Some("Multi-Res".to_string())
-    } else if resource.resolution_u64() > 0 {
-        Some(format!("{}p", resource.resolution_u64()))
-    } else {
-        None
-    };
-    let codec = resource
-        .codec
-        .as_deref()
-        .filter(|value| !value.is_empty())
-        .map(str::to_uppercase);
-    let size = resource
-        .size_bytes
-        .map(|value| crate::tui::text::format_file_size(value as f64));
-    let fields = [size, resolution, codec]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
-    (!fields.is_empty()).then(|| fields.join(" · "))
 }
 
 fn clean_language_name(value: &str) -> String {
     let mut name = if value.to_ascii_lowercase().starts_with("original") {
         "Original".to_string()
+    } else if value.eq_ignore_ascii_case("dub") {
+        "English Dub".to_string()
     } else {
         value
             .replace("dub", "")
@@ -1538,7 +1682,7 @@ pub fn clean_stream_release_title(filename: &str) -> String {
 fn pane_title(
     label: &str,
     count: usize,
-    pane: crate::tui::state::DetailsPane,
+    _pane: crate::tui::state::DetailsPane,
     focused: bool,
     state: &AppState,
     max_width: u16,
@@ -1549,45 +1693,16 @@ fn pane_title(
     } else {
         ""
     };
-    let mut panes = Vec::new();
-    let has_languages = state
-        .selected_details
-        .as_ref()
-        .is_some_and(|d| d.has_languages());
-    if has_languages {
-        panes.push(crate::tui::state::DetailsPane::Languages);
-    }
-    if !state.available_seasons.is_empty() {
-        panes.push(crate::tui::state::DetailsPane::Seasons);
-        panes.push(crate::tui::state::DetailsPane::Episodes);
-    }
-    panes.push(crate::tui::state::DetailsPane::Streams);
-
-    let position_str = if focused && !modal_active && panes.len() > 1 {
-        if let Some(position) = panes.iter().position(|candidate| *candidate == pane) {
-            format!("  {}/{}", position + 1, panes.len())
-        } else {
-            String::new()
-        }
-    } else {
-        String::new()
-    };
-
     let count_suffix = if count > 0 {
         format!(" ({count})")
     } else {
         String::new()
     };
 
-    let title_full = format!(" {marker}{label}{count_suffix}{position_str} ");
+    let title_full = format!(" {marker}{label}{count_suffix} ");
     let avail = max_width.saturating_sub(2) as usize;
     let title = if avail > 0 && crate::tui::text::width(&title_full) > avail {
-        let title_medium = format!(" {marker}{label}{count_suffix} ");
-        if crate::tui::text::width(&title_medium) <= avail {
-            title_medium
-        } else {
-            format!(" {marker}{label} ")
-        }
+        format!(" {marker}{label} ")
     } else {
         title_full
     };
@@ -1618,7 +1733,7 @@ fn pane_styles(
     theme: &Theme,
 ) -> (Style, Style, Style, &'static str) {
     if modal_active {
-        (theme.muted, theme.muted, theme.muted, "  ")
+        (theme.muted, theme.muted, theme.muted, "")
     } else {
         (
             if focused {
@@ -1632,7 +1747,7 @@ fn pane_styles(
                 unfocused_title_style(theme)
             },
             selection_style(focused, basic_terminal, theme),
-            selection_symbol(focused, basic_terminal),
+            "",
         )
     }
 }
@@ -1641,40 +1756,24 @@ fn metadata_style(theme: &Theme) -> Style {
     theme.subtext1
 }
 
-fn with_selection_surface(style: Style, basic_terminal: bool, theme: &Theme) -> Style {
+fn with_selection_surface(style: Style, basic_terminal: bool, _theme: &Theme) -> Style {
     if basic_terminal {
         style
     } else {
-        style.bg(theme_color(theme.surface1, theme.base))
+        style.add_modifier(Modifier::BOLD)
     }
 }
 
 fn selection_style(focused: bool, basic_terminal: bool, theme: &Theme) -> Style {
     if focused {
-        let style =
-            with_selection_surface(theme.text, basic_terminal, theme).add_modifier(Modifier::BOLD);
-        if basic_terminal {
-            style.add_modifier(Modifier::UNDERLINED)
-        } else {
-            style
-        }
+        crate::tui::overlay::selection_style(theme, basic_terminal)
     } else {
-        theme.text.add_modifier(Modifier::BOLD)
+        theme.subtext1.add_modifier(Modifier::BOLD)
     }
 }
 
 fn focus_title_marker(basic_terminal: bool) -> &'static str {
-    if basic_terminal { "> " } else { "● " }
-}
-
-fn selection_symbol(focused: bool, basic_terminal: bool) -> &'static str {
-    if focused {
-        if basic_terminal { "> " } else { "▌ " }
-    } else if basic_terminal {
-        "* "
-    } else {
-        "· "
-    }
+    if basic_terminal { "> " } else { "› " }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1692,51 +1791,14 @@ fn render_workflow(
     if area.height == 0 || area.width == 0 {
         return;
     }
-    let compact = area.width < 100;
-    let mut steps = Vec::new();
-
-    if has_languages {
-        let active_idx = details
-            .dubs
-            .iter()
-            .position(|dub| {
-                dub.subject_id == state.active_subject_id.as_deref().unwrap_or_default()
-            })
-            .or_else(|| state.language_list_state.selected())
-            .unwrap_or(0);
-
-        let language = details
-            .dubs
-            .get(active_idx)
-            .map(|dub| clean_language_name(&dub.language))
-            .unwrap_or_else(|| "Choose".to_string());
-        steps.push((
-            crate::tui::state::DetailsPane::Languages,
-            format!("Audio: {language}"),
-        ));
-    }
-    if is_series {
-        steps.push((
-            crate::tui::state::DetailsPane::Seasons,
-            if compact {
-                format!("S{}", state.selected_season)
-            } else {
-                format!("Season {}", state.selected_season)
-            },
-        ));
-
-        let ep_label = if compact {
-            format!("E{}", state.selected_episode)
-        } else {
-            format!("Episode {}", state.selected_episode)
-        };
-
-        steps.push((crate::tui::state::DetailsPane::Episodes, ep_label));
-    }
-    steps.push((
-        crate::tui::state::DetailsPane::Streams,
-        format!("Streams: {streams_count}"),
-    ));
+    let (steps, _step_ranges) = workflow_step_ranges(
+        area.width,
+        state,
+        details,
+        has_languages,
+        is_series,
+        streams_count,
+    );
 
     if area.width < 60 {
         let position = steps
@@ -1806,30 +1868,94 @@ fn render_workflow(
     );
 }
 
-fn stream_table_header_spans(width: u16, theme: &Theme, modal_active: bool) -> Vec<Span<'static>> {
-    let header_style = if modal_active {
-        theme.muted
-    } else {
-        theme.subtext1.add_modifier(Modifier::BOLD)
-    };
-    if width < 58 {
-        vec![Span::styled("  RES     SIZE     RELEASE", header_style)]
-    } else if width < 85 {
-        vec![Span::styled(
-            "  RES     SIZE     CODEC   RELEASE",
-            header_style,
-        )]
-    } else if width < 115 {
-        vec![Span::styled(
-            "  RES     SIZE     MEDIA TAGS            RELEASE",
-            header_style,
-        )]
-    } else {
-        vec![Span::styled(
-            "  RES     SIZE     MEDIA TAGS            SOURCE          RELEASE",
-            header_style,
-        )]
+pub type WorkflowStep = (crate::tui::state::DetailsPane, String);
+pub type WorkflowRange = (crate::tui::state::DetailsPane, u16, u16);
+
+pub fn workflow_step_ranges(
+    area_width: u16,
+    state: &AppState,
+    details: &MediaDetails,
+    has_languages: bool,
+    is_series: bool,
+    streams_count: usize,
+) -> (Vec<WorkflowStep>, Vec<WorkflowRange>) {
+    let compact = area_width < 100;
+    let mut steps = Vec::new();
+
+    if has_languages {
+        let active_idx = details
+            .dubs
+            .iter()
+            .position(|dub| {
+                dub.subject_id == state.active_subject_id.as_deref().unwrap_or_default()
+            })
+            .or_else(|| state.language_list_state.selected())
+            .unwrap_or(0);
+
+        let language = details
+            .dubs
+            .get(active_idx)
+            .map(|dub| clean_language_name(&dub.language))
+            .unwrap_or_else(|| "Choose".to_string());
+        steps.push((
+            crate::tui::state::DetailsPane::Languages,
+            format!("Audio: {language}"),
+        ));
     }
+    if is_series {
+        steps.push((
+            crate::tui::state::DetailsPane::Seasons,
+            if compact {
+                format!("S{}", state.selected_season)
+            } else {
+                format!("Season {}", state.selected_season)
+            },
+        ));
+
+        let ep_label = if compact {
+            format!("E{}", state.selected_episode)
+        } else {
+            format!("Episode {}", state.selected_episode)
+        };
+
+        steps.push((crate::tui::state::DetailsPane::Episodes, ep_label));
+    }
+    steps.push((
+        crate::tui::state::DetailsPane::Streams,
+        format!("Streams: {streams_count}"),
+    ));
+
+    let sep_len = if state.basic_terminal { 3 } else { 5 };
+    let marker_len = 2;
+    let mut total_w = 0;
+    for (idx, (pane, label)) in steps.iter().enumerate() {
+        if idx > 0 {
+            total_w += sep_len;
+        }
+        if *pane == state.details_pane {
+            total_w += marker_len;
+        }
+        total_w += crate::tui::text::width(label) as u16;
+    }
+
+    let start_x = area_width.saturating_sub(total_w) / 2;
+    let mut current_x = start_x;
+    let mut ranges = Vec::new();
+
+    for (idx, (pane, label)) in steps.iter().enumerate() {
+        if idx > 0 {
+            current_x += sep_len;
+        }
+        let step_start = current_x;
+        let mut step_w = crate::tui::text::width(label) as u16;
+        if *pane == state.details_pane {
+            step_w += marker_len;
+        }
+        current_x += step_w;
+        ranges.push((*pane, step_start, current_x));
+    }
+
+    (steps, ranges)
 }
 
 fn footer_group(
@@ -1882,11 +2008,6 @@ fn details_footer(
     } else {
         "Favorite"
     };
-    let show_provider = !state.is_addon_mode
-        && !state
-            .selected_details
-            .as_ref()
-            .is_some_and(|d| d.id.provider == crate::providers::ProviderKind::Addons);
 
     let (enter_label, d_label) = if is_streams {
         ("Play", Some(if compact { "Save" } else { "Download" }))
@@ -1917,20 +2038,12 @@ fn details_footer(
         primary.extend(footer_group("d", d, false, theme, modal_active));
     }
 
-    let mut secondary = footer_group("f", fav_label, false, theme, modal_active);
-    if show_provider {
-        secondary.extend(footer_group(
-            crate::tui::text::CTRL_P_STR,
-            "Provider",
-            false,
-            theme,
-            modal_active,
-        ));
-    }
+    let mut secondary = Vec::new();
     if !is_streams {
         secondary.extend(footer_group("Tab", "Streams", false, theme, modal_active));
     }
-    secondary.extend(footer_group("Esc", "Back", false, theme, modal_active));
+    secondary.extend(footer_group("f", fav_label, false, theme, modal_active));
+    secondary.extend(footer_group("i", "Info", false, theme, modal_active));
     if let Some(last) = secondary.last_mut() {
         *last = Span::raw("");
     }
@@ -1944,7 +2057,11 @@ fn render_scroll_indicator(
     position: usize,
     theme: &Theme,
     basic_terminal: bool,
+    modal_active: bool,
 ) {
+    if modal_active {
+        return;
+    }
     let scroll_area = area.inner(ratatui::layout::Margin {
         vertical: 1,
         horizontal: 0,
@@ -1967,15 +2084,6 @@ mod tests {
         AudioTrackOption, Episode, MediaDetails, MediaType, ProviderKind, ProviderMediaId, Release,
         Season, SourceMirror,
     };
-
-    #[test]
-    fn test_stream_loading_spinner_frames() {
-        assert_eq!(stream_loading_spinner(0, false), "⠋");
-        assert_eq!(stream_loading_spinner(1, false), "⠙");
-        assert_eq!(stream_loading_spinner(9, false), "⠏");
-        assert_eq!(stream_loading_spinner(10, false), "⠋");
-        assert_eq!(stream_loading_spinner(0, true), "..");
-    }
 
     #[test]
     fn test_stream_list_tabular_alignment_and_headers() {
@@ -2085,6 +2193,170 @@ mod tests {
         assert!(content.contains("1.0GB"));
         assert!(content.contains("HEVC"));
         assert!(content.contains("Pahe.in"));
+
+        let header_line = buffer
+            .content()
+            .chunks(120)
+            .find(|line| {
+                let text: String = line.iter().map(|c| c.symbol()).collect();
+                text.contains("RES") && text.contains("SIZE") && text.contains("SOURCE")
+            })
+            .map(|line| line.iter().map(|c| c.symbol()).collect::<String>())
+            .expect("header line must exist");
+
+        let res_idx = header_line.find("RES").unwrap();
+        let size_idx = header_line.find("SIZE").unwrap();
+        let tags_idx = header_line.find("MEDIA TAGS").unwrap();
+        let source_idx = header_line.find("SOURCE").unwrap();
+        let release_idx = header_line.find("RELEASE").unwrap();
+        assert_eq!(size_idx - res_idx, 9);
+        assert_eq!(tags_idx - size_idx, 10);
+        assert_eq!(source_idx - tags_idx, 19);
+        assert_eq!(release_idx - source_idx, 17);
+
+        let data_line = buffer
+            .content()
+            .chunks(120)
+            .find(|line| {
+                let text: String = line.iter().map(|c| c.symbol()).collect();
+                text.contains("1080p") && text.contains("1.0GB")
+            })
+            .map(|line| line.iter().map(|c| c.symbol()).collect::<String>())
+            .expect("data line must exist");
+        let data_size_idx = data_line.find("1.0GB").unwrap();
+        assert_eq!(data_size_idx, size_idx);
+    }
+
+    #[test]
+    fn test_redundant_source_labels_fallback_to_provider_origin() {
+        let backend = ratatui::backend::TestBackend::new(120, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut state = AppState {
+            selected_details: Some(MediaDetails {
+                id: ProviderMediaId {
+                    provider: ProviderKind::MovieBox,
+                    value: "test_show".to_string(),
+                },
+                title: "Test Show".to_string(),
+                media_type: MediaType::Series,
+                year: Some("2024".to_string()),
+                description: None,
+                tagline: None,
+                imdb_rating: None,
+                director: None,
+                stars: None,
+                prints: None,
+                audios: None,
+                poster_url: None,
+                duration: None,
+                genres: vec![],
+                seasons: vec![],
+                dubs: vec![],
+            }),
+            selected_resources: vec![Release {
+                provider: ProviderKind::MovieBox,
+                filename: "Summer Dress S01E02 Multi-Res hevc".to_string(),
+                quality: Some("multi".to_string()),
+                codec: Some("hevc".to_string()),
+                language: None,
+                size_bytes: Some(400 * 1024 * 1024),
+                season: Some(1),
+                episode: Some(2),
+                mirrors: vec![SourceMirror {
+                    label: "Multi-Res hevc".to_string(),
+                    resolver_url: "https://example.com/stream.mpd".to_string(),
+                    headers: vec![],
+                    direct_file: true,
+                }],
+                resource_id: None,
+            }],
+            details_pane: crate::tui::state::DetailsPane::Streams,
+            ..Default::default()
+        };
+        let theme = Theme::dracula();
+
+        terminal
+            .draw(|frame| {
+                draw(frame, frame.area(), &mut state, &theme);
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let content = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(content.contains("MovieBox CDN"));
+        assert!(!content.contains("Multi-Res hevc"));
+        assert!(content.contains("Summer Dress S01E02"));
+    }
+
+    #[test]
+    fn test_duplicate_movie_title_in_release_column_replaced_with_source() {
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut state = AppState {
+            selected_details: Some(MediaDetails {
+                id: ProviderMediaId {
+                    provider: ProviderKind::MovieBox,
+                    value: "ek_deewane".to_string(),
+                },
+                title: "Ek Deewane Ki Deewaniyat".to_string(),
+                media_type: MediaType::Movie,
+                year: Some("2025".to_string()),
+                description: None,
+                tagline: None,
+                imdb_rating: None,
+                director: None,
+                stars: None,
+                prints: None,
+                audios: None,
+                poster_url: None,
+                duration: None,
+                genres: vec![],
+                seasons: vec![],
+                dubs: vec![],
+            }),
+            selected_resources: vec![Release {
+                provider: ProviderKind::MovieBox,
+                filename: "Ek Deewane Ki Deewaniyat.1080p.hevc".to_string(),
+                quality: Some("1080p".to_string()),
+                codec: Some("hevc".to_string()),
+                language: None,
+                size_bytes: Some(1600 * 1024 * 1024),
+                season: None,
+                episode: None,
+                mirrors: vec![SourceMirror {
+                    label: "1080p hevc".to_string(),
+                    resolver_url: "https://example.com/stream.mpd".to_string(),
+                    headers: vec![],
+                    direct_file: true,
+                }],
+                resource_id: None,
+            }],
+            details_pane: crate::tui::state::DetailsPane::Streams,
+            ..Default::default()
+        };
+        let theme = Theme::dracula();
+
+        terminal
+            .draw(|frame| {
+                draw(frame, frame.area(), &mut state, &theme);
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let content = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(content.contains("MovieBox CDN"));
+        let occurrences = content.matches("Ek Deewane Ki Deewaniyat").count();
+        assert_eq!(occurrences, 1);
     }
 
     #[test]
@@ -2178,6 +2450,88 @@ mod tests {
             "Streams table header should not have selection background"
         );
     }
+    #[test]
+    fn test_streams_table_alignment_invariant_under_modal() {
+        let backend = ratatui::backend::TestBackend::new(120, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut state = AppState {
+            selected_details: Some(crate::providers::models::MediaDetails {
+                id: crate::providers::models::ProviderMediaId {
+                    provider: crate::providers::models::ProviderKind::MovieBox,
+                    value: "m1".to_string(),
+                },
+                title: "Movie".to_string(),
+                media_type: crate::providers::models::MediaType::Movie,
+                year: Some("2024".to_string()),
+                description: None,
+                tagline: None,
+                imdb_rating: None,
+                director: None,
+                stars: None,
+                prints: None,
+                audios: None,
+                poster_url: None,
+                duration: None,
+                genres: vec![],
+                seasons: vec![],
+                dubs: vec![],
+            }),
+            selected_resources: vec![crate::providers::models::Release {
+                provider: crate::providers::models::ProviderKind::MovieBox,
+                filename: "Movie.1080p.mkv".to_string(),
+                quality: Some("1080p".to_string()),
+                codec: Some("HEVC".to_string()),
+                language: None,
+                size_bytes: Some(1_000_000_000),
+                season: None,
+                episode: None,
+                mirrors: vec![],
+                resource_id: None,
+            }],
+            details_pane: crate::tui::state::DetailsPane::Streams,
+            ..Default::default()
+        };
+        state.resource_list_state.select(Some(0));
+        let theme = Theme::mocha();
+
+        terminal
+            .draw(|frame| {
+                draw(frame, frame.area(), &mut state, &theme);
+            })
+            .unwrap();
+
+        let buffer_normal = terminal.backend().buffer().clone();
+        let normal_header_x = (0..buffer_normal.area.height)
+            .find_map(|y| {
+                let row: String = (0..buffer_normal.area.width)
+                    .map(|x| buffer_normal[(x, y)].symbol())
+                    .collect();
+                row.find("RES")
+            })
+            .expect("header found in normal state");
+
+        state.subtitle_popup = true;
+        terminal
+            .draw(|frame| {
+                draw(frame, frame.area(), &mut state, &theme);
+            })
+            .unwrap();
+
+        let buffer_modal = terminal.backend().buffer().clone();
+        let modal_header_x = (0..buffer_modal.area.height)
+            .find_map(|y| {
+                let row: String = (0..buffer_modal.area.width)
+                    .map(|x| buffer_modal[(x, y)].symbol())
+                    .collect();
+                row.find("RES")
+            })
+            .expect("header found in modal state");
+
+        assert_eq!(
+            normal_header_x, modal_header_x,
+            "Streams table column alignment must not shift when a modal opens"
+        );
+    }
 
     #[test]
     fn test_details_error_state_rendering() {
@@ -2202,7 +2556,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(content.contains("Error Loading Details"));
-        assert!(content.contains("Retry fetch"));
+        assert!(content.contains("Retry"));
         assert!(content.contains("Back"));
     }
 
@@ -2258,22 +2612,17 @@ mod tests {
         assert!(!footer_text.contains("[o] Open With"));
         assert!(footer_text.contains("[d] Download"));
         assert!(footer_text.contains("[f] Favorite"));
-        assert!(footer_text.contains("Provider"));
-        assert!(footer_text.contains("[Esc] Back"));
+        assert!(footer_text.contains("[i] Info"));
+        assert!(!footer_text.contains("Provider"));
+        assert!(!footer_text.contains("[Esc] Back"));
 
-        let (compact_primary, compact_secondary) = details_footer(&state, &theme, 90, false);
+        let (compact_primary, compact_secondary) = details_footer(&state, &theme, 70, false);
         let mut compact_spans = compact_primary;
         compact_spans.extend(compact_secondary);
         let compact_text: String = compact_spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(compact_text.contains("[d] Save"));
-
-        state.is_addon_mode = true;
-        let (addon_primary, addon_secondary) = details_footer(&state, &theme, 120, false);
-        let mut addon_spans = addon_primary;
-        addon_spans.extend(addon_secondary);
-        let addon_text: String = addon_spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(!addon_text.contains("Provider"));
-        state.is_addon_mode = false;
+        assert!(!compact_text.contains("Provider"));
+        assert!(!compact_text.contains("[Esc] Back"));
 
         state.details_pane = crate::tui::state::DetailsPane::Seasons;
         let (primary, secondary) = details_footer(&state, &theme, 120, false);
@@ -2282,9 +2631,10 @@ mod tests {
         let footer_text: String = all_spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(footer_text.contains("[Enter] Select"));
         assert!(footer_text.contains("[d] Download Season"));
-        assert!(footer_text.contains("[f] Favorite"));
         assert!(footer_text.contains("[Tab] Streams"));
-        assert!(footer_text.contains("[Esc] Back"));
+        assert!(footer_text.contains("[f] Favorite"));
+        assert!(footer_text.contains("[i] Info"));
+        assert!(!footer_text.contains("[Esc] Back"));
 
         state.details_pane = crate::tui::state::DetailsPane::Episodes;
         let (primary, secondary) = details_footer(&state, &theme, 120, false);
@@ -2293,9 +2643,10 @@ mod tests {
         let footer_text: String = all_spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(footer_text.contains("[Enter] Select"));
         assert!(footer_text.contains("[d] Download Episode"));
-        assert!(footer_text.contains("[f] Favorite"));
         assert!(footer_text.contains("[Tab] Streams"));
-        assert!(footer_text.contains("[Esc] Back"));
+        assert!(footer_text.contains("[f] Favorite"));
+        assert!(footer_text.contains("[i] Info"));
+        assert!(!footer_text.contains("[Esc] Back"));
     }
 
     #[test]
@@ -2329,16 +2680,19 @@ mod tests {
                             season: 1,
                             number: 1,
                             title: None,
+                            overview: None,
                         },
                         Episode {
                             season: 1,
                             number: 2,
                             title: None,
+                            overview: None,
                         },
                         Episode {
                             season: 1,
                             number: 10,
                             title: None,
+                            overview: None,
                         },
                     ],
                 }],
@@ -2351,16 +2705,19 @@ mod tests {
                         season: 1,
                         number: 1,
                         title: None,
+                        overview: None,
                     },
                     Episode {
                         season: 1,
                         number: 2,
                         title: None,
+                        overview: None,
                     },
                     Episode {
                         season: 1,
                         number: 10,
                         title: None,
+                        overview: None,
                     },
                 ],
             }],
@@ -2382,11 +2739,100 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(content.contains("EP 01"));
-        assert!(content.contains("EP 02"));
-        assert!(content.contains("EP 10"));
+        assert!(content.contains("Episode 01"));
+        assert!(content.contains("Episode 02"));
+        assert!(content.contains("Episode 10"));
         assert!(!content.contains("· ·"));
         assert!(!content.contains("·  EP"));
+    }
+    #[test]
+    fn test_episode_list_progress_and_long_title_bounded() {
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut state = AppState {
+            active_subject_id: Some("series_test".to_string()),
+            selected_details: Some(MediaDetails {
+                id: ProviderMediaId {
+                    provider: ProviderKind::MovieBox,
+                    value: "series_test".to_string(),
+                },
+                title: "Series Test".to_string(),
+                media_type: MediaType::Series,
+                year: Some("2024".to_string()),
+                description: None,
+                tagline: None,
+                imdb_rating: None,
+                director: None,
+                stars: None,
+                prints: None,
+                audios: None,
+                poster_url: None,
+                duration: None,
+                genres: vec![],
+                seasons: vec![Season {
+                    number: 1,
+                    episodes: vec![Episode {
+                        season: 1,
+                        number: 1,
+                        title: Some(
+                            "Very Long Episode Title That Exceeds Normal Pane Width Substantially"
+                                .to_string(),
+                        ),
+                        overview: None,
+                    }],
+                }],
+                dubs: vec![],
+            }),
+            available_seasons: vec![Season {
+                number: 1,
+                episodes: vec![Episode {
+                    season: 1,
+                    number: 1,
+                    title: Some(
+                        "Very Long Episode Title That Exceeds Normal Pane Width Substantially"
+                            .to_string(),
+                    ),
+                    overview: None,
+                }],
+            }],
+            available_episode_numbers: vec![vec![1]],
+            details_pane: crate::tui::state::DetailsPane::Episodes,
+            ..Default::default()
+        };
+        state.history.update_progress(
+            crate::history::WatchHistoryItem {
+                provider: "moviebox".to_string(),
+                subject_id: "series_test".to_string(),
+                title: "Series Test".to_string(),
+                cover_url: None,
+                stype: 2,
+                release_year: "2024".to_string(),
+                season: 1,
+                episode: 1,
+                timestamp: 1000,
+                duration_seconds: Some(1200),
+                progress_seconds: 600,
+                completed: false,
+                stream_filename: None,
+            },
+            600,
+            Some(1200),
+            false,
+        );
+        let theme = Theme::mocha();
+        terminal
+            .draw(|frame| {
+                draw(frame, frame.area(), &mut state, &theme);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let content = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(content.contains("Episode 01"));
+        assert!(content.contains("50%"));
     }
 
     #[test]
@@ -2505,14 +2951,14 @@ mod tests {
         };
 
         let title_wide = pane_title("Audio", 2, DetailsPane::Languages, true, &state, 40, false);
-        assert_eq!(title_wide.to_string(), " ● Audio (2)  1/2 ");
+        assert_eq!(title_wide.to_string(), " › Audio (2) ");
 
         let title_unfocused =
             pane_title("Audio", 2, DetailsPane::Languages, false, &state, 40, false);
         assert_eq!(title_unfocused.to_string(), " Audio (2) ");
 
         let title_narrow = pane_title("Audio", 2, DetailsPane::Languages, true, &state, 10, false);
-        assert_eq!(title_narrow.to_string(), " ● Audio ");
+        assert_eq!(title_narrow.to_string(), " › Audio ");
     }
     #[test]
     fn test_details_screen_renders_in_narrow_terminal_without_clipping() {
@@ -2540,7 +2986,7 @@ mod tests {
                 duration: Some("45m".to_string()),
                 seasons: vec![Season {
                     number: 1,
-                    episodes: (1..=7).map(|n| Episode { season: 1, number: n, title: None }).collect(),
+                    episodes: (1..=7).map(|n| Episode { season: 1, number: n, title: None, overview: None }).collect(),
                 }],
                 dubs: vec![
                     AudioTrackOption { subject_id: "1".to_string(), language: "Original".to_string(), label: "Original".to_string() },
@@ -2551,7 +2997,7 @@ mod tests {
             }),
             available_seasons: vec![Season {
                 number: 1,
-                episodes: (1..=7).map(|n| Episode { season: 1, number: n, title: None }).collect(),
+                episodes: (1..=7).map(|n| Episode { season: 1, number: n, title: None, overview: None }).collect(),
             }],
             available_episode_numbers: vec![vec![1, 2, 3]],
             details_pane: crate::tui::state::DetailsPane::Languages,
@@ -2610,10 +3056,60 @@ mod tests {
             ],
         };
 
+        let area = Rect::new(0, 0, 70, 24);
+        let tier = DetailsLayoutTier::for_area(area);
+        let height_with_synopsis = tier.header_height(area, Some(&details));
+        assert_eq!(height_with_synopsis, 8);
+
+        let mut details_empty = details.clone();
+        details_empty.description = None;
+        let height_empty = tier.header_height(area, Some(&details_empty));
+        assert_eq!(height_empty, 5);
+    }
+
+    #[test]
+    fn test_details_header_height_stable_with_poster_across_audio_dub_synopsis_lengths() {
+        let details_original = MediaDetails {
+            id: ProviderMediaId {
+                provider: ProviderKind::MovieBox,
+                value: "100".to_string(),
+            },
+            title: "Obsession".to_string(),
+            media_type: MediaType::Movie,
+            year: Some("2026".to_string()),
+            description: Some("After breaking the mysterious \"One Wish Willow\" to win his crush's heart, a hopeless romantic finds himself getting exactly what he asked for but soon discovers that some desires come at a dark, si...".to_string()),
+            tagline: None,
+            imdb_rating: Some("7.8".to_string()),
+            director: None,
+            stars: None,
+            prints: None,
+            audios: None,
+            poster_url: Some("https://example.com/obsession.jpg".to_string()),
+            duration: Some("1h 49m".to_string()),
+            genres: vec![],
+            seasons: vec![],
+            dubs: vec![],
+        };
+        let mut details_hindi = details_original.clone();
+        details_hindi.description = Some(
+            "A hopeless romantic's wish for his crush's love triggers a dark enchantment."
+                .to_string(),
+        );
+        details_hindi.duration = Some("1h 40m".to_string());
+
+        let mut details_empty_synopsis = details_original.clone();
+        details_empty_synopsis.description = None;
+
         let area = Rect::new(0, 0, 120, 30);
         let tier = DetailsLayoutTier::for_area(area);
-        let height = tier.header_height(area, Some(&details));
-        assert_eq!(height, 7);
+
+        let height_original = tier.header_height(area, Some(&details_original));
+        let height_hindi = tier.header_height(area, Some(&details_hindi));
+        let height_empty = tier.header_height(area, Some(&details_empty_synopsis));
+
+        assert_eq!(height_original, 8);
+        assert_eq!(height_hindi, 8);
+        assert_eq!(height_empty, 8);
     }
 
     #[test]
@@ -2675,7 +3171,8 @@ mod tests {
         assert!(content.contains("Ek Deewane Ki Deewaniyat"));
         assert!(content.contains("2025"));
         assert!(content.contains("Movie"));
-        assert!(content.contains("Audio: 2 Tracks"));
+        assert!(content.contains("Audio (2)"));
+        assert!(content.contains("Original"));
         assert!(content.contains("MovieBox"));
         assert!(content.contains("No Art"));
     }
@@ -2872,7 +3369,8 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
 
-        assert!(content.contains("Audio: 4 Tracks"));
+        assert!(content.contains("Audio (4)"));
+        assert!(!content.contains("Audio: 4 Tracks"));
         assert!(!content.contains("Audio: Original, Hindi, Spanish (LA), Portuguese (BR)"));
     }
 
@@ -2965,7 +3463,10 @@ mod tests {
                 resource_id: Some("res-1".to_string()),
             }],
             details_pane: crate::tui::state::DetailsPane::Streams,
-            show_episode_download_confirm: true,
+            show_overview_modal: true,
+            overview_modal_title: "Overview Modal".to_string(),
+            overview_modal_content: "Overview content".to_string(),
+            basic_terminal: false,
             ..Default::default()
         };
         state.language_list_state.select(Some(0));
@@ -2984,8 +3485,8 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
 
-        assert!(content.contains("Confirm Episode Download"));
-        assert!(!content.contains("● Streams"));
+        assert!(content.contains("Overview Modal"));
+        assert!(!content.contains("› Streams"));
         assert!(content.contains("Multi"));
         assert!(content.contains("Hindi"));
 
@@ -3012,5 +3513,284 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_details_empty_streams_message_dimmed_when_modal_active() {
+        let backend = ratatui::backend::TestBackend::new(120, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut state = AppState {
+            selected_details: Some(MediaDetails {
+                id: ProviderMediaId {
+                    provider: ProviderKind::MovieBox,
+                    value: "sample".to_string(),
+                },
+                title: "Sample Movie".to_string(),
+                media_type: MediaType::Movie,
+                year: Some("2024".to_string()),
+                description: Some("Synopsis".to_string()),
+                tagline: None,
+                imdb_rating: None,
+                director: None,
+                stars: None,
+                prints: None,
+                audios: None,
+                poster_url: None,
+                duration: None,
+                genres: vec![],
+                seasons: vec![],
+                dubs: vec![
+                    AudioTrackOption {
+                        subject_id: "sample".to_string(),
+                        language: "Original".to_string(),
+                        label: "Original".to_string(),
+                    },
+                    AudioTrackOption {
+                        subject_id: "sample-hi".to_string(),
+                        language: "Hindi".to_string(),
+                        label: "Hindi".to_string(),
+                    },
+                ],
+            }),
+            selected_resources: vec![],
+            language_chosen: false,
+            show_overview_modal: true,
+            overview_modal_title: "Sample Movie · Synopsis".to_string(),
+            overview_modal_content: "Overview content".to_string(),
+            basic_terminal: false,
+            ..Default::default()
+        };
+        let theme = Theme::mocha();
+
+        terminal
+            .draw(|frame| {
+                draw(frame, frame.area(), &mut state, &theme);
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let mut found_choose = false;
+        for y in 0..30 {
+            for x in 0..120 {
+                let cell = &buffer[(x, y)];
+                if cell.symbol() == "C"
+                    && x + 6 < 120
+                    && buffer[(x + 1, y)].symbol() == "h"
+                    && buffer[(x + 2, y)].symbol() == "o"
+                    && buffer[(x + 3, y)].symbol() == "o"
+                {
+                    found_choose = true;
+                    assert_eq!(
+                        cell.style().fg,
+                        theme.muted.fg,
+                        "Choose an audio track text should be muted when modal is active"
+                    );
+                }
+            }
+        }
+        assert!(
+            found_choose,
+            "Expected to find 'Choose an audio track' on screen"
+        );
+    }
+    #[test]
+    fn test_details_scrollbars_hidden_when_overview_modal_active() {
+        let backend = ratatui::backend::TestBackend::new(120, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let dubs = (0..10)
+            .map(|i| AudioTrackOption {
+                subject_id: format!("dub-{i}"),
+                language: format!("Lang {i}"),
+                label: format!("Lang {i}"),
+            })
+            .collect();
+        let mut state = AppState {
+            selected_details: Some(MediaDetails {
+                id: ProviderMediaId {
+                    provider: ProviderKind::MovieBox,
+                    value: "sample".to_string(),
+                },
+                title: "Sample Movie".to_string(),
+                media_type: MediaType::Movie,
+                year: Some("2024".to_string()),
+                description: Some("Synopsis".to_string()),
+                tagline: None,
+                imdb_rating: None,
+                director: None,
+                stars: None,
+                prints: None,
+                audios: None,
+                poster_url: None,
+                duration: None,
+                genres: vec![],
+                seasons: vec![],
+                dubs,
+            }),
+            show_overview_modal: false,
+            basic_terminal: false,
+            ..Default::default()
+        };
+        let theme = Theme::mocha();
+
+        terminal
+            .draw(|frame| {
+                draw(frame, frame.area(), &mut state, &theme);
+            })
+            .unwrap();
+
+        let buffer_without_modal = terminal.backend().buffer().clone();
+        let symbols_without_modal = buffer_without_modal
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(symbols_without_modal.contains('▲'));
+        assert!(symbols_without_modal.contains('█'));
+
+        state.show_overview_modal = true;
+        terminal
+            .draw(|frame| {
+                draw(frame, frame.area(), &mut state, &theme);
+            })
+            .unwrap();
+
+        let buffer_with_modal = terminal.backend().buffer().clone();
+        let symbols_with_modal = buffer_with_modal
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(!symbols_with_modal.contains('▲'));
+        assert!(!symbols_with_modal.contains('█'));
+    }
+
+    #[test]
+    fn test_active_overview_resolution_series_and_episodes() {
+        let mut state = AppState {
+            selected_details: Some(MediaDetails {
+                id: ProviderMediaId {
+                    provider: ProviderKind::MovieBox,
+                    value: "series_1".to_string(),
+                },
+                title: "Test Series".to_string(),
+                media_type: MediaType::Series,
+                year: Some("2024".to_string()),
+                description: Some("Full series description here.".to_string()),
+                tagline: None,
+                imdb_rating: None,
+                director: None,
+                stars: None,
+                prints: None,
+                audios: None,
+                poster_url: None,
+                duration: None,
+                genres: vec![],
+                seasons: vec![Season {
+                    number: 1,
+                    episodes: vec![
+                        Episode {
+                            season: 1,
+                            number: 1,
+                            title: Some("Pilot Episode".to_string()),
+                            overview: Some("Episode 1 overview text.".to_string()),
+                        },
+                        Episode {
+                            season: 1,
+                            number: 2,
+                            title: None,
+                            overview: None,
+                        },
+                    ],
+                }],
+                dubs: vec![],
+            }),
+            available_seasons: vec![Season {
+                number: 1,
+                episodes: vec![
+                    Episode {
+                        season: 1,
+                        number: 1,
+                        title: Some("Pilot Episode".to_string()),
+                        overview: Some("Episode 1 overview text.".to_string()),
+                    },
+                    Episode {
+                        season: 1,
+                        number: 2,
+                        title: None,
+                        overview: None,
+                    },
+                ],
+            }],
+            available_episode_numbers: vec![vec![1, 2]],
+            details_pane: crate::tui::state::DetailsPane::Languages,
+            ..Default::default()
+        };
+
+        let (series_title, series_desc) = state.active_overview().unwrap();
+        assert_eq!(series_title, "Test Series · Synopsis");
+        assert_eq!(series_desc, "Full series description here.");
+
+        state.details_pane = crate::tui::state::DetailsPane::Episodes;
+        state.episode_list_state.select(Some(0));
+
+        let (ep_title, ep_desc) = state.active_overview().unwrap();
+        assert_eq!(ep_title, "Test Series · S01E01 · Pilot Episode");
+        assert_eq!(ep_desc, "Episode 1 overview text.");
+
+        state.episode_list_state.select(Some(1));
+        let (ep2_title, ep2_desc) = state.active_overview().unwrap();
+        assert_eq!(ep2_title, "Test Series · Synopsis");
+        assert_eq!(ep2_desc, "Full series description here.");
+    }
+
+    #[test]
+    fn test_overview_modal_renders_in_details_screen() {
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut state = AppState {
+            selected_details: Some(MediaDetails {
+                id: ProviderMediaId {
+                    provider: ProviderKind::MovieBox,
+                    value: "sample".to_string(),
+                },
+                title: "Sample Movie".to_string(),
+                media_type: MediaType::Movie,
+                year: Some("2024".to_string()),
+                description: Some("Short synopsis".to_string()),
+                tagline: None,
+                imdb_rating: None,
+                director: None,
+                stars: None,
+                prints: None,
+                audios: None,
+                poster_url: None,
+                duration: None,
+                genres: vec![],
+                seasons: vec![],
+                dubs: vec![],
+            }),
+            show_overview_modal: true,
+            overview_modal_title: "Test Movie · Synopsis".to_string(),
+            overview_modal_content: "This is the complete movie summary rendered inside modal."
+                .to_string(),
+            ..Default::default()
+        };
+        let theme = Theme::mocha();
+
+        terminal
+            .draw(|frame| {
+                draw(frame, frame.area(), &mut state, &theme);
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let content = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(content.contains("Test Movie · Synopsis"));
+        assert!(content.contains("complete movie summary rendered"));
+        assert!(!content.contains("[Esc] Close"));
     }
 }

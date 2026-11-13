@@ -1,5 +1,5 @@
-use super::{App, network};
-use crate::models::{Episode, MediaType, ProviderKind, Release, Season};
+use super::App;
+use crate::models::{Episode, MediaType, ProviderKind, Season};
 use crate::tui::{
     action::Action,
     state::{InputMode, Screen, SearchResult},
@@ -37,17 +37,16 @@ impl App {
                     return None;
                 }
 
-                self.request_tasks.cancel_suggest();
                 let service = self.service.clone();
                 let sender = self.action_sender.clone();
                 let query_clone = query.clone();
-                self.request_tasks.suggest = Some(tokio::spawn(async move {
+                self.request_tasks.spawn_suggest(async move {
                     if let Ok(res) = service.suggest(&query_clone).await {
                         sender
                             .send(Action::SuggestSuccess(request_id, query_clone, res))
                             .ok();
                     }
-                }));
+                });
             }
 
             Action::SuggestSuccess(request_id, query, suggestions) => {
@@ -81,7 +80,7 @@ impl App {
                     let clean_title = if query.starts_with('/') {
                         raw_title
                     } else {
-                        crate::providers::moviebox::clean_moviebox_title(&raw_title)
+                        crate::providers::moviebox::clean_moviebox_title(&raw_title).to_string()
                     };
 
                     if query.starts_with('/') {
@@ -132,11 +131,11 @@ impl App {
                 let lower_query = query.trim().to_lowercase();
 
                 if lower_query == "/history"
-                    && (self.state.mode() == crate::tui::state::AppMode::Streaming
-                        || self.state.mode() == crate::tui::state::AppMode::Addon)
+                    && self.state.mode() == crate::tui::state::AppMode::Streaming
                 {
                     self.state.input_mode = InputMode::Normal;
                     self.state.is_loading = false;
+                    self.state.has_search_settled = true;
                     self.state.is_homepage_mode = false;
                     self.state.active_browse_preset = None;
                     self.state.browse_metrics.clear();
@@ -198,11 +197,14 @@ impl App {
                     self.load_favorites_virtual_list();
                     return None;
                 }
-
                 if self.handle_search_command(&query, &lower_query).is_some() {
                     return None;
                 }
                 if query.trim().starts_with('/') {
+                    return None;
+                }
+                if self.state.is_tv_mode {
+                    self.apply_tv_search_results(&query, &lower_query);
                     return None;
                 }
                 let context = self.prepare_search_request(&query);
@@ -255,8 +257,7 @@ impl App {
                 let manifest_url = target.manifest_url.clone();
                 let r_type = target.r#type.clone();
                 let cat_id = target.catalog_id.clone();
-
-                tokio::spawn(async move {
+                self.request_tasks.spawn_search(async move {
                     let result = service
                         .fetch_addon_catalog(&manifest_url, &r_type, &cat_id)
                         .await;
@@ -301,9 +302,8 @@ impl App {
                 self.state.search_error = None;
                 self.state.is_loading = false;
                 self.state.has_search_settled = true;
-                if page <= 1 {
-                    self.state.search_results.clear();
-                }
+                let raw_count = items.len();
+                let mut new_results = Vec::new();
 
                 for item in items {
                     let id = item.id.value.clone();
@@ -332,7 +332,7 @@ impl App {
                         self.state.search_results.iter_mut().find(|r| r.id == id)
                     {
                         if existing.title.is_empty() {
-                            existing.title = clean_title;
+                            existing.title = clean_title.to_string();
                             existing.stype = stype;
                             existing.release_year = release_year;
                             existing.cover_url = cover_url;
@@ -347,25 +347,30 @@ impl App {
                         || raw_lower.contains("[english]");
 
                     if is_dub
-                        && self
+                        && (self
                             .state
                             .search_results
                             .iter()
                             .any(|r| r.title == clean_title && r.stype == stype)
+                            || new_results
+                                .iter()
+                                .any(|r: &SearchResult| r.title == clean_title && r.stype == stype))
                     {
                         continue;
                     }
 
                     if self.state.search_results.iter().any(|r| {
                         r.title == clean_title && r.release_year == release_year && r.stype == stype
+                    }) || new_results.iter().any(|r: &SearchResult| {
+                        r.title == clean_title && r.release_year == release_year && r.stype == stype
                     }) {
                         continue;
                     }
 
                     if !id.is_empty() {
-                        self.state.search_results.push(SearchResult {
+                        new_results.push(SearchResult {
                             id,
-                            title: clean_title,
+                            title: clean_title.to_string(),
                             stype,
                             release_year,
                             cover_url,
@@ -376,6 +381,30 @@ impl App {
                     }
                 }
 
+                if new_results.is_empty() || raw_count < 15 {
+                    self.state.search_exhausted = true;
+                }
+
+                let sort_results = |results: &mut Vec<SearchResult>, q: &str| {
+                    let query_lower = q.to_lowercase();
+                    results.sort_by(|a, b| {
+                        let a_title = a.title.to_lowercase();
+                        let b_title = b.title.to_lowercase();
+
+                        let a_exact = a_title == query_lower;
+                        let b_exact = b_title == query_lower;
+
+                        let a_starts = a_title.starts_with(&query_lower);
+                        let b_starts = b_title.starts_with(&query_lower);
+
+                        b_exact
+                            .cmp(&a_exact)
+                            .then_with(|| b_starts.cmp(&a_starts))
+                            .then_with(|| b.stype.cmp(&a.stype))
+                            .then_with(|| b.release_year.cmp(&a.release_year))
+                    });
+                };
+
                 let previous_selected_id = if page > 1 {
                     self.state
                         .search_list_state
@@ -385,24 +414,13 @@ impl App {
                     None
                 };
 
-                let query_lower = query.to_lowercase();
-                self.state.search_results.sort_by(|a, b| {
-                    let a_title = a.title.to_lowercase();
-                    let b_title = b.title.to_lowercase();
-
-                    let a_exact = a_title == query_lower;
-                    let b_exact = b_title == query_lower;
-
-                    let a_starts = a_title.starts_with(&query_lower);
-                    let b_starts = b_title.starts_with(&query_lower);
-
-                    b_exact
-                        .cmp(&a_exact)
-                        .then_with(|| b_starts.cmp(&a_starts))
-                        .then_with(|| b.stype.cmp(&a.stype))
-                        .then_with(|| b.release_year.cmp(&a.release_year))
-                });
-
+                if page <= 1 {
+                    self.state.search_results = new_results;
+                    sort_results(&mut self.state.search_results, &query);
+                } else {
+                    sort_results(&mut new_results, &query);
+                    self.state.search_results.extend(new_results);
+                }
                 if let Some(prev_id) = previous_selected_id {
                     if let Some(new_idx) = self
                         .state
@@ -590,42 +608,14 @@ impl App {
                             let cover_url = channel.logo.clone();
                             if !cover_url.is_empty() {
                                 let tx = self.action_sender.clone();
-                                let client = self.service.http_client().clone();
+                                let service = self.service.clone();
                                 let id2 = id.clone();
                                 tokio::spawn(async move {
-                                    if let Ok(Some(bytes)) = tokio::task::spawn_blocking({
-                                        let id_clone = id2.clone();
-                                        move || {
-                                            crate::cache::get_namespaced_image_cache(
-                                                "iptv", &id_clone,
-                                            )
-                                        }
-                                    })
-                                    .await
+                                    if let Some(img) = service
+                                        .fetch_and_decode_cached_poster("iptv", &id2, &cover_url)
+                                        .await
                                     {
-                                        if let Some(img) = network::decode_poster(bytes).await {
-                                            tx.send(Action::SearchPosterLoaded(id2, Some(img)))
-                                                .ok();
-                                            return;
-                                        }
-                                    }
-                                    if let Some(bytes) =
-                                        network::fetch_poster_bytes(&client, &cover_url).await
-                                    {
-                                        let bytes_clone = bytes.clone();
-                                        let id_clone = id2.clone();
-                                        let _ = tokio::task::spawn_blocking(move || {
-                                            crate::cache::set_namespaced_image_cache(
-                                                "iptv",
-                                                &id_clone,
-                                                &bytes_clone,
-                                            )
-                                        })
-                                        .await;
-                                        if let Some(img) = network::decode_poster(bytes).await {
-                                            tx.send(Action::SearchPosterLoaded(id2, Some(img)))
-                                                .ok();
-                                        }
+                                        tx.send(Action::SearchPosterLoaded(id2, Some(img))).ok();
                                     }
                                 });
                             }
@@ -658,38 +648,13 @@ impl App {
                         let url = url.to_string();
                         let tx = self.action_sender.clone();
                         let id2 = id.clone();
-                        let client = self.service.http_client().clone();
+                        let service = self.service.clone();
                         tokio::spawn(async move {
-                            if let Ok(Some(bytes)) = tokio::task::spawn_blocking({
-                                let id_clone = id2.clone();
-                                move || {
-                                    crate::cache::get_namespaced_image_cache(
-                                        prov.cache_key(),
-                                        &id_clone,
-                                    )
-                                }
-                            })
-                            .await
+                            if let Some(img) = service
+                                .fetch_and_decode_cached_poster(prov.cache_key(), &id2, &url)
+                                .await
                             {
-                                if let Some(img) = network::decode_poster(bytes).await {
-                                    tx.send(Action::PosterSuccess(id2, img)).ok();
-                                    return;
-                                }
-                            }
-                            if let Some(bytes) = network::fetch_poster_bytes(&client, &url).await {
-                                let bytes_clone = bytes.clone();
-                                let id_clone = id2.clone();
-                                let _ = tokio::task::spawn_blocking(move || {
-                                    crate::cache::set_namespaced_image_cache(
-                                        prov.cache_key(),
-                                        &id_clone,
-                                        &bytes_clone,
-                                    )
-                                })
-                                .await;
-                                if let Some(img) = network::decode_poster(bytes).await {
-                                    tx.send(Action::PosterSuccess(id2, img)).ok();
-                                }
+                                tx.send(Action::PosterSuccess(id2, img)).ok();
                             }
                         });
                     }
@@ -709,7 +674,11 @@ impl App {
                     .await
                     {
                         sender
-                            .send(Action::PreviewSuccess(request_id, id_clone, cached_disk))
+                            .send(Action::PreviewSuccess(
+                                request_id,
+                                id_clone,
+                                Box::new(cached_disk),
+                            ))
                             .ok();
                         return;
                     }
@@ -725,7 +694,11 @@ impl App {
                             })
                             .await;
                             sender
-                                .send(Action::PreviewSuccess(request_id, id_clone, details))
+                                .send(Action::PreviewSuccess(
+                                    request_id,
+                                    id_clone,
+                                    Box::new(details),
+                                ))
                                 .ok();
                         }
                         Err(e) => {
@@ -760,8 +733,8 @@ impl App {
                     return None;
                 }
 
-                self.state.preview_cache.put(id.clone(), details.clone());
-                self.state.search_preview = Some(details.clone());
+                self.state.preview_cache.put(id.clone(), (*details).clone());
+                self.state.search_preview = Some((*details).clone());
                 self.state.poster_image = None;
                 self.state.poster_protocol = None;
                 if let Some(cached_img) = self.state.image_cache.get(&id) {
@@ -772,35 +745,13 @@ impl App {
                     let url_clone = url.to_string();
                     let action_tx = self.action_sender.clone();
                     let id_clone = id.clone();
-                    let http_client = self.service.http_client().clone();
+                    let service = self.service.clone();
                     tokio::spawn(async move {
-                        if let Ok(Some(bytes)) = tokio::task::spawn_blocking({
-                            let id_clone = id_clone.clone();
-                            move || crate::cache::get_namespaced_image_cache("posters", &id_clone)
-                        })
-                        .await
+                        if let Some(img) = service
+                            .fetch_and_decode_cached_poster("posters", &id_clone, &url_clone)
+                            .await
                         {
-                            if let Some(img) = network::decode_poster(bytes).await {
-                                let _ = action_tx.send(Action::PosterSuccess(id_clone, img));
-                                return;
-                            }
-                        }
-                        if let Some(bytes) =
-                            network::fetch_poster_bytes(&http_client, &url_clone).await
-                        {
-                            let bytes_clone = bytes.clone();
-                            let id_clone2 = id_clone.clone();
-                            let _ = tokio::task::spawn_blocking(move || {
-                                crate::cache::set_namespaced_image_cache(
-                                    "posters",
-                                    &id_clone2,
-                                    &bytes_clone,
-                                )
-                            })
-                            .await;
-                            if let Some(img) = network::decode_poster(bytes).await {
-                                let _ = action_tx.send(Action::PosterSuccess(id_clone, img));
-                            }
+                            let _ = action_tx.send(Action::PosterSuccess(id_clone, img));
                         }
                     });
                 }
@@ -847,11 +798,13 @@ impl App {
                     .set_status_default(format!("Preview failed: {}", err));
             }
 
-            Action::DetailsSuccess(context, request_id, id, mut details) => {
+            Action::DetailsSuccess(context, request_id, id, details) => {
+                let mut details = *details;
                 if request_id != self.state.active_details_request {
                     return None;
                 }
-                if !self.context_is_current(context) || self.state.active_screen != Screen::Details
+                if !self.details_context_is_current(context, &id)
+                    || self.state.active_screen != Screen::Details
                 {
                     return None;
                 }
@@ -859,32 +812,66 @@ impl App {
                 self.state.details_error = None;
 
                 if let Some(existing) = &self.state.selected_details {
-                    if existing.id.value == id && existing.id.provider == details.id.provider {
-                        if details.title.trim().is_empty() {
+                    let is_same_subject = existing.id.value == id
+                        || existing.dubs.iter().any(|d| d.subject_id == id)
+                        || details
+                            .dubs
+                            .iter()
+                            .any(|d| d.subject_id == existing.id.value)
+                        || crate::providers::moviebox::clean_moviebox_title(&existing.title)
+                            == crate::providers::moviebox::clean_moviebox_title(&details.title);
+
+                    if is_same_subject && existing.id.provider == details.id.provider {
+                        if details.title.trim().is_empty()
+                            || (!existing.title.trim().is_empty()
+                                && crate::providers::moviebox::clean_moviebox_title(&details.title)
+                                    == crate::providers::moviebox::clean_moviebox_title(
+                                        &existing.title,
+                                    ))
+                        {
                             details.title = existing.title.clone();
                         }
-                        if details.description.is_none() {
+                        let is_placeholder_desc = |desc: &Option<String>| {
+                            desc.as_ref().is_none_or(|d| {
+                                let trimmed = d.trim();
+                                trimmed.is_empty()
+                                    || trimmed == "N/A"
+                                    || crate::providers::moviebox::clean_moviebox_title(trimmed)
+                                        == crate::providers::moviebox::clean_moviebox_title(
+                                            &details.title,
+                                        )
+                            })
+                        };
+                        if is_placeholder_desc(&details.description)
+                            && !is_placeholder_desc(&existing.description)
+                        {
                             details.description = existing.description.clone();
                         }
                         if details.poster_url.is_none() {
                             details.poster_url = existing.poster_url.clone();
                         }
-                        if details.year.is_none() {
+                        if details.year.is_none() || details.year.as_deref() == Some("N/A") {
                             details.year = existing.year.clone();
                         }
-                        if details.duration.is_none() {
+                        if details.duration.is_none()
+                            || details.duration.as_deref() == Some("N/A")
+                            || details.duration.as_deref() == Some("")
+                        {
                             details.duration = existing.duration.clone();
                         }
                         if details.genres.is_empty() {
                             details.genres = existing.genres.clone();
                         }
-                        if details.imdb_rating.is_none() {
+                        if details.imdb_rating.is_none()
+                            || details.imdb_rating.as_deref() == Some("N/A")
+                        {
                             details.imdb_rating = existing.imdb_rating.clone();
                         }
-                        if details.director.is_none() {
+                        if details.director.is_none() || details.director.as_deref() == Some("N/A")
+                        {
                             details.director = existing.director.clone();
                         }
-                        if details.stars.is_none() {
+                        if details.stars.is_none() || details.stars.as_deref() == Some("N/A") {
                             details.stars = existing.stars.clone();
                         }
                         if details.dubs.is_empty() {
@@ -893,11 +880,16 @@ impl App {
                     }
                 }
 
-                if let Some(res) = self.state.search_results.iter().find(|r| r.id == id) {
+                if let Some(res) = self.state.search_results.iter().find(|r| {
+                    r.id == id
+                        || details.dubs.iter().any(|d| d.subject_id == r.id)
+                        || crate::providers::moviebox::clean_moviebox_title(&r.title)
+                            == crate::providers::moviebox::clean_moviebox_title(&details.title)
+                }) {
                     if details.title.trim().is_empty() {
                         details.title = res.title.clone();
                     }
-                    if details.year.is_none() {
+                    if details.year.is_none() || details.year.as_deref() == Some("N/A") {
                         details.year = Some(res.release_year.clone());
                     }
                     if details.poster_url.is_none() {
@@ -922,41 +914,15 @@ impl App {
                             let url_clone = url.to_string();
                             let action_tx = self.action_sender.clone();
                             let id_clone = id.clone();
-                            let http_client = self.service.http_client().clone();
+                            let service = self.service.clone();
                             tokio::spawn(async move {
-                                if let Ok(Some(bytes)) = tokio::task::spawn_blocking({
-                                    let id_clone = id_clone.clone();
-                                    move || {
-                                        crate::cache::get_namespaced_image_cache(
-                                            "posters", &id_clone,
-                                        )
-                                    }
-                                })
-                                .await
+                                if let Some(img) = service
+                                    .fetch_and_decode_cached_poster(
+                                        "posters", &id_clone, &url_clone,
+                                    )
+                                    .await
                                 {
-                                    if let Some(img) = network::decode_poster(bytes).await {
-                                        let _ =
-                                            action_tx.send(Action::PosterSuccess(id_clone, img));
-                                        return;
-                                    }
-                                }
-                                if let Some(bytes) =
-                                    network::fetch_poster_bytes(&http_client, &url_clone).await
-                                {
-                                    let bytes_clone = bytes.clone();
-                                    let id_clone2 = id_clone.clone();
-                                    let _ = tokio::task::spawn_blocking(move || {
-                                        crate::cache::set_namespaced_image_cache(
-                                            "posters",
-                                            &id_clone2,
-                                            &bytes_clone,
-                                        );
-                                    })
-                                    .await;
-                                    if let Some(img) = network::decode_poster(bytes).await {
-                                        let _ =
-                                            action_tx.send(Action::PosterSuccess(id_clone, img));
-                                    }
+                                    let _ = action_tx.send(Action::PosterSuccess(id_clone, img));
                                 }
                             });
                         }
@@ -972,6 +938,7 @@ impl App {
                             season: 1,
                             number: 1,
                             title: None,
+                            overview: None,
                         }],
                     }];
                 } else {
@@ -1090,8 +1057,7 @@ impl App {
                 {
                     self.state.details_pane = crate::tui::state::DetailsPane::Languages;
                     self.state.is_loading = false;
-                    self.state
-                        .set_status_default("Please select a language dubbing.");
+                    self.state.set_status_default("Select a language dubbing.");
                 } else {
                     if !self.state.language_chosen {
                         if details.is_series() && !self.state.available_seasons.is_empty() {
@@ -1113,7 +1079,8 @@ impl App {
                     return None;
                 }
                 self.state.auto_play_on_ready = false;
-                if !self.context_is_current(context) {
+                let current_id = self.state.active_subject_id.clone().unwrap_or_default();
+                if !self.details_context_is_current(context, &current_id) {
                     return None;
                 }
                 log::error!(
@@ -1158,16 +1125,16 @@ impl App {
                                     let url_clone = url.to_string();
                                     let action_tx = self.action_sender.clone();
                                     let id_clone = id.clone();
-                                    let http_client = self.service.http_client().clone();
+                                    let service = self.service.clone();
                                     tokio::spawn(async move {
-                                        if let Some(bytes) =
-                                            network::fetch_poster_bytes(&http_client, &url_clone)
-                                                .await
+                                        if let Some(img) = service
+                                            .fetch_and_decode_cached_poster(
+                                                "posters", &id_clone, &url_clone,
+                                            )
+                                            .await
                                         {
-                                            if let Some(img) = network::decode_poster(bytes).await {
-                                                let _ = action_tx
-                                                    .send(Action::PosterSuccess(id_clone, img));
-                                            }
+                                            let _ = action_tx
+                                                .send(Action::PosterSuccess(id_clone, img));
                                         }
                                     });
                                 }
@@ -1184,24 +1151,10 @@ impl App {
                 self.state.is_fetching_streams = true;
                 self.state.has_streams_settled = false;
                 self.state.stream_error = None;
-                if self.provider_for_subject(&subject_id) != ProviderKind::MovieBox {
-                    self.state
-                        .stream_pool
-                        .insert(subject_id.clone(), Default::default());
-                    self.trigger_episode_fetch();
-                    return None;
-                }
-                let service = self.service.clone();
-                let sender = self.action_sender.clone();
-                tokio::spawn(async move {
-                    let resolutions = service
-                        .fetch_collection_resolutions(&subject_id)
-                        .await
-                        .unwrap_or_default();
-                    sender
-                        .send(Action::StreamPoolInitialized(subject_id, resolutions))
-                        .ok();
-                });
+                self.request_tasks.cancel_stream_pool_init();
+                self.action_sender
+                    .send(Action::StreamPoolInitialized(subject_id, Vec::new()))
+                    .ok();
             }
 
             Action::StreamPoolInitialized(subject_id, resolutions) => {
@@ -1319,17 +1272,17 @@ impl App {
                 if context.provider == ProviderKind::Addons {
                     let sender = self.action_sender.clone();
                     let client = self.service.addon_client.clone();
-                    let addons = crate::config::load_addons();
+                    let addons = self.state.installed_addons.clone();
                     let id = subject_id.clone();
                     let is_series = self
                         .state
                         .selected_details
                         .as_ref()
                         .map(|d| d.is_series())
-                        .unwrap_or(season > 0);
+                        .unwrap_or_else(|| id.starts_with("series:") || season > 0 || episode > 0);
 
                     let has_stream_addons = addons.iter().any(|a| a.enabled && a.provides_stream);
-                    tokio::spawn(async move {
+                    self.request_tasks.spawn_streams(async move {
                         if !has_stream_addons {
                             sender
                                 .send(Action::EpisodeStreamsFailed(
@@ -1338,7 +1291,7 @@ impl App {
                                     id,
                                     season,
                                     episode,
-                                    "No streaming addons are currently installed or enabled.\nOpen /settings to install/enable a stream provider.".into(),
+                                    "No stream addons enabled. Install via /config.".into(),
                                 ))
                                 .ok();
                             return;
@@ -1351,10 +1304,12 @@ impl App {
                             .await;
 
                         if !blocked_addons.is_empty() {
-                            sender.send(Action::SetStatus(format!(
-                                "Warning: {} streams blocked (raw torrents). Only HTTP streams are supported.",
-                                blocked_addons.join(", ")
-                            ))).ok();
+                            sender
+                                .send(Action::SetStatus(format!(
+                                    "Warning: Blocked {} torrent streams. HTTP only.",
+                                    blocked_addons.join(", ")
+                                )))
+                                .ok();
                         }
 
                         if !releases.is_empty() {
@@ -1384,7 +1339,7 @@ impl App {
                                     id,
                                     season,
                                     episode,
-                                    "No HTTP streams found from active addons for this title.\nPress r to retry or install additional stream addons via /config.".into(),
+                                    "No streams found. Press 'r' to retry.".into(),
                                 ))
                                 .ok();
                         }
@@ -1392,13 +1347,17 @@ impl App {
                     return None;
                 }
 
-                if context.provider == ProviderKind::FourKHdHub || context.provider.is_bdix() {
+                if context.provider == ProviderKind::FourKHdHub
+                    || context.provider == ProviderKind::Dramachi
+                    || context.provider.is_bdix()
+                {
                     let sender = self.action_sender.clone();
                     let fourk_client = self.service.fourk_client.clone();
+                    let dramachi_client = self.service.dramachi_client.clone();
                     let circleftp_client = self.service.circleftp_client.clone();
                     let dhakaflix_client = self.service.dhakaflix_client.clone();
                     let id = subject_id.clone();
-                    tokio::spawn(async move {
+                    self.request_tasks.spawn_streams(async move {
                         let result = match context.provider {
                             ProviderKind::FourKHdHub => {
                                 if let Some(client) = fourk_client.as_ref() {
@@ -1411,6 +1370,15 @@ impl App {
                                         "4KHDHub provider is unavailable".to_string(),
                                     ))
                                 }
+                            }
+                            ProviderKind::Dramachi => {
+                                crate::providers::ReleaseProvider::episode_streams(
+                                    &dramachi_client,
+                                    &id,
+                                    season,
+                                    episode,
+                                )
+                                .await
                             }
                             ProviderKind::BdixCircleFtp => {
                                 crate::providers::ReleaseProvider::episode_streams(
@@ -1488,214 +1456,52 @@ impl App {
                     .or_default();
                 if !force_refresh {
                     if let Some(cached) = pool.episode_index.get(&(season, episode)) {
-                        let sender = self.action_sender.clone();
-                        let cached = cached.clone();
-                        let cached_subject_id = subject_id.clone();
-                        tokio::spawn(async move {
-                            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-                            sender
-                                .send(Action::EpisodeStreamsReady(
-                                    context,
-                                    request_id,
-                                    cached_subject_id,
-                                    season,
-                                    episode,
-                                    cached,
-                                ))
-                                .ok();
-                        });
+                        self.request_tasks.cancel_streams();
+                        self.action_sender
+                            .send(Action::EpisodeStreamsReady(
+                                context,
+                                request_id,
+                                subject_id.clone(),
+                                season,
+                                episode,
+                                cached.clone(),
+                            ))
+                            .ok();
                         return None;
                     }
                 }
 
-                let mut absolute_episode = 0;
-                for s_val in &self.state.available_seasons {
-                    if s_val.number < season {
-                        absolute_episode += s_val.episodes.len().max(1);
-                    }
-                }
-                absolute_episode += episode.saturating_sub(1);
-                let estimated_page = (absolute_episode / 20) + 1;
-
                 let client = self.service.client.clone();
                 let sender = self.action_sender.clone();
-                let cancel_token = self.state.fetch_cancel.clone();
                 let id_clone = subject_id.clone();
-                let resolutions = pool.available_resolutions.clone();
-                let is_movie = season == 0 && episode == 0;
 
-                self.request_tasks.cancel_streams();
-                self.request_tasks.streams = Some(tokio::spawn(async move {
-                    sender
-                        .send(Action::SetStatus("Fetching streams...".to_string()))
-                        .ok();
-
-                    if let Ok(streams) = crate::providers::ReleaseProvider::episode_streams(
+                self.request_tasks.spawn_streams(async move {
+                    match crate::providers::ReleaseProvider::episode_streams(
                         &client, &id_clone, season, episode,
                     )
                     .await
                     {
-                        if !streams.is_empty() {
+                        Ok(streams) => {
                             sender
                                 .send(Action::EpisodeStreamsReady(
                                     context, request_id, id_clone, season, episode, streams,
                                 ))
                                 .ok();
-                            return;
+                        }
+                        Err(err) => {
+                            sender
+                                .send(Action::EpisodeStreamsFailed(
+                                    context,
+                                    request_id,
+                                    id_clone,
+                                    season,
+                                    episode,
+                                    err.to_string(),
+                                ))
+                                .ok();
                         }
                     }
-
-                    let mut all_items: Vec<Release> = Vec::new();
-                    let mut found_target = false;
-                    let mut any_fetch_failed = false;
-
-                    if is_movie {
-                        let mut page = 1usize;
-                        loop {
-                            if cancel_token.load(std::sync::atomic::Ordering::Relaxed) {
-                                break;
-                            }
-                            match tokio::time::timeout(
-                                std::time::Duration::from_secs(15),
-                                client.fetch_resource_page(&id_clone, 0, page),
-                            )
-                            .await
-                            {
-                                Ok(Ok((items, pager))) => {
-                                    let has_more = pager
-                                        .get("hasMore")
-                                        .and_then(|v| v.as_bool())
-                                        .unwrap_or(false);
-                                    for item in items {
-                                        all_items.push(
-                                            crate::providers::moviebox::adapt::moviebox_resource_item_to_release(
-                                                &item,
-                                            ),
-                                        );
-                                    }
-                                    if !has_more {
-                                        break;
-                                    }
-                                    page += 1;
-                                    if page > 10 {
-                                        break;
-                                    }
-                                }
-                                _ => {
-                                    any_fetch_failed = true;
-                                    break;
-                                }
-                            }
-                        }
-                    } else {
-                        let concurrency_limit = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
-                        let mut page = estimated_page;
-                        'outer: loop {
-                            if cancel_token.load(std::sync::atomic::Ordering::Relaxed) {
-                                break 'outer;
-                            }
-                            let mut page_handles = Vec::new();
-
-                            let res_to_fetch = if resolutions.is_empty() {
-                                vec![0]
-                            } else {
-                                resolutions.clone()
-                            };
-
-                            for &res in &res_to_fetch {
-                                let c = client.clone();
-                                let id = id_clone.clone();
-                                let ct = cancel_token.clone();
-                                let permit = concurrency_limit.clone();
-                                page_handles.push(tokio::spawn(async move {
-                                    let _permit = permit.acquire_owned().await.ok();
-                                    if ct.load(std::sync::atomic::Ordering::Relaxed) {
-                                        return (Vec::new(), serde_json::json!({}), false);
-                                    }
-                                    match tokio::time::timeout(
-                                        std::time::Duration::from_secs(15),
-                                        c.fetch_resource_page(&id, res, page),
-                                    )
-                                    .await
-                                    {
-                                        Ok(Ok((items, pager))) => (items, pager, true),
-                                        _ => (Vec::new(), serde_json::json!({}), false),
-                                    }
-                                }));
-                            }
-
-                            let mut page_empty = true;
-                            let mut has_more = false;
-                            for handle in page_handles {
-                                if let Ok((items, pager, ok)) = handle.await {
-                                    if !ok {
-                                        any_fetch_failed = true;
-                                    }
-                                    if !items.is_empty() {
-                                        page_empty = false;
-                                    }
-                                    if pager
-                                        .get("hasMore")
-                                        .and_then(|v| v.as_bool())
-                                        .unwrap_or(false)
-                                    {
-                                        has_more = true;
-                                    }
-                                    for item in items {
-                                        let release =
-                                            crate::providers::moviebox::adapt::moviebox_resource_item_to_release(
-                                                &item,
-                                            );
-                                        if release.season == Some(season)
-                                            && release.episode == Some(episode)
-                                        {
-                                            found_target = true;
-                                        }
-                                        all_items.push(release);
-                                    }
-                                }
-                            }
-
-                            if found_target || page_empty || !has_more {
-                                break 'outer;
-                            }
-                            page += 1;
-                            if page > 60 {
-                                break;
-                            }
-                        }
-                    }
-
-                    let target_ok = if is_movie {
-                        !all_items.is_empty()
-                    } else {
-                        found_target
-                    };
-
-                    if !target_ok || all_items.is_empty() {
-                        let provider_name = context.provider.label();
-                        let err_msg = if any_fetch_failed && all_items.is_empty() {
-                            format!("Network connection failed to {provider_name}")
-                        } else if any_fetch_failed {
-                            format!("Rate limited by {provider_name}")
-                        } else if all_items.is_empty() {
-                            format!("No stream sources available on {provider_name}")
-                        } else {
-                            format!("Episode S{season}E{episode} is not listed on {provider_name}")
-                        };
-                        sender
-                            .send(Action::EpisodeStreamsFailed(
-                                context, request_id, id_clone, season, episode, err_msg,
-                            ))
-                            .ok();
-                    } else {
-                        sender
-                            .send(Action::EpisodeStreamsReady(
-                                context, request_id, id_clone, season, episode, all_items,
-                            ))
-                            .ok();
-                    }
-                }));
+                });
             }
 
             Action::EpisodeStreamsReady(
@@ -1709,7 +1515,7 @@ impl App {
                 if request_id != self.state.active_resource_request {
                     return None;
                 }
-                if !self.context_is_current(context)
+                if !self.details_context_is_current(context, &subject_id)
                     || Some(&subject_id) != self.state.active_subject_id.as_ref()
                 {
                     return None;
@@ -1751,12 +1557,19 @@ impl App {
                             let mut exists = false;
                             for i in entry.iter_mut() {
                                 let i_link = i.direct_url().unwrap_or("");
-                                let base_link = link.split('?').next().unwrap_or(link);
-                                let i_base_link = i_link.split('?').next().unwrap_or(i_link);
+                                let same_url = if context.provider == ProviderKind::MovieBox {
+                                    let base_link = link.split('?').next().unwrap_or(link);
+                                    let i_base_link = i_link.split('?').next().unwrap_or(i_link);
+                                    !base_link.is_empty()
+                                        && base_link == i_base_link
+                                        && item.quality == i.quality
+                                } else {
+                                    !link.is_empty() && link == i_link
+                                };
+                                let same_filename =
+                                    !item.filename.is_empty() && item.filename == i.filename;
 
-                                if (!base_link.is_empty() && base_link == i_base_link)
-                                    || (!item.filename.is_empty() && item.filename == i.filename)
-                                {
+                                if same_url || same_filename {
                                     if !item.mirrors.is_empty() && i.mirrors.is_empty() {
                                         i.mirrors = item.mirrors.clone();
                                     }
@@ -1815,9 +1628,37 @@ impl App {
                 self.state.is_fetching_streams = false;
                 self.state.has_streams_settled = true;
                 self.state.stream_error = None;
-                self.state
-                    .resource_list_state
-                    .select(if count > 0 { Some(0) } else { None });
+                let preferred_stream_idx = if count > 0 {
+                    let saved_stream = self
+                        .state
+                        .active_subject_id
+                        .as_deref()
+                        .and_then(|sid| {
+                            self.state.history.get_item(
+                                context.provider.cache_key(),
+                                sid,
+                                target_se,
+                                target_ep,
+                                self.state
+                                    .selected_details
+                                    .as_ref()
+                                    .map(|d| d.title.as_str()),
+                            )
+                        })
+                        .and_then(|item| item.stream_filename.as_deref());
+                    if let Some(target_file) = saved_stream {
+                        self.state
+                            .selected_resources
+                            .iter()
+                            .position(|r| r.filename == target_file)
+                            .or(Some(0))
+                    } else {
+                        Some(0)
+                    }
+                } else {
+                    None
+                };
+                self.state.resource_list_state.select(preferred_stream_idx);
                 self.state
                     .set_status_default(format!("{} streams available.", count));
 
@@ -1834,41 +1675,14 @@ impl App {
                             .state
                             .selected_details
                             .as_ref()
-                            .map(|d| {
-                                let mut ids = vec![d.id.value.clone()];
-                                ids.extend(d.dubs.iter().map(|dub| dub.subject_id.clone()));
-                                ids.retain(|s| !s.is_empty());
-                                ids.sort();
-                                ids.dedup();
-                                ids
-                            })
+                            .map(|d| d.sibling_ids())
                             .unwrap_or_default();
+                        let season = self.state.selected_season;
+                        let episode = self.state.selected_episode;
                         tokio::spawn(async move {
-                            let already_cached = tokio::task::spawn_blocking({
-                                let subject_id = subject_id.clone();
-                                let rid = rid.clone();
-                                move || {
-                                    crate::cache::get_captions_cache_typed(&subject_id, &rid)
-                                        .is_some()
-                                }
-                            })
-                            .await
-                            .unwrap_or(false);
-
-                            if !already_cached {
-                                if let Ok(res) = service
-                                    .get_ext_captions(&subject_id, &rid, &sibling_ids)
-                                    .await
-                                {
-                                    tokio::task::spawn_blocking(move || {
-                                        crate::cache::set_captions_cache_typed(
-                                            &subject_id,
-                                            &rid,
-                                            &res,
-                                        );
-                                    });
-                                }
-                            }
+                            let _ = service
+                                .get_ext_captions(&subject_id, &rid, &sibling_ids, season, episode)
+                                .await;
                         });
                     }
                 }
@@ -1896,10 +1710,18 @@ impl App {
                                     ids
                                 })
                                 .unwrap_or_default();
+                            let season = self.state.selected_season;
+                            let episode = self.state.selected_episode;
 
-                            tokio::spawn(async move {
+                            self.request_tasks.spawn_playback_resolve(async move {
                                 if let Ok(res) = service
-                                    .get_ext_captions(&subject_id, &rid, &sibling_ids)
+                                    .get_ext_captions(
+                                        &subject_id,
+                                        &rid,
+                                        &sibling_ids,
+                                        season,
+                                        episode,
+                                    )
                                     .await
                                 {
                                     if pref.is_none() {
@@ -1940,7 +1762,7 @@ impl App {
                 if request_id != self.state.active_resource_request {
                     return None;
                 }
-                if !self.context_is_current(context)
+                if !self.details_context_is_current(context, &subject_id)
                     || Some(&subject_id) != self.state.active_subject_id.as_ref()
                 {
                     return None;
@@ -1951,26 +1773,363 @@ impl App {
                     return None;
                 }
                 self.state.auto_play_on_ready = false;
+                self.state.is_waiting_for_download_stream = false;
+                self.state.download_queue.clear();
+                self.state.download_queue_total = 0;
+                self.state.season_subtitle_preference = None;
                 self.state.is_loading = false;
                 self.state.is_fetching_streams = false;
                 self.state.has_streams_settled = true;
                 self.state.selected_resources.clear();
                 self.state.resource_list_state.select(None);
-                self.state.stream_error = Some(err.clone());
                 log::error!(
                     "episode streams failed ({} s{}e{}): {err}",
                     context.provider.cache_key(),
                     target_se,
                     target_ep
                 );
+                let clean_err = if err.contains("No stream sources") {
+                    format!("No streams available on {}.", context.provider.label())
+                } else if let Some(stripped) =
+                    err.strip_prefix("Provider is temporarily unavailable: ")
+                {
+                    stripped.to_string()
+                } else {
+                    err
+                };
+                self.state.stream_error = Some(clean_err.clone());
                 self.state.notify(
                     crate::tui::overlay::NotificationKind::Error,
                     "Streams Failed",
-                    err,
+                    clean_err,
                 );
             }
             _ => return None,
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::providers::models::{ProviderKind, Release, SourceMirror};
+    use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn test_fourkhdhub_releases_not_collapsed_by_query_id() {
+        let mut app = App::new();
+        let subject_id = "/obsession-movie-7327/".to_string();
+        app.state.active_subject_id = Some(subject_id.clone());
+        app.state.active_provider = ProviderKind::FourKHdHub;
+        app.state.selected_season = 0;
+        app.state.selected_episode = 0;
+        app.state.stream_pool.insert(
+            subject_id.clone(),
+            crate::tui::state::SubjectStreamPool {
+                episode_index: HashMap::new(),
+                available_resolutions: Vec::new(),
+                ..Default::default()
+            },
+        );
+
+        let raw_list = vec![
+            Release {
+                provider: ProviderKind::FourKHdHub,
+                filename: "Obsession (2025) 2160p UHD BluRay REMUX".into(),
+                quality: Some("2160p".into()),
+                codec: Some("HEVC".into()),
+                language: None,
+                size_bytes: Some(50_000_000_000),
+                season: None,
+                episode: None,
+                mirrors: vec![SourceMirror {
+                    label: "Download HubCloud".into(),
+                    resolver_url: "https://greenmotors.club/?id=id1".into(),
+                    headers: vec![],
+                    direct_file: false,
+                }],
+                resource_id: None,
+            },
+            Release {
+                provider: ProviderKind::FourKHdHub,
+                filename: "Obsession (2025) 1080p BluRay REMUX AVC".into(),
+                quality: Some("1080p".into()),
+                codec: Some("AVC".into()),
+                language: None,
+                size_bytes: Some(25_000_000_000),
+                season: None,
+                episode: None,
+                mirrors: vec![SourceMirror {
+                    label: "Download HubCloud".into(),
+                    resolver_url: "https://greenmotors.club/?id=id2".into(),
+                    headers: vec![],
+                    direct_file: false,
+                }],
+                resource_id: None,
+            },
+        ];
+
+        let context = app.request_context();
+        app.handle_requests(Action::EpisodeStreamsReady(
+            context,
+            app.state.active_resource_request,
+            subject_id,
+            0,
+            0,
+            raw_list,
+        ))
+        .await;
+
+        assert_eq!(app.state.selected_resources.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_details_success_preserves_rich_metadata_across_dub_switch() {
+        use crate::providers::models::{
+            AudioTrackOption, MediaDetails, MediaType, ProviderMediaId,
+        };
+
+        let mut app = App::new();
+        app.state.active_screen = crate::tui::state::Screen::Details;
+        let original_id = "100".to_string();
+        let dub_id = "200".to_string();
+
+        app.state.selected_details = Some(MediaDetails {
+            id: ProviderMediaId {
+                provider: ProviderKind::MovieBox,
+                value: original_id.clone(),
+            },
+            title: "Ek Deewane Ki Deewaniyat".to_string(),
+            media_type: MediaType::Movie,
+            year: Some("2025".to_string()),
+            description: Some(
+                "When a powerful politician falls for a strong-willed superstar...".to_string(),
+            ),
+            tagline: None,
+            imdb_rating: Some("4.7".to_string()),
+            director: Some("Director Name".to_string()),
+            stars: Some("Actor One, Actor Two".to_string()),
+            prints: None,
+            audios: None,
+            poster_url: Some("https://example.com/poster.jpg".to_string()),
+            duration: Some("2h 20m".to_string()),
+            genres: vec!["Romance".to_string(), "Drama".to_string()],
+            seasons: vec![],
+            dubs: vec![
+                AudioTrackOption {
+                    subject_id: original_id.clone(),
+                    language: "Original".to_string(),
+                    label: "Original".to_string(),
+                },
+                AudioTrackOption {
+                    subject_id: dub_id.clone(),
+                    language: "Hindi".to_string(),
+                    label: "Hindi".to_string(),
+                },
+            ],
+        });
+
+        let dub_details = Box::new(MediaDetails {
+            id: ProviderMediaId {
+                provider: ProviderKind::MovieBox,
+                value: dub_id.clone(),
+            },
+            title: "Ek Deewane Ki Deewaniyat [Hindi]".to_string(),
+            media_type: MediaType::Movie,
+            year: Some("2025".to_string()),
+            description: Some("Ek Deewane Ki Deewaniyat".to_string()),
+            tagline: None,
+            imdb_rating: Some("4.7".to_string()),
+            director: None,
+            stars: None,
+            prints: None,
+            audios: None,
+            poster_url: None,
+            duration: None,
+            genres: vec![],
+            seasons: vec![],
+            dubs: vec![],
+        });
+
+        let context = app.request_context();
+        let request_id = app.state.active_details_request;
+        app.handle_requests(Action::DetailsSuccess(
+            context,
+            request_id,
+            dub_id,
+            dub_details,
+        ))
+        .await;
+
+        let details = app.state.selected_details.as_ref().unwrap();
+        assert_eq!(details.duration.as_deref(), Some("2h 20m"));
+        assert_eq!(
+            details.description.as_deref(),
+            Some("When a powerful politician falls for a strong-willed superstar...")
+        );
+        assert_eq!(details.title, "Ek Deewane Ki Deewaniyat");
+        assert_eq!(details.genres, vec!["Romance", "Drama"]);
+        assert_eq!(details.director.as_deref(), Some("Director Name"));
+        assert_eq!(details.stars.as_deref(), Some("Actor One, Actor Two"));
+        assert_eq!(details.dubs.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_search_success_preserves_page_1_order_and_sets_exhausted() {
+        let mut app = App::new();
+        app.state.search_query.set_content("deewaniyat");
+        let context = app.request_context();
+        let request_id = app.state.active_search_request;
+        let page1_items = vec![
+            crate::providers::models::CatalogItem {
+                id: crate::providers::models::ProviderMediaId {
+                    value: "1".into(),
+                    provider: ProviderKind::MovieBox,
+                },
+                title: "Deewaniyat".into(),
+                media_type: crate::models::MediaType::Series,
+                year: Some("2024".into()),
+                poster_url: None,
+                season_count: None,
+            },
+            crate::providers::models::CatalogItem {
+                id: crate::providers::models::ProviderMediaId {
+                    value: "2".into(),
+                    provider: ProviderKind::MovieBox,
+                },
+                title: "Ek Deewane Ki Deewaniyat".into(),
+                media_type: crate::models::MediaType::Movie,
+                year: Some("2025".into()),
+                poster_url: None,
+                season_count: None,
+            },
+        ];
+
+        app.handle_requests(Action::SearchSuccess {
+            context,
+            request_id,
+            query: "deewaniyat".into(),
+            page: 1,
+            items: page1_items,
+        })
+        .await;
+
+        assert_eq!(app.state.search_results.len(), 2);
+        assert_eq!(app.state.search_results[0].title, "Deewaniyat");
+        assert_eq!(
+            app.state.search_results[1].title,
+            "Ek Deewane Ki Deewaniyat"
+        );
+        assert!(app.state.search_exhausted);
+
+        app.handle_requests(Action::SearchSuccess {
+            context,
+            request_id,
+            query: "deewaniyat".into(),
+            page: 2,
+            items: vec![],
+        })
+        .await;
+
+        assert_eq!(app.state.search_results.len(), 2);
+        assert!(app.state.search_exhausted);
+    }
+
+    #[tokio::test]
+    async fn test_episode_streams_auto_selects_saved_stream_filename() {
+        let mut app = App::new();
+        app.state.active_provider = ProviderKind::FourKHdHub;
+        let context = app.request_context();
+        app.state.active_subject_id = Some("dune-2021".to_string());
+        app.state.selected_details = Some(crate::providers::models::MediaDetails {
+            id: crate::providers::models::ProviderMediaId {
+                provider: ProviderKind::FourKHdHub,
+                value: "dune-2021".to_string(),
+            },
+            title: "Dune".to_string(),
+            media_type: crate::models::MediaType::Movie,
+            year: Some("2021".to_string()),
+            description: None,
+            tagline: None,
+            imdb_rating: None,
+            director: None,
+            stars: None,
+            prints: None,
+            audios: None,
+            poster_url: None,
+            duration: None,
+            genres: vec![],
+            seasons: vec![],
+            dubs: vec![],
+        });
+
+        let hist = crate::history::WatchHistoryItem {
+            provider: "4khdhub".to_string(),
+            subject_id: "dune-2021".to_string(),
+            title: "Dune".to_string(),
+            cover_url: None,
+            stype: 1,
+            release_year: "2021".to_string(),
+            season: 1,
+            episode: 1,
+            timestamp: 1000,
+            duration_seconds: Some(7200),
+            progress_seconds: 1500,
+            completed: false,
+            stream_filename: Some("Dune.1080p.mkv".to_string()),
+        };
+        app.state.history.recent.push(hist);
+
+        let streams = vec![
+            Release {
+                provider: ProviderKind::FourKHdHub,
+                filename: "Dune.2160p.mkv".to_string(),
+                quality: Some("2160p".to_string()),
+                codec: Some("hevc".to_string()),
+                language: None,
+                size_bytes: Some(15000000000),
+                season: None,
+                episode: None,
+                mirrors: vec![],
+                resource_id: None,
+            },
+            Release {
+                provider: ProviderKind::FourKHdHub,
+                filename: "Dune.1080p.mkv".to_string(),
+                quality: Some("1080p".to_string()),
+                codec: Some("hevc".to_string()),
+                language: None,
+                size_bytes: Some(3000000000),
+                season: None,
+                episode: None,
+                mirrors: vec![],
+                resource_id: None,
+            },
+            Release {
+                provider: ProviderKind::FourKHdHub,
+                filename: "Dune.720p.mkv".to_string(),
+                quality: Some("720p".to_string()),
+                codec: Some("h264".to_string()),
+                language: None,
+                size_bytes: Some(1000000000),
+                season: None,
+                episode: None,
+                mirrors: vec![],
+                resource_id: None,
+            },
+        ];
+
+        app.handle_requests(Action::EpisodeStreamsReady(
+            context,
+            0,
+            "dune-2021".to_string(),
+            1,
+            1,
+            streams,
+        ))
+        .await;
+
+        assert_eq!(app.state.resource_list_state.selected(), Some(1));
     }
 }

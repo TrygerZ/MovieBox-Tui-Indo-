@@ -1,9 +1,11 @@
 use super::{hubcloud, parser};
-use crate::providers::models::{CatalogItem, MediaDetails, PlaybackSource, ProviderKind, Release};
+use crate::providers::models::{
+    CatalogItem, MediaDetails, PlaybackSource, ProviderKind, Release, ResolutionIntent,
+};
 use reqwest::Url;
 
 const DEFAULT_BASE_URL: &str = "https://4khdhub.one/";
-const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+const BROWSER_UA: &str = crate::net::DEFAULT_BROWSER_USER_AGENT;
 
 #[derive(thiserror::Error, Debug)]
 pub enum FourKHdHubError {
@@ -16,11 +18,49 @@ pub enum FourKHdHubError {
     #[error("no playable mirrors: {0}")]
     NoPlayableMirror(String),
 }
+impl FourKHdHubError {
+    pub fn user_message(&self) -> &'static str {
+        match self {
+            Self::Network(err) => {
+                if err.is_timeout() {
+                    "4KHDHub timed out."
+                } else if let Some(status) = err.status() {
+                    match status.as_u16() {
+                        403 => "4KHDHub blocked (HTTP 403).",
+                        404 => "4KHDHub page not found (HTTP 404).",
+                        429 => "4KHDHub rate limited (HTTP 429).",
+                        500..=599 => "4KHDHub server error.",
+                        _ => "Cannot reach 4KHDHub.",
+                    }
+                } else {
+                    "Cannot reach 4KHDHub."
+                }
+            }
+            Self::InvalidUrl(_) => "Invalid 4KHDHub URL.",
+            Self::Parse(_) => "4KHDHub parse error.",
+            Self::NoPlayableMirror(reason) => {
+                let lower = reason.to_ascii_lowercase();
+                if lower.contains("timed out") || lower.contains("timeout") {
+                    "4KHDHub mirror probe timed out."
+                } else if lower.contains("quota") {
+                    "4KHDHub mirror quota exceeded."
+                } else if lower.contains("expired") {
+                    "4KHDHub mirror link expired."
+                } else {
+                    "No working 4KHDHub mirrors found."
+                }
+            }
+        }
+    }
+}
+
+type PageCache = std::sync::Arc<std::sync::Mutex<Option<(String, std::time::Instant, String)>>>;
 
 #[derive(Clone)]
 pub struct FourKHdHubClient {
     client: reqwest::Client,
     base_url: Url,
+    page_cache: PageCache,
 }
 
 impl FourKHdHubClient {
@@ -39,6 +79,7 @@ impl FourKHdHubClient {
         Ok(Self {
             client: build_client(),
             base_url,
+            page_cache: std::sync::Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -60,9 +101,25 @@ impl FourKHdHubClient {
         parser::parse_search(&self.base_url, &html)
     }
 
-    pub async fn details(&self, id: &str) -> Result<MediaDetails, FourKHdHubError> {
+    async fn fetch_cached_page(&self, id: &str) -> Result<String, FourKHdHubError> {
         let url = self.provider_url(id)?;
+        let key = url.as_str().to_string();
+        if let Ok(lock) = self.page_cache.lock()
+            && let Some((cached_key, ts, html)) = lock.as_ref()
+            && cached_key == &key
+            && ts.elapsed() < std::time::Duration::from_secs(60)
+        {
+            return Ok(html.clone());
+        }
         let html = self.fetch_text(url).await?;
+        if let Ok(mut lock) = self.page_cache.lock() {
+            *lock = Some((key, std::time::Instant::now(), html.clone()));
+        }
+        Ok(html)
+    }
+
+    pub async fn details(&self, id: &str) -> Result<MediaDetails, FourKHdHubError> {
+        let html = self.fetch_cached_page(id).await?;
         parser::parse_details(id, &html)
     }
 
@@ -72,14 +129,14 @@ impl FourKHdHubClient {
         season: usize,
         episode: usize,
     ) -> Result<Vec<Release>, FourKHdHubError> {
-        let url = self.provider_url(id)?;
-        let html = self.fetch_text(url).await?;
+        let html = self.fetch_cached_page(id).await?;
         parser::parse_releases(&html, season, episode)
     }
 
     pub async fn resolve_release(
         &self,
         release: &Release,
+        intent: ResolutionIntent,
     ) -> Result<PlaybackSource, FourKHdHubError> {
         if release.provider != ProviderKind::FourKHdHub {
             return Err(FourKHdHubError::Parse(
@@ -87,100 +144,135 @@ impl FourKHdHubClient {
             ));
         }
         let referer = self.base_url.as_str().trim_end_matches('/').to_string();
-        let fetch_futures = release.mirrors.iter().map(|mirror| {
+        use futures::StreamExt;
+        let mut resolve_tasks = futures::stream::FuturesUnordered::new();
+        for mirror in &release.mirrors {
             let client = self.client.clone();
             let mirror_url = mirror.resolver_url.clone();
             let mirror_label = mirror.label.clone();
             let mirror_headers = mirror.headers.clone();
-            async move {
+            resolve_tasks.push(async move {
                 let fetch = async {
                     if mirror_url.contains("hubcloud.") {
-                        hubcloud::resolve(&client, &mirror_url).await
+                        hubcloud::resolve(&client, &mirror_url, intent).await
                     } else if mirror_url.contains("hubdrive.") {
-                        hubcloud::resolve_hubdrive(&client, &mirror_url).await
+                        hubcloud::resolve_hubdrive(&client, &mirror_url, intent).await
+                    } else if mirror_url.contains("greenmotors.")
+                        || mirror_url.contains("greenmountmotors.")
+                    {
+                        hubcloud::resolve_greenmotors(&client, &mirror_url, intent).await
                     } else {
                         hubcloud::validate_playback_url(&mirror_url)
                             .map(|url| vec![(url, mirror_label, mirror_headers)])
                     }
                 };
-                tokio::time::timeout(std::time::Duration::from_millis(4000), fetch)
+                tokio::time::timeout(std::time::Duration::from_millis(7000), fetch)
                     .await
                     .map_err(|_| {
                         FourKHdHubError::NoPlayableMirror("mirror resolver timed out".into())
                     })
                     .and_then(|res| res)
-            }
-        });
-        let mirror_results = futures::future::join_all(fetch_futures).await;
-
-        let mut candidates = Vec::new();
-        for cand_list in mirror_results.into_iter().flatten() {
-            for (url, label, headers) in cand_list {
-                let score = hubcloud::score(&url, &label);
-                candidates.push((score, url, label, headers));
-            }
+            });
         }
-        candidates.sort_by_key(|cand| cand.0);
-        let mut unique_candidates = Vec::new();
+
+        let mut preflight_tasks = futures::stream::FuturesUnordered::new();
         let mut seen = std::collections::HashSet::new();
-        for (_, url, label, headers) in candidates {
-            if seen.insert(url.clone()) {
-                unique_candidates.push((url, label, headers));
+        let mut spawned_preflights = 0usize;
+        let mut fallbacks = Vec::new();
+
+        loop {
+            tokio::select! {
+                Some(resolve_res) = resolve_tasks.next(), if !resolve_tasks.is_empty() => {
+                    if let Ok(mut cand_list) = resolve_res {
+                        cand_list.sort_by_key(|(url, label, _)| hubcloud::score(url, label, intent));
+                        for (url, label, headers) in cand_list {
+                            if spawned_preflights >= 6 || !seen.insert(url.clone()) {
+                                continue;
+                            }
+                            spawned_preflights += 1;
+                            let cand_score = hubcloud::score(&url, &label, intent);
+                            let this = self.clone();
+                            let mut merged = headers;
+                            if !merged
+                                .iter()
+                                .any(|(name, _)| name.eq_ignore_ascii_case("referer"))
+                            {
+                                merged.push(("Referer".to_string(), referer.clone()));
+                            }
+                            if !merged
+                                .iter()
+                                .any(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+                            {
+                                merged.push(("User-Agent".to_string(), BROWSER_UA.to_string()));
+                            }
+                            preflight_tasks.push(async move {
+                                let (playable_url, is_seekable) =
+                                    this.preflight_with_seekable(&url, &merged).await?;
+                                let resolved_score =
+                                    cand_score.min(hubcloud::score(&playable_url, &label, intent));
+                                Ok::<_, FourKHdHubError>((
+                                    is_seekable,
+                                    resolved_score,
+                                    playable_url,
+                                    label,
+                                    merged,
+                                ))
+                            });
+                        }
+                    }
+                }
+                Some(preflight_res) = preflight_tasks.next(), if !preflight_tasks.is_empty() => {
+                    if let Ok((is_seekable, resolved_score, playable_url, label, headers)) =
+                        preflight_res
+                    {
+                        if is_seekable && resolved_score <= 1 {
+                            log::info!(
+                                "4KHDHub seekable mirror playable: {label} ({})",
+                                crate::logging::sanitize_url(&playable_url)
+                            );
+                            return Ok(PlaybackSource {
+                                provider: ProviderKind::FourKHdHub,
+                                url: playable_url,
+                                headers,
+                                subtitle: None,
+                                source_label: label,
+                                max_height: None,
+                            });
+                        }
+                        fallbacks.push((is_seekable, resolved_score, playable_url, label, headers));
+                    }
+                }
+                else => break,
             }
         }
 
-        if unique_candidates.is_empty() {
+        if spawned_preflights == 0 {
             return Err(FourKHdHubError::NoPlayableMirror(
-                "Mirrors for this release are dead or expired on 4KHDHub. Select another release (e.g. 1080p) or press Ctrl+P for MovieBox.".into(),
+                "no working mirror links extracted".into(),
             ));
         }
-
-        for chunk in unique_candidates.chunks(3) {
-            let chunk_futures = chunk.iter().map(|(url, label, headers)| {
-                let this = self.clone();
-                let url = url.clone();
-                let label = label.clone();
-                let mut merged = headers.clone();
-                if !merged
-                    .iter()
-                    .any(|(name, _)| name.eq_ignore_ascii_case("referer"))
-                {
-                    merged.push(("Referer".to_string(), referer.clone()));
-                }
-                if !merged
-                    .iter()
-                    .any(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
-                {
-                    merged.push(("User-Agent".to_string(), BROWSER_UA.to_string()));
-                }
-                Box::pin(async move {
-                    let playable_url = this.preflight(&url, &merged).await?;
-                    Ok::<_, FourKHdHubError>((playable_url, label, merged))
-                })
+        fallbacks
+            .sort_by_key(|(is_seekable, resolved_score, _, _, _)| (!*is_seekable, *resolved_score));
+        if let Some((_, _, playable_url, label, headers)) = fallbacks.into_iter().next() {
+            log::info!(
+                "4KHDHub fallback mirror playable: {label} ({})",
+                crate::logging::sanitize_url(&playable_url)
+            );
+            return Ok(PlaybackSource {
+                provider: ProviderKind::FourKHdHub,
+                url: playable_url,
+                headers,
+                subtitle: None,
+                source_label: label,
+                max_height: None,
             });
-            if let Ok(((playable_url, label, headers), _)) =
-                futures::future::select_ok(chunk_futures).await
-            {
-                log::info!(
-                    "4KHDHub mirror playable: {label} ({})",
-                    crate::logging::sanitize_url(&playable_url)
-                );
-                return Ok(PlaybackSource {
-                    provider: ProviderKind::FourKHdHub,
-                    url: playable_url,
-                    headers,
-                    subtitle: None,
-                    source_label: label,
-                });
-            }
         }
-
         log::error!(
             "4KHDHub: no playable mirror for release {:?}",
             release.filename
         );
         Err(FourKHdHubError::NoPlayableMirror(
-            "Mirrors for this release are dead or expired on 4KHDHub. Select another release (e.g. 1080p) or press Ctrl+P for MovieBox.".into(),
+            "all candidate mirrors failed preflight".into(),
         ))
     }
 
@@ -189,6 +281,16 @@ impl FourKHdHubClient {
         url: &str,
         headers: &[(String, String)],
     ) -> Result<String, FourKHdHubError> {
+        self.preflight_with_seekable(url, headers)
+            .await
+            .map(|(u, _)| u)
+    }
+
+    async fn preflight_with_seekable(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+    ) -> Result<(String, bool), FourKHdHubError> {
         let probe = async {
             hubcloud::validate_playback_url(url)?;
             let mut request = self
@@ -199,6 +301,7 @@ impl FourKHdHubClient {
                 request = request.header(name, value);
             }
             let response = request.send().await?.error_for_status()?;
+            let mut is_seekable = response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
             let mut final_url = response.url().clone();
             hubcloud::validate_playback_url(final_url.as_str())?;
             let content_type = response
@@ -219,6 +322,9 @@ impl FourKHdHubClient {
                     || body_lower.contains("404 not found")
                     || body_lower.contains("link has expired")
                     || body_lower.contains("expired")
+                    || body_lower.contains("access denied")
+                    || body_lower.contains("downloadquotaexceeded")
+                    || body_lower.contains("generate link again")
                 {
                     return Err(FourKHdHubError::NoPlayableMirror(
                         "upstream mirror reported expired file link".into(),
@@ -244,6 +350,7 @@ impl FourKHdHubClient {
                     wrapped_request = wrapped_request.header(name, value);
                 }
                 let wrapped_response = wrapped_request.send().await?.error_for_status()?;
+                is_seekable = wrapped_response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
                 final_url = wrapped_response.url().clone();
                 hubcloud::validate_playback_url(final_url.as_str())?;
                 let wrapped_type = wrapped_response
@@ -264,6 +371,9 @@ impl FourKHdHubClient {
                         || wrapped_lower.contains("file not found")
                         || wrapped_lower.contains("404 not found")
                         || wrapped_lower.contains("expired")
+                        || wrapped_lower.contains("access denied")
+                        || wrapped_lower.contains("downloadquotaexceeded")
+                        || wrapped_lower.contains("generate link again")
                     {
                         return Err(FourKHdHubError::NoPlayableMirror(
                             "upstream mirror reported expired file link".into(),
@@ -274,7 +384,7 @@ impl FourKHdHubClient {
                     )));
                 }
             }
-            Ok(final_url.to_string())
+            Ok((final_url.to_string(), is_seekable))
         };
 
         tokio::time::timeout(std::time::Duration::from_millis(3500), probe)
@@ -330,7 +440,12 @@ mod tests {
             mirrors: Vec::new(),
             resource_id: None,
         };
-        assert!(client.resolve_release(&release).await.is_err());
+        assert!(
+            client
+                .resolve_release(&release, ResolutionIntent::Playback)
+                .await
+                .is_err()
+        );
     }
 
     #[test]
@@ -338,5 +453,36 @@ mod tests {
         let client = FourKHdHubClient::new().expect("client creation");
         assert!(client.provider_url("movie/inception-2010").is_ok());
         assert!(client.provider_url("https://evil.com/movie").is_err());
+    }
+
+    #[tokio::test]
+    async fn preflight_blocks_loopback_ssrf_and_prioritizes_seekable_mirrors() {
+        let client = FourKHdHubClient::new().expect("client");
+        assert!(
+            client
+                .preflight("http://127.0.0.1:8080/video.mkv", &[])
+                .await
+                .is_err()
+        );
+
+        let mut candidates = [
+            (
+                false,
+                0_u8,
+                "https://r2.dev/unseekable.mkv",
+                "10Gbps Server",
+            ),
+            (false, 4_u8, "https://workers.dev/quota.mkv", "HubCloud"),
+            (
+                true,
+                1_u8,
+                "https://pixeldrain.dev/seekable.mkv",
+                "PixelDrain",
+            ),
+        ];
+        candidates.sort_by_key(|(is_seekable, score, _, _)| (!*is_seekable, *score));
+        assert_eq!(candidates[0].2, "https://pixeldrain.dev/seekable.mkv");
+        assert_eq!(candidates[1].2, "https://r2.dev/unseekable.mkv");
+        assert_eq!(candidates[2].2, "https://workers.dev/quota.mkv");
     }
 }

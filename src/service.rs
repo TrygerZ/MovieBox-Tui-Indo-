@@ -16,6 +16,7 @@ pub struct MovieBoxService {
     pub circleftp_client: CircleFtpClient,
     pub dhakaflix_client: DhakaFlixClient,
     pub addon_client: crate::providers::addons::AddonClient,
+    pub dramachi_client: crate::providers::dramachi::DramachiClient,
     pub http_client: reqwest::Client,
 }
 
@@ -38,12 +39,9 @@ impl MovieBoxService {
             circleftp_client: CircleFtpClient::new(),
             dhakaflix_client: DhakaFlixClient::new(),
             addon_client: crate::providers::addons::AddonClient::new(),
+            dramachi_client: crate::providers::dramachi::DramachiClient::new(),
             http_client,
         }
-    }
-
-    pub fn http_client(&self) -> &reqwest::Client {
-        &self.http_client
     }
 
     pub fn capabilities(&self, provider: ProviderKind) -> crate::providers::ProviderCapabilities {
@@ -57,6 +55,7 @@ impl MovieBoxService {
             ProviderKind::BdixCircleFtp => Provider::capabilities(&self.circleftp_client),
             ProviderKind::BdixDhakaFlix => Provider::capabilities(&self.dhakaflix_client),
             ProviderKind::Addons => Provider::capabilities(&self.addon_client),
+            ProviderKind::Dramachi => Provider::capabilities(&self.dramachi_client),
         }
     }
 
@@ -90,6 +89,7 @@ impl MovieBoxService {
                 Provider::search(&self.dhakaflix_client, query, page).await
             }
             ProviderKind::Addons => Provider::search(&self.addon_client, query, page).await,
+            ProviderKind::Dramachi => Provider::search(&self.dramachi_client, query, page).await,
         }
     }
 
@@ -116,10 +116,6 @@ impl MovieBoxService {
             .fetch_catalog(&base_url, r#type, catalog_id, None)
             .await
             .map_err(|e| e.to_string())?;
-
-        if metas.is_empty() {
-            return Err("No catalog items found".to_string());
-        }
 
         let items: Vec<CatalogItem> = metas
             .iter()
@@ -161,6 +157,7 @@ impl MovieBoxService {
                 Provider::details(&self.dhakaflix_client, subject_id).await
             }
             ProviderKind::Addons => Provider::details(&self.addon_client, subject_id).await,
+            ProviderKind::Dramachi => Provider::details(&self.dramachi_client, subject_id).await,
         }
     }
 
@@ -195,26 +192,39 @@ impl MovieBoxService {
         subject_id: &str,
         resource_id: &str,
         sibling_ids: &[String],
+        season: usize,
+        episode: usize,
     ) -> Result<Vec<crate::providers::models::SubtitleOption>, String> {
+        if !subject_id.is_empty() && !resource_id.is_empty() {
+            let sid = subject_id.to_string();
+            let rid = resource_id.to_string();
+            if let Ok(Some(cached)) = tokio::task::spawn_blocking(move || {
+                crate::cache::get_captions_cache_typed(&sid, &rid)
+            })
+            .await
+            {
+                if !cached.is_empty() || sibling_ids.is_empty() {
+                    return Ok(cached);
+                }
+            }
+        }
+
         let mut all_captions = Vec::new();
         let mut seen_urls = std::collections::HashSet::new();
 
-        if let Ok(payload) = self.client.get_ext_captions(subject_id, resource_id).await {
-            Self::append_unique_captions(
-                &mut all_captions,
-                &mut seen_urls,
-                crate::providers::moviebox::adapt::captions_json_to_options(&payload),
-            );
-        }
-
-        if all_captions.len() < 5 && !sibling_ids.is_empty() {
-            let mut sibling_futs = Vec::new();
-            for sib in sibling_ids.iter().take(3) {
-                if !sib.is_empty() && sib != subject_id {
-                    let client = &self.client;
-                    sibling_futs.push(async move {
-                        if let Ok((items, _)) = client.fetch_resource_page(sib, 0, 1).await {
-                            if let Some(item) = items.first() {
+        let primary_fut = self.client.get_ext_captions(subject_id, resource_id);
+        let mut sibling_futs = Vec::new();
+        for sib in sibling_ids.iter().take(3) {
+            if !sib.is_empty() && sib != subject_id {
+                let client = &self.client;
+                sibling_futs.push(async move {
+                    tokio::time::timeout(std::time::Duration::from_secs(6), async move {
+                        let page = if episode > 0 { (episode - 1) / 20 + 1 } else { 1 };
+                        if let Ok((items, _)) =
+                            client.fetch_resource_page(sib, season, episode, 0, page).await
+                        {
+                            let matched_item = find_matching_resource_item(&items, season, episode);
+                            if let Some(item) = matched_item {
                                 let item_rid = item
                                     .get("resourceId")
                                     .or_else(|| item.get("id"))
@@ -228,7 +238,8 @@ impl MovieBoxService {
                                         }
                                     });
                                 if let Some(rid) = item_rid {
-                                    if let Ok(res_payload) = client.get_ext_captions(sib, &rid).await {
+                                    if let Ok(res_payload) = client.get_ext_captions(sib, &rid).await
+                                    {
                                         return crate::providers::moviebox::adapt::captions_json_to_options(
                                             &res_payload,
                                         );
@@ -237,16 +248,24 @@ impl MovieBoxService {
                             }
                         }
                         Vec::new()
-                    });
-                }
+                    })
+                    .await
+                    .unwrap_or_default()
+                });
             }
+        }
 
-            if !sibling_futs.is_empty() {
-                let sibling_results = futures::future::join_all(sibling_futs).await;
-                for res in sibling_results {
-                    Self::append_unique_captions(&mut all_captions, &mut seen_urls, res);
-                }
-            }
+        let (primary_res, sibling_results) =
+            tokio::join!(primary_fut, futures::future::join_all(sibling_futs));
+        if let Ok(payload) = primary_res {
+            Self::append_unique_captions(
+                &mut all_captions,
+                &mut seen_urls,
+                crate::providers::moviebox::adapt::captions_json_to_options(&payload),
+            );
+        }
+        for res in sibling_results {
+            Self::append_unique_captions(&mut all_captions, &mut seen_urls, res);
         }
         let mut deduplicated: Vec<crate::providers::models::SubtitleOption> = Vec::new();
         let mut seen_languages = std::collections::HashSet::new();
@@ -268,6 +287,14 @@ impl MovieBoxService {
                 clean_a.cmp(&clean_b)
             }
         });
+        if !subject_id.is_empty() && !resource_id.is_empty() && !deduplicated.is_empty() {
+            let sid = subject_id.to_string();
+            let rid = resource_id.to_string();
+            let to_cache = deduplicated.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::cache::set_captions_cache_typed(&sid, &rid, &to_cache);
+            });
+        }
 
         Ok(deduplicated)
     }
@@ -283,71 +310,148 @@ impl MovieBoxService {
             }
         }
     }
-
     pub async fn fetch_poster_bytes(&self, url: &str) -> Option<Vec<u8>> {
-        let response = self
+        const MAX_POSTER_BYTES: usize = 5 * 1024 * 1024;
+        let mut response = self
             .http_client
             .get(url)
-            .header("User-Agent", "MovieBox-Tui/1.0")
+            .header("User-Agent", crate::net::APP_HTTP_USER_AGENT)
             .send()
             .await
             .ok()?
             .error_for_status()
             .ok()?;
-        Some(response.bytes().await.ok()?.to_vec())
+        let content_len = response.content_length();
+        if content_len.is_some_and(|len| len > MAX_POSTER_BYTES as u64) {
+            log::warn!(
+                "poster at {} exceeds size limit ({} bytes), skipping",
+                crate::logging::sanitize_url(url),
+                content_len.unwrap_or(0)
+            );
+            return None;
+        }
+        let mut buf = Vec::with_capacity(
+            content_len
+                .map(|l| (l as usize).min(MAX_POSTER_BYTES))
+                .unwrap_or(64 * 1024),
+        );
+        while let Ok(Some(chunk)) = response.chunk().await {
+            if buf.len().saturating_add(chunk.len()) > MAX_POSTER_BYTES {
+                return None;
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        if buf.is_empty() { None } else { Some(buf) }
+    }
+
+    pub async fn fetch_and_decode_cached_poster(
+        &self,
+        namespace: &str,
+        id: &str,
+        url: &str,
+    ) -> Option<Arc<image::DynamicImage>> {
+        let ns = namespace.to_string();
+        let id_owned = id.to_string();
+        if let Ok(Some(bytes)) = tokio::task::spawn_blocking(move || {
+            crate::cache::get_namespaced_image_cache(&ns, &id_owned)
+        })
+        .await
+            && let Some(img) = decode_poster(bytes).await
+        {
+            return Some(img);
+        }
+        let bytes = Arc::<[u8]>::from(self.fetch_poster_bytes(url).await?);
+        let ns = namespace.to_string();
+        let id_owned = id.to_string();
+        let bytes_for_cache = Arc::clone(&bytes);
+        tokio::task::spawn_blocking(move || {
+            crate::cache::set_namespaced_image_cache(&ns, &id_owned, &bytes_for_cache);
+        });
+        decode_poster_arc(bytes).await
     }
 
     pub async fn download_subtitle_file(
         &self,
         url: &str,
         headers: &[(String, String)],
+        preferred_filename: Option<&str>,
     ) -> Result<PathBuf, String> {
         let mut request = self.http_client.get(url);
+        let sub_host = crate::proxy::extract_host_authority(url);
+        let referer_host = headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("referer"))
+            .and_then(|(_, val)| crate::proxy::extract_host_authority(val));
+        let same_host = sub_host.is_some() && sub_host == referer_host;
         for (name, value) in headers {
-            request = request.header(name.as_str(), value.as_str());
+            if crate::proxy::should_forward_header(same_host, name) {
+                request = request.header(name.as_str(), value.as_str());
+            }
         }
 
         let response = tokio::time::timeout(std::time::Duration::from_secs(8), request.send())
             .await
-            .map_err(|_| "Subtitle download timed out".to_string())?
-            .map_err(|e| format!("Failed to request subtitle: {e}"))?
-            .error_for_status()
-            .map_err(|e| format!("Subtitle response status error: {e}"))?;
+            .map_err(|_| "timed out".to_string())?
+            .map_err(|e| {
+                if e.is_timeout() {
+                    "timed out".to_string()
+                } else {
+                    "connection failed".to_string()
+                }
+            })?;
+        if !response.status().is_success() {
+            return Err(format!("HTTP {}", response.status().as_u16()));
+        }
 
         let bytes = response
             .bytes()
             .await
-            .map_err(|e| format!("Failed to read subtitle bytes: {e}"))?;
+            .map_err(|_| "read error".to_string())?;
 
-        let extension = url
-            .rsplit('.')
-            .next()
-            .map(|e| e.to_ascii_lowercase())
-            .filter(|e| matches!(e.as_str(), "srt" | "vtt" | "ass" | "ssa" | "sub"))
-            .unwrap_or_else(|| "srt".to_string());
-
+        let extension = subtitle_extension_from_url(url);
         let base_dir = resolve_subtitle_dir();
-        let _ = std::fs::create_dir_all(&base_dir);
+        let _ = tokio::fs::create_dir_all(&base_dir).await;
 
-        let path = base_dir.join(format!(
-            "{}_{}.{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos(),
-            extension
-        ));
-
+        let url_clean = url.split(['?', '#']).next().unwrap_or(url);
+        let url_tag = &crate::cache::md5_hex(url_clean)[..8];
+        let file_stem = if let Some(pref) = preferred_filename {
+            let base = crate::download::safe_file_stem(pref);
+            format!("{base}_{url_tag}")
+        } else {
+            format!(
+                "{}_{}_{url_tag}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            )
+        };
+        let path = base_dir.join(format!("{file_stem}.{extension}"));
         tokio::fs::write(&path, bytes)
             .await
-            .map_err(|e| format!("Failed to write subtitle file: {e}"))?;
+            .map_err(|e| format!("write error ({})", e.kind()))?;
 
         Ok(path)
     }
 }
 
 pub async fn decode_poster(bytes: Vec<u8>) -> Option<Arc<image::DynamicImage>> {
+    tokio::task::spawn_blocking(move || {
+        let img = image::load_from_memory(&bytes).ok()?;
+        const MAX_DIM: u32 = 512;
+        let downscaled = if img.width().max(img.height()) <= MAX_DIM {
+            img
+        } else {
+            img.resize(MAX_DIM, MAX_DIM, image::imageops::FilterType::Triangle)
+        };
+        Some(Arc::new(downscaled))
+    })
+    .await
+    .ok()?
+}
+
+async fn decode_poster_arc(bytes: Arc<[u8]>) -> Option<Arc<image::DynamicImage>> {
     tokio::task::spawn_blocking(move || {
         let img = image::load_from_memory(&bytes).ok()?;
         const MAX_DIM: u32 = 512;
@@ -417,14 +521,28 @@ pub fn extract_browse_metrics(item: &serde_json::Value) -> BrowseMetrics {
 }
 
 pub fn resolve_subtitle_dir() -> PathBuf {
-    if let Some(home) = dirs::home_dir() {
-        let storage = home.join("storage/downloads/moviebox_subs");
-        if home.join("storage/downloads").exists() {
-            let _ = std::fs::create_dir_all(&storage);
-            return storage;
+    if crate::config::is_termux_environment() {
+        if let Some(home) = dirs::home_dir() {
+            let storage = home.join("storage/downloads/moviebox_subs");
+            if home.join("storage/downloads").exists() {
+                let _ = std::fs::create_dir_all(&storage);
+                return storage;
+            }
         }
     }
     crate::config::cache_dir().join("subs")
+}
+
+pub fn subtitle_extension_from_url(url: &str) -> &'static str {
+    let clean = url.split(['?', '#']).next().unwrap_or(url);
+    match clean.rsplit('.').next() {
+        Some(ext) if ext.eq_ignore_ascii_case("srt") => "srt",
+        Some(ext) if ext.eq_ignore_ascii_case("vtt") => "vtt",
+        Some(ext) if ext.eq_ignore_ascii_case("ass") => "ass",
+        Some(ext) if ext.eq_ignore_ascii_case("ssa") => "ssa",
+        Some(ext) if ext.eq_ignore_ascii_case("sub") => "sub",
+        _ => "srt",
+    }
 }
 
 pub fn ensure_moviebox_subdir(path: &Path) -> PathBuf {
@@ -458,14 +576,36 @@ pub fn resolve_download_dir(custom_dir: Option<&Path>) -> PathBuf {
         .or_else(|| dirs::home_dir().map(|h| h.join("Downloads")))
         .unwrap_or_else(|| PathBuf::from("."));
 
-    if let Some(home) = dirs::home_dir() {
-        let android_storage = home.join("storage/downloads");
-        if android_storage.exists() {
-            return ensure_moviebox_subdir(&android_storage);
+    if crate::config::is_termux_environment() {
+        if let Some(home) = dirs::home_dir() {
+            let android_storage = home.join("storage/downloads");
+            if android_storage.exists() {
+                return ensure_moviebox_subdir(&android_storage);
+            }
         }
     }
 
     ensure_moviebox_subdir(&base_dir)
+}
+
+pub fn find_matching_resource_item(
+    items: &[serde_json::Value],
+    season: usize,
+    episode: usize,
+) -> Option<&serde_json::Value> {
+    items.iter().find(|item| {
+        let parse_num = |k: &str| -> Option<usize> {
+            item.get(k).and_then(|v| {
+                v.as_u64()
+                    .map(|n| n as usize)
+                    .or_else(|| v.as_i64().map(|n| n as usize))
+                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            })
+        };
+        let se = parse_num("se");
+        let ep_num = parse_num("ep");
+        (season == 0 && episode == 0) || (se == Some(season) && ep_num == Some(episode))
+    })
 }
 
 #[cfg(test)]
@@ -484,5 +624,89 @@ mod tests {
         assert!(decoded.height() <= 512);
         assert_eq!(decoded.width(), 512);
         assert_eq!(decoded.height(), 384);
+    }
+
+    #[test]
+    fn test_find_matching_resource_item_integer_and_string_values() {
+        let items = vec![
+            serde_json::json!({
+                "id": "1001",
+                "se": 1,
+                "ep": 1
+            }),
+            serde_json::json!({
+                "id": "1002",
+                "se": "2",
+                "ep": "5"
+            }),
+        ];
+
+        let matched = find_matching_resource_item(&items, 2, 5);
+        assert!(matched.is_some());
+        assert_eq!(matched.unwrap().get("id").unwrap().as_str(), Some("1002"));
+    }
+
+    #[test]
+    fn test_find_matching_resource_item_series_does_not_fall_back_to_episode_one() {
+        let items = vec![
+            serde_json::json!({
+                "id": "1001",
+                "se": 1,
+                "ep": 1
+            }),
+            serde_json::json!({
+                "id": "1002",
+                "se": 1,
+                "ep": 2
+            }),
+        ];
+
+        let matched = find_matching_resource_item(&items, 2, 3);
+        assert!(matched.is_none());
+    }
+
+    #[test]
+    fn test_find_matching_resource_item_movie_matches_first() {
+        let items = vec![
+            serde_json::json!({
+                "id": "movie_res_1"
+            }),
+            serde_json::json!({
+                "id": "movie_res_2"
+            }),
+        ];
+
+        let matched = find_matching_resource_item(&items, 0, 0);
+        assert!(matched.is_some());
+        assert_eq!(
+            matched.unwrap().get("id").unwrap().as_str(),
+            Some("movie_res_1")
+        );
+    }
+
+    #[test]
+    fn test_subtitle_extension_from_url_strips_signed_query_and_fragment() {
+        assert_eq!(
+            subtitle_extension_from_url(
+                "https://cacdn.hakunaymatata.com/subtitle/5cc122.vtt?Policy=eyJ&Signature=abc&Key-Pair-Id=KMH"
+            ),
+            "vtt"
+        );
+        assert_eq!(
+            subtitle_extension_from_url("https://cdn.example.com/subs/track.ASS?token=123#cue1"),
+            "ass"
+        );
+        assert_eq!(
+            subtitle_extension_from_url("https://cdn.example.com/subs/track.ssa"),
+            "ssa"
+        );
+        assert_eq!(
+            subtitle_extension_from_url("https://cdn.example.com/subs/track.sub?exp=999"),
+            "sub"
+        );
+        assert_eq!(
+            subtitle_extension_from_url("https://cdn.example.com/subs/unknown?format=text"),
+            "srt"
+        );
     }
 }

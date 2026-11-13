@@ -4,7 +4,7 @@ use crate::tui::{
     overlay::NotificationKind,
     state::{BrowsePreset, DetailsPane, InputMode, Screen},
 };
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Rect};
 
 impl App {
     pub(super) fn handle_mouse(&mut self, col: u16, row: u16) -> Option<Action> {
@@ -17,9 +17,15 @@ impl App {
             return None;
         }
 
+        let main_area = if self.state.download_progress.is_some() {
+            crate::tui::app::App::split_main_and_download(area)[0]
+        } else {
+            area
+        };
+
         match self.state.active_screen {
-            Screen::Home => self.handle_home_mouse(col, row, area),
-            Screen::Details => self.handle_details_mouse(col, row, area),
+            Screen::Home => self.handle_home_mouse(col, row, main_area),
+            Screen::Details => self.handle_details_mouse(col, row, main_area),
         }
     }
 
@@ -44,11 +50,7 @@ impl App {
         }
 
         if self.state.download_progress.is_some() {
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Min(1), Constraint::Length(3)])
-                .split(area);
-            let dl_area = chunks[1];
+            let [_, dl_area] = crate::tui::app::App::split_main_and_download(area);
             if dl_area.contains(ratatui::layout::Position::new(col, row)) {
                 let cancel_rect = Rect {
                     x: dl_area.right().saturating_sub(14),
@@ -69,9 +71,23 @@ impl App {
                 .iter()
                 .map(|k| k.label().to_string())
                 .collect::<Vec<_>>();
-            let confirm_label = "Select";
+            let confirm_label = if self.state.settings_player_picker {
+                "Select"
+            } else {
+                "Play"
+            };
+            let layout = if self.state.settings_player_picker {
+                crate::tui::overlay::settings_picker_layout(
+                    area,
+                    self.state.settings_category,
+                    &items,
+                    10,
+                )
+            } else {
+                crate::tui::overlay::picker_layout(area, &items, confirm_label, 10)
+            };
             match click_in_picker(
-                crate::tui::overlay::picker_layout(area, &items, confirm_label, 24),
+                layout,
                 col,
                 row,
                 &self.state.player_picker_state,
@@ -84,8 +100,45 @@ impl App {
                 }
                 Some(None) => {}
                 None => {
+                    self.state.is_resolving_playback = false;
                     self.state.player_picker_popup = false;
                     self.state.settings_player_picker = false;
+                }
+            }
+            return true;
+        }
+        if self.state.show_sources_popup {
+            let items = crate::providers::models::ProviderKind::ENABLED
+                .iter()
+                .map(|p| format!("  [✓] {}  ", p.label()))
+                .collect::<Vec<_>>();
+            let layout = crate::tui::overlay::settings_picker_layout(
+                area,
+                self.state.settings_category,
+                &items,
+                20,
+            );
+            match click_in_picker(
+                layout,
+                col,
+                row,
+                &self.state.sources_list_state,
+                items.len(),
+                area,
+            ) {
+                Some(Some(clicked_idx)) => {
+                    self.state.sources_list_state.select(Some(clicked_idx));
+                    if let Some(&provider) =
+                        crate::providers::models::ProviderKind::ENABLED.get(clicked_idx)
+                    {
+                        self.action_sender
+                            .send(Action::ToggleProvider(provider))
+                            .ok();
+                    }
+                }
+                Some(None) => {}
+                None => {
+                    self.state.show_sources_popup = false;
                 }
             }
             return true;
@@ -93,18 +146,33 @@ impl App {
 
         if self.state.show_theme_popup {
             let theme_names = crate::tui::theme::AVAILABLE_THEMES;
+            let longest_name = theme_names
+                .iter()
+                .map(|name| crate::tui::text::width(name))
+                .max()
+                .unwrap_or(10);
             let items: Vec<String> = theme_names
                 .iter()
                 .map(|name| {
                     if self.state.basic_terminal {
-                        format!("{name:<12} * * *")
+                        format!("  {name:<pad$}   * * *  ", pad = longest_name)
                     } else {
-                        format!("{name:<12} ■ ■ ■")
+                        format!("  {name:<pad$}   ■ ■ ■  ", pad = longest_name)
                     }
                 })
                 .collect();
+            let layout = if self.state.show_settings_popup {
+                crate::tui::overlay::settings_picker_layout(
+                    area,
+                    self.state.settings_category,
+                    &items,
+                    16,
+                )
+            } else {
+                crate::tui::overlay::picker_layout(area, &items, "Apply", 16)
+            };
             match click_in_picker(
-                crate::tui::overlay::picker_layout(area, &items, "Apply", 32),
+                layout,
                 col,
                 row,
                 &self.state.theme_list_state,
@@ -125,6 +193,9 @@ impl App {
                 }
                 Some(None) => {}
                 None => {
+                    if let Some(orig) = self.state.original_theme_kind.take() {
+                        self.action_sender.send(Action::SelectTheme(orig)).ok();
+                    }
                     self.state.show_theme_popup = false;
                     self.state.theme_list_state.select(None);
                 }
@@ -167,7 +238,8 @@ impl App {
         }
 
         if self.state.show_browse_popup {
-            let is_addon = self.state.mode() == crate::tui::state::AppMode::Addon;
+            let is_addon =
+                self.state.active_provider == crate::providers::models::ProviderKind::Addons;
             let raw_labels: Vec<String> = if is_addon {
                 crate::providers::addons::models::curated_catalog_presets(
                     &self.state.installed_addons,
@@ -198,11 +270,12 @@ impl App {
                     } else {
                         "[DISCOVER] "
                     };
-                    format!("{badge_str}{label}")
+                    format!("  {badge_str}{label}  ")
                 })
                 .collect();
+            let layout = crate::tui::overlay::browse_picker_layout(area, &browse_items, 36);
             match click_in_picker(
-                crate::tui::overlay::picker_layout(area, &browse_items, "Open", 36),
+                layout,
                 col,
                 row,
                 &self.state.browse_list_state,
@@ -240,33 +313,45 @@ impl App {
             return true;
         }
 
-        if let Some((ver, notes)) = &self.state.update_available {
+        if self.state.input_mode != InputMode::Editing
+            && let Some((ver, notes)) = &self.state.update_available
+        {
             let layout = crate::tui::overlay::update_modal_layout(area, notes);
             if layout
                 .popup_area
                 .contains(ratatui::layout::Position::new(col, row))
             {
-                let is_homebrew = std::env::current_exe()
-                    .map(|p| crate::updater::apply::is_homebrew_managed(&p))
-                    .unwrap_or(false);
+                let env = std::env::current_exe()
+                    .as_deref()
+                    .map(crate::updater::apply::detect_environment)
+                    .unwrap_or(crate::updater::apply::InstallationEnvironment::DirectReplace);
 
                 if row == layout.button_row_y {
                     if col < layout.update_btn_end_x {
-                        if is_homebrew {
-                            self.state
-                                .set_status_short("Run: brew upgrade moviebox-tui");
-                            self.state.notify(
-                                NotificationKind::Info,
-                                "Homebrew Upgrade",
-                                "Run 'brew upgrade moviebox-tui' in your terminal to update.",
-                            );
-                        } else {
-                            self.action_sender.send(Action::StartSelfUpdate).ok();
+                        match env {
+                            crate::updater::apply::InstallationEnvironment::Homebrew => {
+                                self.state.notify(
+                                    NotificationKind::Info,
+                                    "Homebrew Update",
+                                    "Installed via Homebrew.",
+                                );
+                            }
+                            crate::updater::apply::InstallationEnvironment::Scoop => {
+                                self.state.notify(
+                                    NotificationKind::Info,
+                                    "Scoop Update",
+                                    "Installed via Scoop.",
+                                );
+                            }
+                            crate::updater::apply::InstallationEnvironment::DirectReplace
+                            | crate::updater::apply::InstallationEnvironment::WindowsHelper => {
+                                self.action_sender.send(Action::StartSelfUpdate).ok();
+                            }
+                            _ => {}
                         }
                     } else if col < layout.open_btn_end_x {
-                        let url =
-                            format!("https://github.com/mesamirh/MovieBox-Tui/releases/tag/v{ver}");
-                        let _ = open::that(&url);
+                        let url = crate::updater::check::release_tag_url(ver);
+                        let _ = crate::net::open_external_url(&url);
                     }
                     self.state.update_available = None;
                 }
@@ -289,7 +374,7 @@ impl App {
                 "Use"
             };
             match click_in_picker(
-                crate::tui::overlay::picker_layout(area, &items, confirm_label, 32),
+                crate::tui::overlay::picker_layout(area, &items, confirm_label, 20),
                 col,
                 row,
                 &self.state.subtitle_list_state,
@@ -311,6 +396,10 @@ impl App {
                     self.state.subtitle_list.clear();
                     self.state.subtitle_list_state.select(None);
                     if is_dl {
+                        self.state.is_waiting_for_download_stream = false;
+                        self.state.download_queue.clear();
+                        self.state.download_queue_total = 0;
+                        self.state.season_subtitle_preference = None;
                         self.state
                             .set_status_default("Download subtitle selection cancelled.");
                     } else {
@@ -324,53 +413,13 @@ impl App {
             }
             return true;
         }
-
-        if self.state.show_season_download_confirm {
-            let summary = crate::tui::screens::details::season_confirm_summary(&self.state);
-            let longest = summary
-                .iter()
-                .map(|line| crate::tui::text::width(line))
-                .max()
-                .unwrap_or(36);
-            let popup = crate::tui::overlay::download_confirm_layout(area, summary.len(), longest);
-            if popup.contains(ratatui::layout::Position::new(col, row)) {
-                let action_y =
-                    crate::tui::overlay::download_confirm_action_row(popup, summary.len());
-                if row == action_y {
-                    let mid_x = popup.x + popup.width / 2;
-                    if col < mid_x {
-                        self.action_sender.send(Action::ConfirmDownloadSeason).ok();
-                    } else {
-                        self.state.show_season_download_confirm = false;
-                    }
-                }
-            } else {
-                self.state.show_season_download_confirm = false;
-            }
-            return true;
-        }
-
-        if self.state.show_episode_download_confirm {
-            let summary = crate::tui::screens::details::episode_confirm_summary(&self.state);
-            let longest = summary
-                .iter()
-                .map(|line| crate::tui::text::width(line))
-                .max()
-                .unwrap_or(36);
-            let popup = crate::tui::overlay::download_confirm_layout(area, summary.len(), longest);
-            if popup.contains(ratatui::layout::Position::new(col, row)) {
-                let action_y =
-                    crate::tui::overlay::download_confirm_action_row(popup, summary.len());
-                if row == action_y {
-                    let mid_x = popup.x + popup.width / 2;
-                    if col < mid_x {
-                        self.action_sender.send(Action::ConfirmDownloadEpisode).ok();
-                    } else {
-                        self.state.show_episode_download_confirm = false;
-                    }
-                }
-            } else {
-                self.state.show_episode_download_confirm = false;
+        if self.state.show_overview_modal {
+            let (popup, _) = crate::tui::overlay::overview_modal_layout(
+                area,
+                &self.state.overview_modal_content,
+            );
+            if !popup.contains(ratatui::layout::Position::new(col, row)) {
+                self.state.close_overview_modal();
             }
             return true;
         }
@@ -399,19 +448,10 @@ impl App {
                         self.state.tv_manager_selected = clicked_idx;
                         if let Some(r) = rows.get(clicked_idx) {
                             match r {
-                                crate::tui::state::TvManagerRow::AddUrl => {
+                                crate::tui::state::TvManagerRow::AddPlaylist => {
                                     self.action_sender.send(Action::TvInputToggle(false)).ok();
                                 }
-                                crate::tui::state::TvManagerRow::AddFile => {
-                                    self.action_sender.send(Action::TvInputToggle(true)).ok();
-                                }
-                                crate::tui::state::TvManagerRow::Reload => {
-                                    self.action_sender.send(Action::TvReloadPlaylists).ok();
-                                }
-                                crate::tui::state::TvManagerRow::Done => {
-                                    self.state.tv_config_popup = false;
-                                }
-                                _ => {}
+                                crate::tui::state::TvManagerRow::Playlist(_) => {}
                             }
                         }
                     }
@@ -428,21 +468,19 @@ impl App {
             let popup = crate::tui::overlay::addon_manager_layout(
                 area,
                 addons_count,
+                self.state.max_addon_name_width(),
                 self.state.addon_input_active,
             );
             if popup.contains(ratatui::layout::Position::new(col, row)) {
                 if !self.state.addon_input_active {
-                    let list_start_y = popup.y + 1;
-                    let button_y = list_start_y + addons_count as u16 + 1;
-                    if row > list_start_y && row < button_y {
-                        let clicked_addon_idx = (row - list_start_y - 1) as usize;
-                        if clicked_addon_idx < addons_count {
-                            self.state.addon_manager_selected = clicked_addon_idx + 1;
+                    let items_start_y = popup.y + 1;
+                    let total_items = addons_count + 1;
+                    if row >= items_start_y && row < items_start_y + total_items as u16 {
+                        let clicked_idx = (row - items_start_y) as usize;
+                        if clicked_idx < total_items {
+                            self.state.addon_manager_selected = clicked_idx;
                             self.addon_manager_activate();
                         }
-                    } else if row == button_y {
-                        self.state.addon_manager_selected = addons_count + 1;
-                        self.addon_manager_activate();
                     }
                 }
             } else {
@@ -592,9 +630,7 @@ impl App {
                             self.state.provider_list_state.select(Some(current_idx));
                             self.state.input_mode = InputMode::Normal;
                         } else if self.state.mode() == crate::tui::state::AppMode::Tv {
-                            self.action_sender.send(Action::ToggleTvMode).ok();
-                        } else if self.state.mode() == crate::tui::state::AppMode::Addon {
-                            self.action_sender.send(Action::ToggleAddonMode).ok();
+                            self.action_sender.send(Action::SwitchToStreamingMode).ok();
                         }
                         return None;
                     }
@@ -691,7 +727,9 @@ impl App {
                         && row >= discover_card_area.top()
                         && row < discover_card_area.bottom()
                     {
-                        if self.state.is_addon_mode {
+                        if self.state.active_provider
+                            == crate::providers::models::ProviderKind::Addons
+                        {
                             self.action_sender.send(Action::ShowBrowseMenu).ok();
                         } else {
                             let rel_row = row - discover_card_area.top();
@@ -723,23 +761,8 @@ impl App {
             return None;
         }
 
-        let search_bar_area = {
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(1),
-                    Constraint::Length(1),
-                    Constraint::Min(0),
-                ])
-                .split(area);
-
-            Rect {
-                x: chunks[0].x + 2,
-                y: chunks[0].y,
-                width: chunks[0].width.saturating_sub(4),
-                height: chunks[0].height,
-            }
-        };
+        let (search_bar_area, results_chunk) =
+            crate::tui::screens::home::search_results_layout(area);
 
         if self.state.input_mode == InputMode::Editing && !self.state.search_suggestions.is_empty()
         {
@@ -798,32 +821,19 @@ impl App {
             return None;
         }
 
-        let results_y = 2;
-        if row >= results_y && row < area.height {
+        if row >= results_chunk.y && row < area.height {
             if self.state.search_results.is_empty() {
                 let next_label = self.state.next_provider().label();
                 let ctrl_p = crate::tui::text::CTRL_P_STR;
                 let (btn1, btn2) = crate::tui::screens::home::no_results_button_hitboxes(
-                    Rect {
-                        x: area.x,
-                        y: results_y,
-                        width: area.width,
-                        height: area.height.saturating_sub(results_y),
-                    },
+                    results_chunk,
                     next_label,
                     ctrl_p,
                     self.state.is_tv_mode,
-                    self.state.is_addon_mode,
                 );
                 let pos = ratatui::layout::Position::new(col, row);
-                if btn1.contains(pos) {
-                    if self.state.is_tv_mode {
-                        self.action_sender.send(Action::TvReloadPlaylists).ok();
-                    } else if self.state.is_addon_mode {
-                        self.action_sender.send(Action::ShowAddonManager).ok();
-                    } else {
-                        self.cycle_provider();
-                    }
+                if !self.state.is_tv_mode && btn1.contains(pos) {
+                    self.cycle_provider();
                     return None;
                 }
                 if btn2.contains(pos) {
@@ -834,16 +844,18 @@ impl App {
                 }
                 return None;
             }
+            if col < results_chunk.x || col >= results_chunk.right() {
+                return None;
+            }
             let metrics = self
                 .state
-                .result_metrics(area.height.saturating_sub(results_y + 1), area.width);
+                .result_metrics(results_chunk.height.saturating_sub(1), results_chunk.width);
             let row_height = metrics.row_height;
-            let clicked_relative_row = row.saturating_sub(results_y);
+            let clicked_relative_row = row.saturating_sub(results_chunk.y);
             let visual_row = (clicked_relative_row / row_height) as usize;
             let col_step = (metrics.col_width + 1).max(1);
-            let clicked_column = (((col.saturating_sub(area.x)) / col_step) as usize)
+            let clicked_column = (((col.saturating_sub(results_chunk.x)) / col_step) as usize)
                 .min(metrics.columns.saturating_sub(1) as usize);
-
             let page_start = self.state.result_scroll;
 
             let target_idx = page_start + visual_row * metrics.columns as usize + clicked_column;
@@ -879,32 +891,22 @@ impl App {
         } else {
             crate::tui::text::CTRL_T_STR
         };
-        let ctrl_a = if ultra_compact || compact {
-            "A"
-        } else {
-            crate::tui::text::CTRL_A_STR
-        };
 
         enum BottomBtn {
             Stream,
             Tv,
-            Addon,
         }
 
         let current_mode = self.state.mode();
         let mut buttons: Vec<(BottomBtn, u16)> = Vec::new();
 
         if self.state.streaming_enabled && current_mode != crate::tui::state::AppMode::Streaming {
-            let len = (3 + ctrl_s.len() + 6) as u16;
+            let len = (3 + ctrl_s.len() + if compact { 0 } else { 7 }) as u16;
             buttons.push((BottomBtn::Stream, len));
         }
         if self.state.tv_enabled && current_mode != crate::tui::state::AppMode::Tv {
-            let len = (3 + ctrl_t.len() + 2) as u16;
+            let len = (3 + ctrl_t.len() + if compact { 0 } else { 3 }) as u16;
             buttons.push((BottomBtn::Tv, len));
-        }
-        if self.state.addons_enabled && current_mode != crate::tui::state::AppMode::Addon {
-            let len = (3 + ctrl_a.len() + 5) as u16;
-            buttons.push((BottomBtn::Addon, len));
         }
 
         let mode_count = buttons.len();
@@ -921,9 +923,13 @@ impl App {
         } else {
             0
         };
-        let help_w = if ultra_compact { 3 } else { 8 };
-        let quit_w = if ultra_compact { 3 } else { 8 };
-        let util_sep = 2;
+        let help_w = if compact { 3 } else { 8 };
+        let quit_w = if compact { 3 } else { 8 };
+        let util_sep = if compact {
+            u16::from(!ultra_compact)
+        } else {
+            2
+        };
 
         let total_w = modes_total_w + util_gap + help_w + util_sep + quit_w;
         let start_x = width.saturating_sub(total_w) / 2;
@@ -941,12 +947,7 @@ impl App {
                     }
                     BottomBtn::Tv => {
                         if self.state.mode() != crate::tui::state::AppMode::Tv {
-                            self.action_sender.send(Action::ToggleTvMode).ok();
-                        }
-                    }
-                    BottomBtn::Addon => {
-                        if self.state.mode() != crate::tui::state::AppMode::Addon {
-                            self.action_sender.send(Action::ToggleAddonMode).ok();
+                            self.action_sender.send(Action::SwitchToTvMode).ok();
                         }
                     }
                 }
@@ -968,10 +969,14 @@ impl App {
     }
 
     fn handle_details_mouse(&mut self, col: u16, row: u16, area: Rect) -> Option<Action> {
-        let details = self.state.selected_details.as_ref()?.clone();
-
-        let has_languages = details.has_languages();
-        let is_series = details.is_series() && !self.state.available_seasons.is_empty();
+        let (has_languages, is_series, dubs_count) = {
+            let details = self.state.selected_details.as_ref()?;
+            (
+                details.has_languages(),
+                details.is_series() && !self.state.available_seasons.is_empty(),
+                details.dubs.len(),
+            )
+        };
 
         let mut available_panes = Vec::new();
         if has_languages {
@@ -982,6 +987,7 @@ impl App {
             available_panes.push(DetailsPane::Episodes);
         }
 
+        let streams_count = self.state.selected_resources.len();
         let layout = crate::tui::screens::details::details_screen_layout(
             area,
             self.state.selected_details.as_ref(),
@@ -994,15 +1000,32 @@ impl App {
             self.handle_details_footer_click(col, row - footer_area.y, area.width);
             return None;
         }
+        if layout.synopsis_area.height > 0
+            && layout
+                .synopsis_area
+                .contains(ratatui::layout::Position::new(col, row))
+        {
+            if let Some((title, content)) = self.state.series_synopsis() {
+                self.state.open_overview_modal(title, content);
+                return None;
+            }
+        }
 
         if workflow_area.height > 0 && row == workflow_area.y {
-            let count = available_panes.len() + 1;
-            let section_w = area.width / count as u16;
-            let pane_idx = (col / section_w.max(1)) as usize;
-            if pane_idx < available_panes.len() {
-                self.state.details_pane = available_panes[pane_idx];
-            } else {
-                self.state.details_pane = DetailsPane::Streams;
+            let details = self.state.selected_details.as_ref()?;
+            let (_, ranges) = crate::tui::screens::details::workflow_step_ranges(
+                area.width,
+                &self.state,
+                details,
+                has_languages,
+                is_series,
+                streams_count,
+            );
+            for (pane, start_x, end_x) in ranges {
+                if col >= start_x && col < end_x {
+                    self.state.details_pane = pane;
+                    return None;
+                }
             }
             return None;
         }
@@ -1021,12 +1044,18 @@ impl App {
                 .available_episode_numbers
                 .get(self.state.season_list_state.selected().unwrap_or(0))
                 .map_or(0, Vec::len);
-            let language_count = details.dubs.len();
-            language_count
-                .max(self.state.available_seasons.len())
-                .max(episode_count)
-                .min((bottom_area.height / 3).clamp(4, 10) as usize) as u16
-                + 2
+            let language_count = dubs_count;
+            let max_visible_items = visible_selector_panes
+                .iter()
+                .map(|pane| match pane {
+                    DetailsPane::Languages => language_count,
+                    DetailsPane::Seasons => self.state.available_seasons.len(),
+                    DetailsPane::Episodes => episode_count,
+                    DetailsPane::Streams => 0,
+                })
+                .max()
+                .unwrap_or(0);
+            max_visible_items.min((bottom_area.height / 3).clamp(4, 10) as usize) as u16 + 2
         };
 
         let lower_chunks =
@@ -1053,7 +1082,7 @@ impl App {
                     match pane {
                         DetailsPane::Languages => {
                             self.state.details_pane = DetailsPane::Languages;
-                            if clicked_row < details.dubs.len() {
+                            if clicked_row < dubs_count {
                                 self.action_sender
                                     .send(Action::SelectLanguage(clicked_row))
                                     .ok();
@@ -1061,12 +1090,14 @@ impl App {
                         }
                         DetailsPane::Seasons => {
                             self.state.details_pane = DetailsPane::Seasons;
-                            if clicked_row < self.state.available_seasons.len() {
-                                self.state.season_list_state.select(Some(clicked_row));
+                            let offset = self.state.season_list_state.offset();
+                            let abs_row = offset + clicked_row;
+                            if abs_row < self.state.available_seasons.len() {
+                                self.state.season_list_state.select(Some(abs_row));
                                 self.state.selected_season = self
                                     .state
                                     .available_seasons
-                                    .get(clicked_row)
+                                    .get(abs_row)
                                     .map(|s| s.number)
                                     .unwrap_or(1);
                                 self.state.episode_list_state.select(Some(0));
@@ -1075,13 +1106,15 @@ impl App {
                         }
                         DetailsPane::Episodes => {
                             self.state.details_pane = DetailsPane::Episodes;
+                            let offset = self.state.episode_list_state.offset();
+                            let abs_row = offset + clicked_row;
                             let season_idx = self.state.season_list_state.selected().unwrap_or(0);
                             if let Some(ep_numbers) =
                                 self.state.available_episode_numbers.get(season_idx)
                             {
-                                if clicked_row < ep_numbers.len() {
-                                    self.state.episode_list_state.select(Some(clicked_row));
-                                    self.state.selected_episode = ep_numbers[clicked_row];
+                                if abs_row < ep_numbers.len() {
+                                    self.state.episode_list_state.select(Some(abs_row));
+                                    self.state.selected_episode = ep_numbers[abs_row];
                                     self.trigger_episode_fetch();
                                 }
                             }
@@ -1119,8 +1152,8 @@ impl App {
                         if self.state.is_playing {
                             self.state.notify(
                                 NotificationKind::Warning,
-                                "Playback already active",
-                                "Stop the current player before starting another.",
+                                "Playback active",
+                                "Player is already running.",
                             );
                         } else if !self.state.is_resolving_playback
                             && self.state.last_playback_launch.elapsed().as_millis() >= 500
@@ -1140,7 +1173,6 @@ impl App {
         let is_streams = self.state.details_pane == DetailsPane::Streams;
         let is_seasons = self.state.details_pane == DetailsPane::Seasons;
         let is_episodes = self.state.details_pane == DetailsPane::Episodes;
-        let is_languages = self.state.details_pane == DetailsPane::Languages;
         let compact = width < crate::tui::screens::details::DETAILS_FOOTER_SPLIT_THRESHOLD;
 
         let is_favorited = self.state.is_selected_details_favorited();
@@ -1149,45 +1181,32 @@ impl App {
         enum FooterAction {
             PlaySelect,
             Download,
-            Favorite,
             StreamsTab,
-            Back,
+            Favorite,
+            Info,
         }
 
-        let mut primary: Vec<(FooterAction, u16)> = Vec::new();
-        let mut secondary: Vec<(FooterAction, u16)> = Vec::new();
-
-        if is_streams {
-            primary.push((FooterAction::PlaySelect, 7 + 1 + 4));
-            let d_label_len = if compact { 4 } else { 8 };
-            primary.push((FooterAction::Download, 3 + 1 + d_label_len));
-            secondary.push((FooterAction::Favorite, 3 + 1 + fav_label_len));
-            secondary.push((FooterAction::Back, 5 + 1 + 4));
-        } else if is_languages {
-            primary.push((FooterAction::PlaySelect, 7 + 1 + 6));
-            primary.push((FooterAction::Favorite, 3 + 1 + fav_label_len));
-            secondary.push((FooterAction::StreamsTab, 5 + 1 + 7));
-            secondary.push((FooterAction::Back, 5 + 1 + 4));
+        let (enter_len, d_label_len) = if is_streams {
+            (4, Some(if compact { 4 } else { 8 }))
         } else if is_seasons {
-            primary.push((FooterAction::PlaySelect, 7 + 1 + 6));
-            let d_label_len = if compact { 8 } else { 15 };
-            primary.push((FooterAction::Download, 3 + 1 + d_label_len));
-            primary.push((FooterAction::Favorite, 3 + 1 + fav_label_len));
-            secondary.push((FooterAction::StreamsTab, 5 + 1 + 7));
-            secondary.push((FooterAction::Back, 5 + 1 + 4));
+            (6, Some(if compact { 8 } else { 15 }))
         } else if is_episodes {
-            primary.push((FooterAction::PlaySelect, 7 + 1 + 6));
-            let d_label_len = if compact { 8 } else { 16 };
-            primary.push((FooterAction::Download, 3 + 1 + d_label_len));
-            primary.push((FooterAction::Favorite, 3 + 1 + fav_label_len));
-            secondary.push((FooterAction::StreamsTab, 5 + 1 + 7));
-            secondary.push((FooterAction::Back, 5 + 1 + 4));
+            (6, Some(if compact { 8 } else { 16 }))
         } else {
-            primary.push((FooterAction::PlaySelect, 7 + 1 + 6));
-            primary.push((FooterAction::Favorite, 3 + 1 + fav_label_len));
-            secondary.push((FooterAction::StreamsTab, 5 + 1 + 7));
-            secondary.push((FooterAction::Back, 5 + 1 + 4));
+            (6, None)
+        };
+
+        let mut primary = vec![(FooterAction::PlaySelect, 7 + 1 + enter_len)];
+        if let Some(d_len) = d_label_len {
+            primary.push((FooterAction::Download, 3 + 1 + d_len));
         }
+
+        let mut secondary = Vec::new();
+        if !is_streams {
+            secondary.push((FooterAction::StreamsTab, 5 + 1 + 7));
+        }
+        secondary.push((FooterAction::Favorite, 3 + 1 + fav_label_len));
+        secondary.push((FooterAction::Info, 3 + 1 + 4));
         let active_buttons =
             if width >= crate::tui::screens::details::DETAILS_FOOTER_SPLIT_THRESHOLD {
                 if line_idx > 0 {
@@ -1212,28 +1231,35 @@ impl App {
             let end = start + w;
             if col >= start && col < end + sep {
                 match action {
-                    FooterAction::PlaySelect => {
-                        if is_streams {
+                    FooterAction::PlaySelect => match self.state.details_pane {
+                        DetailsPane::Streams => {
                             self.action_sender.send(Action::PlayStream).ok();
-                        } else {
-                            self.action_sender.send(Action::Submit).ok();
                         }
-                    }
+                        DetailsPane::Seasons | DetailsPane::Episodes => {
+                            self.trigger_episode_fetch();
+                        }
+                        DetailsPane::Languages => {
+                            let idx = self.state.language_list_state.selected().unwrap_or(0);
+                            self.action_sender.send(Action::SelectLanguage(idx)).ok();
+                        }
+                    },
                     FooterAction::Download => {
                         if is_seasons {
-                            self.action_sender.send(Action::PromptDownloadSeason).ok();
+                            self.action_sender.send(Action::DownloadSeason).ok();
                         } else {
-                            self.action_sender.send(Action::PromptDownloadEpisode).ok();
+                            self.action_sender.send(Action::DownloadEpisode).ok();
                         }
                     }
                     FooterAction::Favorite => {
                         self.action_sender.send(Action::ToggleFavorite).ok();
                     }
+                    FooterAction::Info => {
+                        if let Some((title, content)) = self.state.active_overview() {
+                            self.state.open_overview_modal(title, content);
+                        }
+                    }
                     FooterAction::StreamsTab => {
                         self.action_sender.send(Action::TabPane).ok();
-                    }
-                    FooterAction::Back => {
-                        self.action_sender.send(Action::GoBack).ok();
                     }
                 }
                 return;
@@ -1372,25 +1398,21 @@ mod tests {
         let mut app = App::new();
         app.state.active_screen = crate::tui::state::Screen::Home;
         app.state.input_mode = crate::tui::state::InputMode::Normal;
+        app.state.is_tv_mode = false;
         app.state.active_provider = ProviderKind::FourKHdHub;
         app.state.search_query.set_content("deewaniyat");
         app.state.search_results = vec![];
 
         let area = Rect::new(0, 0, 100, 30);
-        let results_y = 2;
+        let (_search_bar_area, results_chunk) =
+            crate::tui::screens::home::search_results_layout(area);
         let next_label = app.state.next_provider().label();
         let ctrl_p = crate::tui::text::CTRL_P_STR;
         let (btn1, btn2) = crate::tui::screens::home::no_results_button_hitboxes(
-            Rect {
-                x: area.x,
-                y: results_y,
-                width: area.width,
-                height: area.height.saturating_sub(results_y),
-            },
+            results_chunk,
             next_label,
             ctrl_p,
             app.state.is_tv_mode,
-            app.state.is_addon_mode,
         );
 
         app.handle_home_mouse(btn2.x + 1, btn2.y, area);
@@ -1402,9 +1424,11 @@ mod tests {
     }
     #[tokio::test]
     async fn test_home_provider_pill_mouse_click_opens_popup() {
+        let original_config = crate::config::load();
         let mut app = App::new();
         app.state.active_screen = crate::tui::state::Screen::Home;
         app.state.input_mode = crate::tui::state::InputMode::Normal;
+        app.state.is_tv_mode = false;
         app.state.active_provider = ProviderKind::MovieBox;
         app.state.search_query.clear();
 
@@ -1449,9 +1473,21 @@ mod tests {
 
         app.handle_home_mouse(pill_rect.x + 1, pill_rect.y, area);
         assert!(app.state.show_provider_popup);
+        let last_idx = available.len() - 1;
+        let last_provider = available[last_idx];
+        let last_target_y = inner.y + last_idx as u16;
+        app.handle_home_mouse(inner.x + 1, last_target_y, area);
+        assert!(!app.state.show_provider_popup);
+        assert_eq!(app.state.active_provider, last_provider);
+
+        let pill_rect =
+            crate::tui::screens::home::search_bar_provider_pill_rect(search_card_area, &app.state);
+        app.handle_home_mouse(pill_rect.x + 1, pill_rect.y, area);
+        assert!(app.state.show_provider_popup);
         app.handle_home_mouse(area.x, area.y, area);
         assert!(!app.state.show_provider_popup);
-        assert_eq!(app.state.active_provider, ProviderKind::FourKHdHub);
+        assert_eq!(app.state.active_provider, last_provider);
+        crate::config::save(&original_config);
     }
 
     #[tokio::test]
@@ -1486,5 +1522,59 @@ mod tests {
         assert!(!app.state.subtitle_popup);
         let notif = app.state.notifications.back().expect("notification posted");
         assert_eq!(notif.title, "Playback Cancelled");
+    }
+
+    #[tokio::test]
+    async fn test_details_header_mouse_click_opens_overview_modal_and_outside_click_dismisses() {
+        let mut app = App::new();
+        let area = Rect::new(0, 0, 100, 30);
+        app.state.active_screen = Screen::Details;
+        app.state.selected_details = Some(crate::providers::models::MediaDetails {
+            id: crate::providers::models::ProviderMediaId {
+                provider: crate::providers::models::ProviderKind::MovieBox,
+                value: "sample_series".to_string(),
+            },
+            title: "Stranger Things".to_string(),
+            media_type: crate::providers::models::MediaType::Series,
+            year: Some("2016".to_string()),
+            description: Some("Full synopsis about the Upside Down.".to_string()),
+            tagline: None,
+            imdb_rating: None,
+            director: None,
+            stars: None,
+            prints: None,
+            audios: None,
+            poster_url: None,
+            duration: None,
+            genres: vec![],
+            seasons: vec![],
+            dubs: vec![],
+        });
+
+        assert!(!app.state.show_overview_modal);
+
+        let layout = crate::tui::screens::details::details_screen_layout(
+            area,
+            app.state.selected_details.as_ref(),
+        );
+        let non_synopsis_x = layout.header_area.x + 2;
+        let non_synopsis_y = layout.header_area.y;
+        app.handle_details_mouse(non_synopsis_x, non_synopsis_y, area);
+        assert!(!app.state.show_overview_modal);
+
+        let synopsis_click_x = layout.synopsis_area.x + 2;
+        let synopsis_click_y = layout.synopsis_area.y;
+        app.handle_details_mouse(synopsis_click_x, synopsis_click_y, area);
+
+        assert!(app.state.show_overview_modal);
+        assert_eq!(app.state.overview_modal_title, "Stranger Things · Synopsis");
+        assert_eq!(
+            app.state.overview_modal_content,
+            "Full synopsis about the Upside Down."
+        );
+
+        let outside_handled = app.handle_overlay_mouse(0, 0, area);
+        assert!(outside_handled);
+        assert!(!app.state.show_overview_modal);
     }
 }

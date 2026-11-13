@@ -1020,11 +1020,8 @@ mod tests {
                 let response = respond(idx);
                 stream.write_all(response.as_bytes())?;
                 stream.flush()?;
-                // Hold the socket open briefly after writing the response:
-                // closing it immediately races the client's response read on
-                // Windows and the connection can be aborted before the
-                // headers arrive, surfacing as `IncompleteMessage` flakes.
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                let _ = stream.shutdown(std::net::Shutdown::Write);
+                std::thread::sleep(std::time::Duration::from_millis(200));
                 idx += 1;
             }
             Ok(requests)

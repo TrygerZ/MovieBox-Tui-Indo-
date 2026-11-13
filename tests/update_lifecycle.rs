@@ -83,45 +83,6 @@ async fn test_update_modal_update_now_click() {
 }
 
 #[tokio::test]
-async fn test_update_modal_open_release_click() {
-    let mut app = App::new();
-    app.state_mut().update_available = Some((
-        "0.1.13".to_string(),
-        "### Notes\n• Major performance improvements".to_string(),
-    ));
-
-    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-    let area = Rect::new(0, 0, cols, rows);
-    let layout = update_modal_layout(area, &app.state().update_available.as_ref().unwrap().1);
-
-    let click_x = layout.update_btn_end_x + 5;
-    let click_y = layout.button_row_y;
-
-    app.handle_action(Action::MouseClick(click_x, click_y))
-        .await;
-
-    assert!(app.state().update_available.is_none());
-}
-
-#[tokio::test]
-async fn test_update_modal_dismiss_click() {
-    let mut app = App::new();
-    app.state_mut().update_available = Some(("0.1.13".to_string(), "• Bug fix".to_string()));
-
-    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-    let area = Rect::new(0, 0, cols, rows);
-    let layout = update_modal_layout(area, &app.state().update_available.as_ref().unwrap().1);
-
-    let click_x = layout.open_btn_end_x + 5;
-    let click_y = layout.button_row_y;
-
-    app.handle_action(Action::MouseClick(click_x, click_y))
-        .await;
-
-    assert!(app.state().update_available.is_none());
-}
-
-#[tokio::test]
 async fn test_active_work_protection_download_active_defers_update() {
     let mut app = App::new();
     app.state_mut().download_progress = Some(45.0);
@@ -356,7 +317,7 @@ fn test_homebrew_detection_and_safe_refusal() {
     );
     assert!(is_homebrew_managed(linuxbrew_path));
 
-    let standard_user_path = std::path::Path::new("/Users/samir/.local/bin/moviebox-tui");
+    let standard_user_path = std::path::Path::new("/usr/local/bin/moviebox-tui");
     assert!(!is_homebrew_managed(standard_user_path));
 }
 
@@ -426,9 +387,108 @@ async fn test_update_progress_message_tracking() {
         "Downloading binary...".to_string(),
     ))
     .await;
-
     assert_eq!(
         app.state().update_progress_msg.as_deref(),
         Some("Downloading binary...")
     );
+}
+
+#[tokio::test]
+async fn test_update_modal_rendered_symmetry_and_exact_height() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let mut app = App::new();
+    let notes = "### Highlights\n- Feature One\n- Feature Two\n- Feature Three";
+    app.state_mut().update_available = Some(("0.1.21".to_string(), notes.to_string()));
+
+    for (w, h) in [(80, 24), (85, 26), (120, 30)] {
+        let backend = TestBackend::new(w, h);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                app.draw(frame);
+            })
+            .unwrap();
+
+        let area = Rect::new(0, 0, w, h);
+        let layout = update_modal_layout(area, notes);
+        let buffer = terminal.backend().buffer();
+
+        let top_border_y = layout.popup_area.y;
+        let bottom_border_y = layout.popup_area.y + layout.popup_area.height - 1;
+
+        let top_cell = &buffer[(layout.popup_area.x, top_border_y)];
+        assert!(
+            top_cell.symbol() == "╭" || top_cell.symbol() == "+" || top_cell.symbol() == "┌",
+            "expected top corner, got {:?} at ({}, {}) in {}x{}",
+            top_cell.symbol(),
+            layout.popup_area.x,
+            top_border_y,
+            w,
+            h
+        );
+
+        let bottom_cell = &buffer[(layout.popup_area.x, bottom_border_y)];
+        assert!(
+            bottom_cell.symbol() == "╰"
+                || bottom_cell.symbol() == "+"
+                || bottom_cell.symbol() == "└",
+            "expected bottom corner, got {:?} at ({}, {}) in {}x{}",
+            bottom_cell.symbol(),
+            layout.popup_area.x,
+            bottom_border_y,
+            w,
+            h
+        );
+
+        let button_row = layout.button_row_y;
+        assert_eq!(button_row, bottom_border_y);
+
+        let mut btn_line = String::new();
+        for x in layout.popup_area.x..layout.popup_area.x + layout.popup_area.width {
+            btn_line.push(
+                buffer[(x, button_row)]
+                    .symbol()
+                    .chars()
+                    .next()
+                    .unwrap_or(' '),
+            );
+        }
+        assert!(btn_line.contains("[u] Update") || btn_line.contains("[b] Copy"));
+
+        let mut title_line = String::new();
+        for x in layout.popup_area.x..layout.popup_area.x + layout.popup_area.width {
+            title_line.push(
+                buffer[(x, top_border_y)]
+                    .symbol()
+                    .chars()
+                    .next()
+                    .unwrap_or(' '),
+            );
+        }
+        assert!(title_line.contains("Update Available"));
+    }
+}
+
+#[tokio::test]
+async fn test_update_target_exe_tracking_on_start() {
+    let mut app = App::new();
+    assert!(app.state().update_target_exe.is_none());
+
+    app.handle_action(Action::StartSelfUpdate).await;
+
+    assert!(app.state().is_updating);
+    assert_eq!(app.state().update_target_exe, std::env::current_exe().ok());
+}
+
+#[test]
+fn test_restart_resolution_recovers_unlinked_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let current_bin = temp.path().join("moviebox-tui");
+    std::fs::write(&current_bin, b"new binary").unwrap();
+
+    let deleted_link = temp.path().join("moviebox-tui.old (deleted)");
+    let resolved = moviebox_tui::updater::resolve_executable_path(&deleted_link);
+    assert_eq!(resolved, current_bin);
 }

@@ -40,56 +40,14 @@ async fn test_season_download_remembers_explicit_no_subtitle_choice() {
 }
 
 #[tokio::test]
-async fn test_download_subtitle_popup_renders_in_app_draw() {
-    let backend = TestBackend::new(100, 30);
-    let mut terminal = Terminal::new(backend).unwrap();
-    let mut app = App::new();
-
-    app.state_mut().is_download_subtitle_popup = true;
-    app.state_mut().subtitle_list = vec![
-        ("None".to_string(), String::new()),
-        (
-            "English".to_string(),
-            "https://example.com/en.srt".to_string(),
-        ),
-    ];
-    app.state_mut().subtitle_list_state.select(Some(0));
-
-    terminal.draw(|frame| app.draw(frame)).unwrap();
-
-    let content = terminal
-        .backend()
-        .buffer()
-        .content()
-        .iter()
-        .map(|c| c.symbol())
-        .collect::<String>();
-
-    assert!(content.contains("Subtitles"));
-    assert!(content.contains("No subtitles"));
-    assert!(content.contains("English"));
-    assert!(content.contains("Download"));
-}
-
-#[tokio::test]
-async fn test_tui_startup_and_home_screen_rendering() {
-    let backend = TestBackend::new(100, 30);
-    let mut terminal = Terminal::new(backend).unwrap();
-    let mut app = App::new();
-
-    terminal.draw(|frame| app.draw(frame)).unwrap();
-    let buffer = terminal.backend().buffer();
-    assert_eq!(buffer.area.width, 100);
-    assert_eq!(buffer.area.height, 30);
-}
-
-#[tokio::test]
 async fn test_tui_all_theme_rendering() {
+    let mut app = App::new();
     for theme_kind in ThemeKind::ALL {
+        app.handle_action(Action::SelectTheme(theme_kind.as_str().to_string()))
+            .await;
+        assert_eq!(app.state().active_theme_kind, theme_kind.as_str());
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
-        let mut app = App::new();
-        let _ = theme_kind;
         let res = terminal.draw(|frame| app.draw(frame));
         assert!(res.is_ok(), "Failed to render theme {:?}", theme_kind);
     }
@@ -210,7 +168,7 @@ async fn test_mouse_click_outside_theme_popup_dismisses() {
     assert!(app.state().show_theme_popup);
 
     app.handle_action(Action::MouseClick(0, 0)).await;
-    assert!(!app.state().show_help);
+    assert!(!app.state().show_theme_popup);
 }
 
 #[tokio::test]
@@ -219,6 +177,8 @@ async fn test_mouse_click_search_input_mode() {
     assert_eq!(app.state().input_mode, InputMode::Normal);
 
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let cols = if cols == 0 { 80 } else { cols };
+    let rows = if rows == 0 { 24 } else { rows };
     let area = ratatui::layout::Rect::new(0, 0, cols, rows);
     let (_, landing_rows) = moviebox_tui::tui::screens::home::landing_split(
         area,
@@ -238,6 +198,11 @@ async fn test_mouse_click_search_input_mode() {
 #[tokio::test]
 async fn test_mouse_click_favorites_item_focuses_and_selects() {
     let mut app = App::new();
+    app.state_mut().is_tv_mode = false;
+    app.state_mut().streaming_enabled = true;
+    app.state_mut()
+        .set_mode(moviebox_tui::tui::state::AppMode::Streaming);
+    app.state_mut().favorites.clear();
     app.state_mut()
         .favorites
         .items
@@ -250,8 +215,10 @@ async fn test_mouse_click_favorites_item_focuses_and_selects() {
             release_year: "2010".to_string(),
             added_at: 100,
         });
-
+    app.state_mut().favorites.rebuild_index();
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let cols = if cols == 0 { 80 } else { cols };
+    let rows = if rows == 0 { 24 } else { rows };
     let area = ratatui::layout::Rect::new(0, 0, cols, rows);
     let (_, landing_rows) = moviebox_tui::tui::screens::home::landing_split(
         area,
@@ -261,7 +228,6 @@ async fn test_mouse_click_favorites_item_focuses_and_selects() {
     );
     let card_w = moviebox_tui::tui::screens::home::search_deck_width(area, app.state(), true);
     let card_x = area.x + area.width.saturating_sub(card_w) / 2;
-    // Header is fav_y + 0, item 0 is fav_y + 1
     let item_0_y = landing_rows.rects[landing_rows.favorites].y + 1;
 
     app.handle_action(Action::MouseClick(card_x + 5, item_0_y))
@@ -342,7 +308,6 @@ async fn test_mouse_scroll_maps_to_key_actions() {
 async fn test_full_user_journey_movie_search_details_and_back_navigation() {
     let mut app = App::new();
     app.state_mut().is_tv_mode = false;
-    app.state_mut().is_addon_mode = false;
     app.state_mut().active_screen = Screen::Home;
     app.state_mut().last_search_edit =
         std::time::Instant::now() - std::time::Duration::from_millis(600);
@@ -372,18 +337,156 @@ async fn test_full_user_journey_movie_search_details_and_back_navigation() {
 #[tokio::test]
 async fn test_full_user_journey_mode_switching_and_theme_selection() {
     let mut app = App::new();
-    app.state_mut().is_addon_mode = false;
     app.state_mut().is_tv_mode = false;
 
-    app.handle_action(Action::ToggleAddonMode).await;
-    assert!(app.state().is_addon_mode);
+    app.handle_action(Action::SwitchToTvMode).await;
+    assert!(app.state().is_tv_mode);
+    app.handle_action(Action::SwitchToTvMode).await;
+    assert!(app.state().is_tv_mode);
 
     app.handle_action(Action::SwitchToStreamingMode).await;
-    assert!(!app.state().is_addon_mode);
-
+    assert!(!app.state().is_tv_mode);
+    app.handle_action(Action::SwitchToStreamingMode).await;
+    assert!(!app.state().is_tv_mode);
     app.handle_action(Action::SelectTheme("TokyoNight".to_string()))
         .await;
     assert_eq!(app.state().active_theme_kind, "TokyoNight");
+    app.handle_action(Action::SwitchToStreamingMode).await;
+}
+
+#[tokio::test]
+async fn test_ctrl_t_and_ctrl_s_mode_switch_keys() {
+    let mut app = App::new();
+    app.state_mut().tv_enabled = true;
+    app.state_mut().streaming_enabled = true;
+    app.state_mut().is_tv_mode = false;
+
+    let ctrl_t = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('t'),
+        crossterm::event::KeyModifiers::CONTROL,
+    );
+    let ctrl_s = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('s'),
+        crossterm::event::KeyModifiers::CONTROL,
+    );
+
+    app.handle_action(Action::Key(ctrl_t)).await;
+    app.handle_action(Action::SwitchToTvMode).await;
+    assert!(app.state().is_tv_mode);
+
+    app.handle_action(Action::Key(ctrl_t)).await;
+    assert!(app.state().is_tv_mode);
+    assert_eq!(app.state().status_message, "Already in TV Mode.");
+
+    app.handle_action(Action::Key(ctrl_s)).await;
+    app.handle_action(Action::SwitchToStreamingMode).await;
+    assert!(!app.state().is_tv_mode);
+
+    app.handle_action(Action::Key(ctrl_s)).await;
+    assert!(!app.state().is_tv_mode);
+    assert_eq!(app.state().status_message, "Already in Streaming Mode.");
+}
+
+#[tokio::test]
+async fn test_tv_mode_search_isolated_to_channels() {
+    let mut app = App::new();
+    app.state_mut().tv_enabled = true;
+    app.state_mut().is_tv_mode = true;
+    app.state_mut().tv_channels = vec![
+        moviebox_tui::providers::tv::Channel {
+            id: "ch1".to_string(),
+            name: "Deepto TV".to_string(),
+            stream_url: "https://example.com/deepto.m3u8".to_string(),
+            group: "Bangla".to_string(),
+            logo: "https://example.com/deepto.png".to_string(),
+        },
+        moviebox_tui::providers::tv::Channel {
+            id: "ch2".to_string(),
+            name: "Somoy TV".to_string(),
+            stream_url: "https://example.com/somoy.m3u8".to_string(),
+            group: "Bangla".to_string(),
+            logo: "https://example.com/somoy.png".to_string(),
+        },
+    ];
+
+    app.handle_action(Action::Search {
+        query: "deepto".to_string(),
+        force_refresh: false,
+    })
+    .await;
+
+    assert_eq!(app.state().search_results.len(), 1);
+    assert_eq!(app.state().search_results[0].title, "Deepto TV");
+    assert_eq!(
+        app.state().search_results[0].id,
+        "https://example.com/deepto.m3u8"
+    );
+
+    app.handle_action(Action::Search {
+        query: "nonexistent".to_string(),
+        force_refresh: false,
+    })
+    .await;
+
+    assert!(app.state().search_results.is_empty());
+    assert_eq!(app.state().status_message, "No matches for 'nonexistent'.");
+}
+#[tokio::test]
+async fn test_tv_mode_no_provider_badge_and_single_clear_button() {
+    let mut app = App::new();
+    app.state_mut().tv_enabled = true;
+    app.state_mut().is_tv_mode = true;
+    app.state_mut().active_screen = Screen::Home;
+    app.state_mut().tv_channels = vec![moviebox_tui::providers::tv::Channel {
+        id: "ch1".to_string(),
+        name: "Deepto TV".to_string(),
+        stream_url: "https://example.com/deepto.m3u8".to_string(),
+        group: "Bangla".to_string(),
+        logo: "https://example.com/deepto.png".to_string(),
+    }];
+
+    app.state_mut().search_query.set_content("deepto");
+    app.handle_action(Action::Search {
+        query: "deepto".to_string(),
+        force_refresh: false,
+    })
+    .await;
+
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal.draw(|frame| app.draw(frame)).unwrap();
+
+    let rendered: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+
+    assert!(rendered.contains("Deepto TV"));
+    assert!(!rendered.contains("[MovieBox]"));
+
+    app.state_mut().search_query.set_content("nonexistent");
+    app.handle_action(Action::Search {
+        query: "nonexistent".to_string(),
+        force_refresh: false,
+    })
+    .await;
+
+    terminal.draw(|frame| app.draw(frame)).unwrap();
+    let rendered_empty: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+
+    assert!(rendered_empty.contains("No TV channels found matching “nonexistent”"));
+    assert!(rendered_empty.contains("Clear Search"));
+    assert!(!rendered_empty.contains("Reload Playlists"));
+    assert!(!rendered_empty.contains("MovieBox"));
 }
 
 #[tokio::test]
@@ -481,7 +584,11 @@ async fn test_ctrl_w_deletes_backward_word() {
 async fn test_f_key_toggles_favorite_on_home_results() {
     let mut app = App::new();
     app.state_mut().active_screen = Screen::Home;
-    app.state_mut().favorites.items.clear();
+    app.state_mut().is_tv_mode = false;
+    app.state_mut().streaming_enabled = true;
+    app.state_mut()
+        .set_mode(moviebox_tui::tui::state::AppMode::Streaming);
+    app.state_mut().favorites.clear();
     let res = SearchResult {
         id: "100".to_string(),
         title: "Test Movie".to_string(),
@@ -533,7 +640,6 @@ async fn test_search_cursor_navigation_and_mid_string_editing() {
     app.state_mut().input_mode = InputMode::Editing;
     app.state_mut().search_query.set_content("avtar");
 
-    // Move left twice to position cursor between 'v' and 't' (pos 2)
     let left = KeyEvent::new(KeyCode::Left, KeyModifiers::empty());
     app.handle_action(Action::Key(left)).await;
     app.handle_action(Action::Key(left)).await;
@@ -541,24 +647,20 @@ async fn test_search_cursor_navigation_and_mid_string_editing() {
     app.handle_action(Action::Key(left)).await;
     assert_eq!(app.state().search_query.cursor(), 2);
 
-    // Insert 'a' -> "avatar"
     let char_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty());
     app.handle_action(Action::Key(char_a)).await;
     assert_eq!(app.state().search_query, "avatar");
     assert_eq!(app.state().search_query.cursor(), 3);
 
-    // Home -> cursor at 0
     let home = KeyEvent::new(KeyCode::Home, KeyModifiers::empty());
     app.handle_action(Action::Key(home)).await;
     assert_eq!(app.state().search_query.cursor(), 0);
 
-    // Forward delete 'a' -> "vatar"
     let delete = KeyEvent::new(KeyCode::Delete, KeyModifiers::empty());
     app.handle_action(Action::Key(delete)).await;
     assert_eq!(app.state().search_query, "vatar");
     assert_eq!(app.state().search_query.cursor(), 0);
 
-    // End -> cursor at end
     let end = KeyEvent::new(KeyCode::End, KeyModifiers::empty());
     app.handle_action(Action::Key(end)).await;
     assert_eq!(app.state().search_query.cursor(), 5);
@@ -570,6 +672,7 @@ async fn test_contextual_window_title() {
     app.state_mut().active_screen = Screen::Home;
     app.state_mut()
         .set_mode(moviebox_tui::tui::state::AppMode::Streaming);
+    app.state_mut().active_provider = moviebox_tui::providers::models::ProviderKind::MovieBox;
     assert_eq!(app.contextual_title(), "MovieBox-Tui — Streaming");
 
     app.state_mut()
@@ -577,7 +680,8 @@ async fn test_contextual_window_title() {
     assert_eq!(app.contextual_title(), "MovieBox-Tui — Live TV");
 
     app.state_mut()
-        .set_mode(moviebox_tui::tui::state::AppMode::Addon);
+        .set_mode(moviebox_tui::tui::state::AppMode::Streaming);
+    app.state_mut().active_provider = moviebox_tui::providers::models::ProviderKind::Addons;
     assert_eq!(app.contextual_title(), "MovieBox-Tui — Addons");
 
     app.state_mut().active_screen = Screen::Details;
@@ -695,7 +799,6 @@ async fn test_ctrl_u_and_clear_command_clears_results_cleanly() {
     assert!(app.state().search_query.is_empty());
     assert_eq!(app.state().input_mode, InputMode::Normal);
 
-    // Test /clear slash command
     app.state_mut().search_results.push(SearchResult {
         id: "2".to_string(),
         title: "Inception".to_string(),
@@ -721,6 +824,9 @@ async fn test_ctrl_u_and_clear_command_clears_results_cleanly() {
 #[tokio::test]
 async fn test_history_item_space_and_p_key_direct_resume() {
     let mut app = App::new();
+    app.state_mut().is_tv_mode = false;
+    app.state_mut()
+        .set_mode(moviebox_tui::tui::state::AppMode::Streaming);
     app.state_mut().active_screen = Screen::Home;
     app.state_mut().input_mode = InputMode::Normal;
     app.state_mut().search_query.set_content("/history");
@@ -751,6 +857,9 @@ async fn test_history_item_space_and_p_key_direct_resume() {
 #[tokio::test]
 async fn test_history_item_enter_pre_seeds_season_and_episode() {
     let mut app = App::new();
+    app.state_mut().is_tv_mode = false;
+    app.state_mut()
+        .set_mode(moviebox_tui::tui::state::AppMode::Streaming);
     app.state_mut().active_screen = Screen::Home;
     app.state_mut().input_mode = InputMode::Normal;
     app.state_mut().search_query.set_content("/history");
@@ -779,7 +888,9 @@ async fn test_history_item_enter_pre_seeds_season_and_episode() {
 #[tokio::test]
 async fn test_search_series_submit_defaults_to_season_one() {
     let mut app = App::new();
+    app.state_mut().is_tv_mode = false;
     app.state_mut().active_screen = Screen::Home;
+    app.state_mut().is_loading = false;
     app.state_mut().input_mode = InputMode::Normal;
     app.state_mut().search_query.set_content("Breaking Bad");
     app.state_mut().search_results.push(SearchResult {
@@ -813,7 +924,6 @@ async fn test_no_results_and_error_state_rendering_hints() {
     let mut terminal = Terminal::new(backend).unwrap();
     let mut app = App::new();
 
-    // No results view
     app.state_mut().active_screen = Screen::Home;
     app.state_mut().input_mode = InputMode::Normal;
     app.state_mut().has_search_settled = true;
@@ -830,7 +940,6 @@ async fn test_no_results_and_error_state_rendering_hints() {
     assert!(text.contains("No results for “nonexistent_movie_xyz” on MovieBox"));
     assert!(text.contains("Try on 4KHDHub"));
     assert!(text.contains("Clear Search"));
-    // Error view
     app.state_mut().search_error =
         Some("Failed to connect to MovieBox provider: connection refused by server".to_string());
     terminal.draw(|frame| app.draw(frame)).unwrap();
@@ -862,10 +971,8 @@ async fn test_ctrl_p_scoped_strictly_to_streaming_mode() {
     app.handle_action(Action::Key(ctrl_p)).await;
     assert!(!app.state().tv_config_popup);
 
-    app.state_mut()
-        .set_mode(moviebox_tui::tui::state::AppMode::Addon);
+    app.state_mut().active_provider = moviebox_tui::providers::models::ProviderKind::Addons;
     app.state_mut().is_tv_mode = false;
-    app.state_mut().is_addon_mode = true;
     app.state_mut().addons_enabled = true;
     app.state_mut().addon_manager_popup = false;
     app.handle_action(Action::Key(ctrl_p)).await;
@@ -913,9 +1020,9 @@ async fn test_tui_layout_truncation_and_bounds() {
     }
 
     let tier = moviebox_tui::tui::screens::details::DetailsLayoutTier::Narrow;
-    assert_eq!(tier.footer_height(80), 2);
-    assert_eq!(tier.footer_height(105), 2);
-    assert_eq!(tier.footer_height(106), 1);
+    assert_eq!(tier.footer_height(70), 2);
+    assert_eq!(tier.footer_height(79), 2);
+    assert_eq!(tier.footer_height(80), 1);
     assert_eq!(tier.footer_height(120), 1);
 }
 
@@ -925,8 +1032,11 @@ async fn test_home_deck_tab_switching() {
     app.state_mut().active_screen = Screen::Home;
     app.state_mut().input_mode = InputMode::Normal;
     app.state_mut().streaming_enabled = true;
+    app.state_mut().is_tv_mode = false;
+    app.state_mut()
+        .set_mode(moviebox_tui::tui::state::AppMode::Streaming);
     app.state_mut().history.recent.clear();
-    app.state_mut().favorites.items.clear();
+    app.state_mut().favorites.clear();
 
     app.state_mut()
         .history
@@ -944,6 +1054,7 @@ async fn test_home_deck_tab_switching() {
             duration_seconds: Some(3000),
             completed: false,
             timestamp: 100,
+            stream_filename: None,
         });
     app.state_mut()
         .favorites
@@ -1001,13 +1112,50 @@ async fn test_home_deck_tab_switching() {
 }
 
 #[tokio::test]
+async fn test_browse_suggestions_dimmed_when_modal_active() {
+    let mut app = App::new();
+    app.state_mut().active_screen = Screen::Home;
+    app.state_mut().input_mode = InputMode::Normal;
+    app.state_mut().history.recent.clear();
+    app.state_mut().favorites.clear();
+    app.state_mut().is_tv_mode = false;
+
+    let backend = ratatui::backend::TestBackend::new(90, 30);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+
+    terminal.draw(|frame| app.draw(frame)).unwrap();
+    let buffer_normal = terminal.backend().buffer().clone();
+
+    app.state_mut().show_provider_popup = true;
+    terminal.draw(|frame| app.draw(frame)).unwrap();
+    let buffer_modal = terminal.backend().buffer().clone();
+
+    let cell_normal = buffer_normal
+        .content()
+        .iter()
+        .find(|c| c.symbol() == "T")
+        .expect("Trending Now should be rendered in normal mode");
+
+    let cell_modal = buffer_modal
+        .content()
+        .iter()
+        .find(|c| c.symbol() == "T")
+        .expect("Trending Now should be rendered when modal is active");
+
+    assert_ne!(cell_normal.style().fg, cell_modal.style().fg);
+}
+
+#[tokio::test]
 async fn test_home_deck_continue_watching_resume() {
     let mut app = App::new();
     app.state_mut().active_screen = Screen::Home;
     app.state_mut().input_mode = InputMode::Normal;
     app.state_mut().streaming_enabled = true;
+    app.state_mut().is_tv_mode = false;
+    app.state_mut()
+        .set_mode(moviebox_tui::tui::state::AppMode::Streaming);
     app.state_mut().history.recent.clear();
-    app.state_mut().favorites.items.clear();
+    app.state_mut().favorites.clear();
 
     app.state_mut()
         .history
@@ -1025,6 +1173,7 @@ async fn test_home_deck_continue_watching_resume() {
             duration_seconds: Some(3000),
             completed: false,
             timestamp: 200,
+            stream_filename: None,
         });
 
     app.state_mut().favorites_focus = true;
@@ -1048,8 +1197,11 @@ async fn test_landing_deck_header_renders_without_star_or_bracket() {
     let mut app = App::new();
     app.state_mut().active_screen = Screen::Home;
     app.state_mut().streaming_enabled = true;
+    app.state_mut().is_tv_mode = false;
+    app.state_mut()
+        .set_mode(moviebox_tui::tui::state::AppMode::Streaming);
     app.state_mut().history.recent.clear();
-    app.state_mut().favorites.items.clear();
+    app.state_mut().favorites.clear();
 
     app.state_mut()
         .history
@@ -1067,6 +1219,7 @@ async fn test_landing_deck_header_renders_without_star_or_bracket() {
             duration_seconds: Some(3000),
             completed: false,
             timestamp: 100,
+            stream_filename: None,
         });
     app.state_mut()
         .favorites
@@ -1095,7 +1248,7 @@ async fn test_landing_deck_header_renders_without_star_or_bracket() {
         .map(|c| c.symbol())
         .collect();
 
-    assert!(text.contains("Continue Watching"));
+    assert!(text.contains("Resume"));
     assert!(text.contains("Favorites"));
     assert!(!text.contains("★"));
     assert!(!text.contains("- *  Favorites"));

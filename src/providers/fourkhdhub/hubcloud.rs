@@ -1,4 +1,5 @@
 use super::client::FourKHdHubError;
+use crate::providers::models::ResolutionIntent;
 use reqwest::Url;
 use scraper::{Html, Selector};
 use std::net::IpAddr;
@@ -12,6 +13,7 @@ static SEL_LINKS: LazyLock<Selector> = LazyLock::new(|| Selector::parse("a[href]
 pub async fn resolve(
     client: &reqwest::Client,
     drive_url: &str,
+    intent: ResolutionIntent,
 ) -> Result<Vec<(String, String, Vec<(String, String)>)>, FourKHdHubError> {
     validate_resolver_url(drive_url)?;
     let drive_html = client
@@ -42,7 +44,13 @@ pub async fn resolve(
 
     let mut candidates = extract_script_pixeldrain_urls(&resolver_html)
         .into_iter()
-        .map(|url| (score(&url, "PixelDrain"), url, "PixelDrain".to_string()))
+        .map(|url| {
+            (
+                score(&url, "PixelDrain", intent),
+                url,
+                "PixelDrain".to_string(),
+            )
+        })
         .collect::<Vec<_>>();
     candidates.extend(
         resolver
@@ -54,14 +62,14 @@ pub async fn resolve(
                     && let Ok(valid) = validate_playback_url(&unwrapped)
                 {
                     return Some((
-                        score(&valid, "Watch Online"),
+                        score(&valid, "Watch Online", intent),
                         valid,
                         "Watch Online".to_string(),
                     ));
                 }
                 validate_playback_url(href).ok().map(|url| {
                     let url = pixeldrain_api_url(&url).unwrap_or(url);
-                    (score(&url, &label), url, clean_label(&label))
+                    (score(&url, &label, intent), url, clean_label(&label))
                 })
             })
             .collect::<Vec<_>>(),
@@ -84,6 +92,7 @@ pub async fn resolve(
 pub async fn resolve_hubdrive(
     client: &reqwest::Client,
     drive_url: &str,
+    intent: ResolutionIntent,
 ) -> Result<Vec<(String, String, Vec<(String, String)>)>, FourKHdHubError> {
     validate_hubdrive_url(drive_url)?;
     let html = client
@@ -95,13 +104,116 @@ pub async fn resolve_hubdrive(
         .await?;
     let hubcloud_url = extract_hubcloud_drive_url(&html)
         .ok_or_else(|| FourKHdHubError::Parse("HubDrive HubCloud mirror missing".into()))?;
-    resolve(client, &hubcloud_url).await
+    resolve(client, &hubcloud_url, intent).await
+}
+
+pub async fn resolve_greenmotors(
+    client: &reqwest::Client,
+    drive_url: &str,
+    intent: ResolutionIntent,
+) -> Result<Vec<(String, String, Vec<(String, String)>)>, FourKHdHubError> {
+    validate_greenmotors_url(drive_url)?;
+    let html = client
+        .get(drive_url)
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+    let target_url = unpack_greenmotors_url(&html)
+        .ok_or_else(|| FourKHdHubError::Parse("GreenMotors mirror target missing".into()))?;
+    if target_url.contains("hubcloud.") {
+        resolve(client, &target_url, intent).await
+    } else if target_url.contains("hubdrive.") {
+        resolve_hubdrive(client, &target_url, intent).await
+    } else {
+        validate_playback_url(&target_url).map(|url| vec![(url, "Direct".to_string(), Vec::new())])
+    }
+}
+
+fn validate_greenmotors_url(raw: &str) -> Result<(), FourKHdHubError> {
+    let url = Url::parse(raw).map_err(|_| FourKHdHubError::InvalidUrl(raw.into()))?;
+    let host = url.host_str().unwrap_or_default();
+    if url.scheme() != "https"
+        || (!host.contains("greenmotors.") && !host.contains("greenmountmotors."))
+    {
+        return Err(FourKHdHubError::InvalidUrl(raw.into()));
+    }
+    Ok(())
+}
+
+fn unpack_greenmotors_url(html: &str) -> Option<String> {
+    let payload = extract_greenmotors_payload(html)?;
+    decode_greenmotors_payload(&payload)
+}
+
+fn extract_greenmotors_payload(html: &str) -> Option<String> {
+    let needle = "s(";
+    let mut search_idx = 0;
+    while let Some(pos) = html[search_idx..].find(needle) {
+        let abs_pos = search_idx + pos + needle.len();
+        let rest = html[abs_pos..].trim_start();
+        let after_key = if let Some(stripped) = rest.strip_prefix("'o'") {
+            stripped
+        } else if let Some(stripped) = rest.strip_prefix("\"o\"") {
+            stripped
+        } else {
+            search_idx = abs_pos;
+            continue;
+        };
+        let after_comma = if let Some(stripped) = after_key.trim_start().strip_prefix(',') {
+            stripped
+        } else {
+            search_idx = abs_pos;
+            continue;
+        };
+        let trimmed = after_comma.trim_start();
+        let quote = match trimmed.chars().next() {
+            Some(c @ ('\'' | '"')) => c,
+            _ => {
+                search_idx = abs_pos;
+                continue;
+            }
+        };
+        let payload_slice = &trimmed[1..];
+        if let Some(end) = payload_slice.find(quote) {
+            return Some(payload_slice[..end].to_string());
+        }
+        search_idx = abs_pos;
+    }
+    None
+}
+
+fn rot13(input: &str) -> String {
+    input
+        .chars()
+        .map(|c| match c {
+            'a'..='m' | 'A'..='M' => ((c as u8) + 13) as char,
+            'n'..='z' | 'N'..='Z' => ((c as u8) - 13) as char,
+            _ => c,
+        })
+        .collect()
+}
+
+fn decode_greenmotors_payload(payload: &str) -> Option<String> {
+    use base64::Engine;
+    let b64 = &base64::engine::general_purpose::STANDARD;
+    let step1_bytes = b64.decode(payload.as_bytes()).ok()?;
+    let step1_str = String::from_utf8(step1_bytes).ok()?;
+    let step2_bytes = b64.decode(step1_str.as_bytes()).ok()?;
+    let step2_str = String::from_utf8(step2_bytes).ok()?;
+    let step3_rot = rot13(&step2_str);
+    let step4_bytes = b64.decode(step3_rot.as_bytes()).ok()?;
+    let step4_str = String::from_utf8(step4_bytes).ok()?;
+    let json_val: serde_json::Value = serde_json::from_str(&step4_str).ok()?;
+    let target_b64 = json_val.get("o")?.as_str()?;
+    let target_bytes = b64.decode(target_b64.as_bytes()).ok()?;
+    String::from_utf8(target_bytes).ok()
 }
 
 fn extract_hubcloud_drive_url(html: &str) -> Option<String> {
     let document = Html::parse_document(html);
-    let links = Selector::parse("a[href]").ok()?;
-    document.select(&links).find_map(|node| {
+    document.select(&SEL_LINKS).find_map(|node| {
         let raw = node.value().attr("href")?;
         let url = Url::parse(raw).ok()?;
         let host = url.host_str()?;
@@ -217,6 +329,8 @@ pub fn validate_playback_url(raw: &str) -> Result<String, FourKHdHubError> {
         || path.ends_with(".zip")
         || path.contains("login.php")
         || path.contains("logout")
+        || host.contains("greenmotors.")
+        || host.contains("greenmountmotors.")
     {
         return Err(FourKHdHubError::InvalidUrl(raw.into()));
     }
@@ -284,37 +398,73 @@ fn is_public_ip(address: IpAddr) -> bool {
     }
 }
 
-pub fn score(url: &str, label: &str) -> u8 {
+pub fn score(url: &str, label: &str, intent: ResolutionIntent) -> u8 {
     let value = format!("{} {}", url, label).to_ascii_lowercase();
-    if value.contains("cloudflarestorage.com")
-        || value.contains("r2.cloudflarestorage.com")
-        || value.contains("fsl server")
-        || value.contains("r2.dev")
-        || value.contains("workers.dev")
-        || value.contains("watch online")
-    {
-        0
-    } else if value.contains("storage.googleapis.com")
-        || value.contains("hubcloud.cx/re/")
-        || value.contains("hubcloud.fans/re/")
-    {
-        1
-    } else if value.contains("pixeldrain.com")
-        || value.contains("pixeldrain.dev")
-        || value.contains("pixel.hubcloud.")
-        || value.contains("pixeldrain")
-    {
-        2
-    } else if value.contains("googleusercontent.com")
-        || value.contains("googlevideo.com")
-        || value.contains("testzip.php")
-        || value.contains("vcloud.php")
-        || value.contains("drive.php")
-        || value.contains("gpdl.")
-    {
-        3
-    } else {
-        4
+    match intent {
+        ResolutionIntent::Playback => {
+            if value.contains("pixel.hubcloud.")
+                || value.contains("googleusercontent.com")
+                || value.contains("googlevideo.com")
+                || value.contains("cloudflarestorage.com")
+                || value.contains("r2.cloudflarestorage.com")
+                || value.contains("fsl server")
+                || value.contains("10gbps")
+                || value.contains("r2.dev")
+                || value.contains("watch online")
+            {
+                0
+            } else if value.contains("storage.googleapis.com")
+                || value.contains("hubcloud.cx/re/")
+                || value.contains("hubcloud.fans/re/")
+            {
+                1
+            } else if value.contains("pixeldrain.com")
+                || value.contains("pixeldrain.dev")
+                || value.contains("pixeldrain")
+            {
+                2
+            } else if value.contains("testzip.php")
+                || value.contains("vcloud.php")
+                || value.contains("drive.php")
+                || value.contains("gpdl.")
+            {
+                3
+            } else {
+                4
+            }
+        }
+        ResolutionIntent::Download => {
+            if value.contains("pixel.hubcloud.")
+                || value.contains("googleusercontent.com")
+                || value.contains("cloudflarestorage.com")
+                || value.contains("r2.cloudflarestorage.com")
+                || value.contains("fsl server")
+                || value.contains("r2.dev")
+                || value.contains("workers.dev")
+                || value.contains("watch online")
+            {
+                0
+            } else if value.contains("storage.googleapis.com")
+                || value.contains("hubcloud.cx/re/")
+                || value.contains("hubcloud.fans/re/")
+            {
+                1
+            } else if value.contains("pixeldrain.com")
+                || value.contains("pixeldrain.dev")
+                || value.contains("pixeldrain")
+            {
+                2
+            } else if value.contains("googlevideo.com")
+                || value.contains("testzip.php")
+                || value.contains("vcloud.php")
+                || value.contains("drive.php")
+                || value.contains("gpdl.")
+            {
+                3
+            } else {
+                4
+            }
+        }
     }
 }
 
@@ -353,28 +503,78 @@ mod tests {
     fn scores_mirrors_by_priority() {
         assert_eq!(
             score(
-                "https://c357acb6.r2.cloudflarestorage.com/file.mkv",
-                "FSL Server"
+                "https://pixel.hubcloud.ist/?id=123",
+                "Download [Server : 10Gbps]",
+                ResolutionIntent::Playback
             ),
             0
         );
         assert_eq!(
-            score("https://worker.sub.workers.dev/file.mkv", "Cloudflare"),
+            score(
+                "https://worker.sub.workers.dev/file.mkv",
+                "Cloudflare",
+                ResolutionIntent::Playback
+            ),
+            4
+        );
+        assert_eq!(
+            score(
+                "https://worker.sub.workers.dev/file.mkv",
+                "Cloudflare",
+                ResolutionIntent::Download
+            ),
             0
         );
         assert_eq!(
-            score("https://storage.googleapis.com/bucket/file.mkv", "Storage"),
+            score(
+                "https://c357acb6.r2.cloudflarestorage.com/file.mkv",
+                "FSL Server",
+                ResolutionIntent::Playback
+            ),
+            0
+        );
+        assert_eq!(
+            score(
+                "https://storage.googleapis.com/bucket/file.mkv",
+                "Storage",
+                ResolutionIntent::Playback
+            ),
             1
         );
         assert_eq!(
-            score("https://pixeldrain.com/api/file/abc?download", "PixelDrain"),
+            score(
+                "https://pixeldrain.com/api/file/abc?download",
+                "PixelDrain",
+                ResolutionIntent::Playback
+            ),
             2
         );
         assert_eq!(
-            score("https://hubcloud.cx/testzip.php?id=123", "Fast Direct"),
-            3
+            score(
+                "https://unknown-mirror.org/file.mkv",
+                "Unknown",
+                ResolutionIntent::Playback
+            ),
+            4
         );
-        assert_eq!(score("https://gpdl.example.com/stream", "Google Drive"), 3);
-        assert_eq!(score("https://unknown-mirror.org/file.mkv", "Unknown"), 4);
+    }
+
+    #[test]
+    fn decodes_greenmotors_payload_pipeline() {
+        let payload = "Y214WE0xWjNZbXRhVUdwMmIxQldObFo2ZFRCeFZVOXRRbmxxYVV0UU9XRndla2w1YjNveGFYRlVPV3h3YkRWM2IxVkpka3RRT1dKdk1qRjViMVJUYUUxVVNXeExVRGgyV1ZCWGFWWjNZblpNU0hWR1dsUkJWa2RIVFZweVIzbHBUVk54V0c1NlYxVkNSMU51UkcxSmFreHRRVVZ4ZVdOV1JtRlBlRzlKU1RKTWJVRkNjbnBCYUVwaGVYbHZlWGswU25vMWVISktXbTFIZDFaMmMwUTlQUT09";
+        let target = decode_greenmotors_payload(payload);
+        assert_eq!(
+            target.as_deref(),
+            Some("https://hubcloud.ist/drive/sssrvrzv1fwrssv")
+        );
+    }
+
+    #[test]
+    fn extracts_greenmotors_script_payload() {
+        let snippet = r#"<script>function s(e,t,i){}s('o','TEST_PAYLOAD_ABC123',180000);</script>"#;
+        assert_eq!(
+            extract_greenmotors_payload(snippet).as_deref(),
+            Some("TEST_PAYLOAD_ABC123")
+        );
     }
 }

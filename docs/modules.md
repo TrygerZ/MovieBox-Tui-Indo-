@@ -9,7 +9,7 @@ src/
   main.rs            Entry point. Logging init, panic hook, raw mode, alternate
                      screen, TerminalGuard, App::new + App::run.
   lib.rs             Crate root: declares pub mod cache/config/download/favorites/
-                     history/logging/models/net/player/providers/service/tui/updater.
+                     history/logging/models/net/player/providers/proxy/service/tui/updater.
 
   cache.rs           Disk cache: provider-namespaced directories, TTL expiry,
                      atomic temp-file writes, payload validation, background purge.
@@ -37,8 +37,8 @@ src/
                      history and favorites).
 
   net.rs             Shared HTTP plumbing: FallbackResolver (hickory DNS reading the
-                     OS configuration, falling back to Cloudflare/Google/Quad9 when
-                     absent) wired into every reqwest client via
+                     OS configuration, with automatic runtime fallback to Cloudflare/Google/Quad9
+                     on failure or when absent) wired into every reqwest client via
                      net::http_client_builder().
 
   player.rs          Player detection (OnceLock) and command construction for
@@ -47,6 +47,10 @@ src/
   player/
     tracker.rs       Injected Lua tracker script (`moviebox_tracker.lua`) and
                      periodic 5-second playback state auto-saving.
+
+  proxy.rs           Detached loopback HTTP proxy: handles signed CloudFront cookie
+                     streams for VLC and Android Intent playback, rewrites DASH manifests,
+                     and serves streams and subtitles over localhost.
 
   providers/
     mod.rs           Module declarations.
@@ -62,7 +66,9 @@ src/
       client.rs      Search/details/stream resolution + preflight validation.
       hubcloud.rs    Mirror resolver: fetch drive pages, extract playable links.
       parser.rs      HTML parsing into typed CatalogItem/MediaDetails/Release.
+    dramachi/        Asian dramas and series provider (client + parser).
     bdix/
+      common.rs      Shared BDIX resolution, audio language, and codec detection heuristics.
       circleftp/     BDIX CircleFTP provider (client + parser).
       dhakaflix/     BDIX DhakaFlix provider (client + parser).
     addons/          Community HTTP addons provider (client, aggregator, adapter, models).
@@ -78,7 +84,7 @@ src/
     download.rs      Release asset download (https-only) with retry.
     verify.rs        SHA-256 hashing and sha256sums parsing for artifact verification.
     extract.rs       tar.gz / archive extraction for the staged binary.
-    apply.rs         Swap in the new binary, install-environment detection, restart.
+    apply.rs         Swap in new binary, resolve executable path, detect environment, restart.
     artifact.rs      Release/ReleaseAsset types, target-platform matching.
 
   tui/
@@ -110,8 +116,6 @@ src/
     mod.rs           App struct, App::new, and small helpers.
     run.rs           App::run (event loop), App::draw (rendering), and
                      handle_action dispatcher (thin routing table over action groups).
-    network.rs       fetch_poster_bytes, decode_poster, provider_search,
-                     provider_details.
     search.rs        Search-mode command routing, search state setup, provider
                      search dispatch, poster prefetch helpers.
     requests.rs      handle_requests: suggest/history/homepage/details/preview/

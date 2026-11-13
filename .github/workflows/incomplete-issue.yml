@@ -1,0 +1,46 @@
+name: Incomplete Issue Guard
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  issues: write
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check for empty reports
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const issue = context.payload.issue;
+            const body = issue.body || '';
+
+            const descMatch = body.match(/### Description([\s\S]*?)###/);
+            const reproMatch = body.match(/### Steps to reproduce([\s\S]*?)###/);
+
+            const desc = descMatch ? descMatch[1].trim() : '';
+            const repro = reproMatch ? reproMatch[1].trim() : '';
+            const hasImage = /<img|!\[.*?\]\(.*?\)/i.test(body);
+
+            const tooShort = (s) => s.replace(/\s/g, '').length < 15;
+            const isPlaceholder = (s) => /^(please\s*resol|no\s*steps|followed\s*everything|error|none|\.+)$/i.test(s.trim());
+
+            const incomplete =
+              ((tooShort(desc) || isPlaceholder(desc)) && !hasImage) ||
+              ((tooShort(repro) || isPlaceholder(repro)) && !hasImage);
+
+            if (!incomplete) return;
+
+            await github.rest.issues.addLabels({
+              ...context.repo,
+              issue_number: issue.number,
+              labels: ['needs-info'],
+            });
+
+            await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: issue.number,
+              body: `Thanks for opening an issue! Please provide a brief description of what happened and steps to reproduce it so we can investigate.\n\nScreenshots or terminal error notices can be pasted directly into the issue description.`,
+            });

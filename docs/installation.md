@@ -4,55 +4,64 @@ MovieBox-TUI is available across macOS, Linux, Windows, and Android (Termux).
 
 ---
 
-## macOS & Linux
+## macOS and Linux
 
-Install via the automated script:
+### Homebrew (macOS)
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/mesamirh/MovieBox-Tui/main/install.sh | bash
-```
-
-### macOS via Homebrew
+If you have [Homebrew](https://brew.sh/):
 
 ```bash
 brew tap mesamirh/moviebox-tui https://github.com/mesamirh/MovieBox-Tui
-brew trust mesamirh/moviebox-tui
 brew install moviebox-tui
+```
+
+> [!NOTE]
+> If Homebrew prompts for tap verification on initial install, run `brew trust mesamirh/moviebox-tui`.
+
+### Direct Terminal Script
+
+No package manager required. Open Terminal and run:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mesamirh/MovieBox-Tui/main/install.sh | bash
 ```
 
 ---
 
 ## Windows
 
-Install via PowerShell (run in Windows Terminal or PowerShell 5.1+):
+### Scoop Package Manager (Recommended)
+
+If you have [Scoop](https://scoop.sh/):
+
+```powershell
+scoop bucket add moviebox https://github.com/mesamirh/MovieBox-Tui
+scoop install moviebox-tui
+```
+
+### Direct PowerShell Script
+
+No package manager required. Open **PowerShell** and run:
 
 ```powershell
 irm https://raw.githubusercontent.com/mesamirh/MovieBox-Tui/main/install.ps1 | iex
 ```
 
+> **SmartScreen prompt:** If Windows displays *"Windows protected your PC"*, click **More info** → **Run anyway**.
 ---
 
 ## Android (Termux)
 
-Install Termux tools and the intent bridge, run the installer script to fetch the precompiled native Android ARM64 binary, and grant storage permissions:
+Open Termux and run:
 
 ```bash
 pkg update && pkg install -y curl tar termux-tools termux-am
-curl -fsSL https://raw.githubusercontent.com/mesamirh/MovieBox-Tui/main/install.sh -o install.sh && bash install.sh
+curl -fsSL https://raw.githubusercontent.com/mesamirh/MovieBox-Tui/main/install.sh | bash
 termux-setup-storage
 ```
 
-The installer automatically downloads the native Android ARM64 release package (`MovieBox_Android_arm64.tar.gz`) built against the Android NDK and Bionic libc, requiring zero on-device compilation.
-
-> **Media Player Requirements**: Android streams are rendered through external Android video players (such as **VLC for Android**, **MX Player**, **Just Player**, or **MPV Android APK**) triggered via `termux-open` or `termux-am`. Command-line `mpv` installed directly in Termux (`pkg install mpv`) runs without a video output surface unless an X11 desktop environment (like Termux:X11) is configured.
-
-To compile from source on Termux:
-
-```bash
-pkg install -y rust clang
-cargo install moviebox-tui --locked
-```
-
+> [!IMPORTANT]
+> Video playback on Android launches through your installed external media player (such as VLC, Just Player, or MX Player).
 ---
 
 ## Cargo (Crates.io)
@@ -86,4 +95,29 @@ All release assets include cryptographically signed SHA-256 checksums and GitHub
 ```bash
 sha256sum -c SHA256SUMS --ignore-missing
 gh attestation verify <archive-file> -R mesamirh/MovieBox-Tui
+```
+---
+
+## Uninstallation
+
+### Automated Installer (macOS, Linux, Windows, Android)
+
+Simply re-run your original install command (`curl ... | bash` or `irm ... | iex`). When MovieBox-TUI is already installed, the installer automatically detects it and displays an interactive menu:
+
+```text
+MovieBox-TUI is already installed.
+What would you like to do?
+  1) Reinstall / Update to latest version
+  2) Uninstall
+  3) Cancel
+```
+
+Enter `2` to completely remove MovieBox-TUI from your system.
+
+### Package Managers
+
+```bash
+brew uninstall moviebox-tui     # Homebrew (macOS)
+scoop uninstall moviebox-tui    # Scoop (Windows)
+cargo uninstall moviebox-tui    # Cargo
 ```

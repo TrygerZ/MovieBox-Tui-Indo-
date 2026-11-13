@@ -1,5 +1,6 @@
 pub mod addons;
 pub mod bdix;
+pub mod dramachi;
 pub mod fourkhdhub;
 pub mod models;
 pub mod moviebox;
@@ -10,7 +11,7 @@ pub use tv as m3u;
 
 pub use models::{
     AudioTrackOption, CatalogItem, Episode, MediaDetails, MediaType, PlaybackSource, ProviderError,
-    ProviderKind, ProviderMediaId, Release, Season, SourceMirror, SubtitleOption,
+    ProviderKind, ProviderMediaId, Release, ResolutionIntent, Season, SourceMirror, SubtitleOption,
 };
 use serde::{Deserialize, Serialize};
 

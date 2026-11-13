@@ -16,14 +16,16 @@ impl App {
         self.state.subtitle_popup = false;
         self.state.is_download_subtitle_popup = false;
         self.state.pending_play_link = None;
+        self.state.pending_playback_source = None;
         self.state.subtitle_list.clear();
         self.state.subtitle_list_state.select(None);
-        self.state.show_season_download_confirm = false;
-        self.state.show_episode_download_confirm = false;
         self.state.is_resolving_playback = false;
+        self.state.is_waiting_for_download_stream = false;
         self.state.tv_input_active = false;
         self.state.tv_input_buffer.clear();
         self.state.tv_input_is_file = false;
+        self.state.show_overview_modal = false;
+        self.state.overview_modal_scroll = 0;
     }
 
     pub(super) fn reset_mode_state(&mut self) {
@@ -39,6 +41,7 @@ impl App {
         self.state.tick_count = 0;
         self.reset_transient_overlays();
         self.state.input_mode = crate::tui::state::InputMode::Normal;
+        self.state.active_screen = crate::tui::state::Screen::Home;
         self.state.is_loading = false;
         self.state.clear_search_state();
         self.state.clear_details_state();
@@ -55,25 +58,15 @@ impl App {
             crate::tui::state::AppMode::Tv => {
                 self.state.set_status_long("Loading TV playlists...");
             }
-            crate::tui::state::AppMode::Addon => {
-                self.state.set_status_default("Addon mode active.");
-            }
         }
     }
 
     pub(super) async fn handle_tv(&mut self, action: Action) -> Option<()> {
         match action {
-            Action::ToggleTvMode => {
-                self.reset_mode_state();
-                let will_be_tv = !self.state.is_tv_mode;
-                if will_be_tv {
+            Action::SwitchToTvMode => {
+                if !self.state.is_tv_mode {
+                    self.reset_mode_state();
                     self.state.set_mode(crate::tui::state::AppMode::Tv);
-                } else if self.state.streaming_enabled {
-                    self.state.set_mode(crate::tui::state::AppMode::Streaming);
-                } else if self.state.addons_enabled {
-                    self.state.set_mode(crate::tui::state::AppMode::Addon);
-                }
-                if self.state.is_tv_mode {
                     self.state.tv_config_popup = false;
                     self.state.tv_channels.clear();
                     self.announce_mode();
@@ -82,28 +75,8 @@ impl App {
                     if self.state.tv_playlists.is_empty() {
                         self.action_sender.send(Action::ShowTvConfig).ok();
                     }
-                } else if self.state.is_addon_mode {
-                    self.state.tv_config_popup = false;
-                    self.state.search_results.clear();
-                    self.state.active_provider = crate::providers::models::ProviderKind::Addons;
-                    self.load_installed_addons_from_config();
-                    if self.state.installed_addons.is_empty() {
-                        self.action_sender.send(Action::ShowAddonManager).ok();
-                    } else {
-                        self.announce_mode();
-                    }
-                } else {
-                    self.state.tv_config_popup = false;
-                    self.state.search_query.clear();
-                    self.state.search_results.clear();
-                    if self.state.active_provider == crate::providers::models::ProviderKind::Addons
-                    {
-                        self.state.active_provider =
-                            crate::providers::models::ProviderKind::MovieBox;
-                    }
-                    self.announce_mode();
+                    self.persist_config();
                 }
-                self.persist_config();
             }
 
             Action::ShowTvConfig => {
@@ -111,7 +84,8 @@ impl App {
                     self.reset_transient_overlays();
                     self.state.tv_config_popup = true;
                     self.state.input_mode = crate::tui::state::InputMode::Normal;
-                    self.state.tv_manager_selected = 1;
+                    self.state.tv_manager_selected =
+                        usize::from(!self.state.tv_playlists.is_empty());
                     self.state.tv_input_active = false;
                     self.state.tv_input_buffer.clear();
                 }
@@ -178,21 +152,16 @@ impl App {
                     });
                 if self.state.tv_channels.is_empty() {
                     let status = if failed > 0 {
-                        format!(
-                            "No TV channels found. {failed} playlist(s) failed to load. Add a playlist (/config)."
-                        )
+                        format!("No channels. {failed} failed. Add playlist (/config).")
                     } else {
-                        "No TV channels found. Add a playlist (/config).".to_string()
+                        "No channels. Add playlist (/config).".to_string()
                     };
                     self.state.set_status_long(status);
                 } else {
-                    let mut status = format!(
-                        "{} TV channels imported from {} playlist(s).",
-                        self.state.tv_channels.len(),
-                        self.state.tv_playlists.len().max(1)
-                    );
+                    let count = self.state.tv_channels.len();
+                    let mut status = format!("{count} channels loaded.");
                     if failed > 0 {
-                        status.push_str(&format!(" {failed} playlist(s) failed to load."));
+                        status.push_str(&format!(" {failed} failed."));
                     }
                     self.state.set_status_long(status);
                 }

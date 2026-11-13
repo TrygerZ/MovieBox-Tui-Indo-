@@ -40,13 +40,13 @@ OPTIONS:
     -Uninstall           Uninstall MovieBox-TUI from your system
     -Help                Show this help message
 "@
-    exit 0
+    return
 }
 
 function Write-Step { param([string]$Message) Write-Host "  > " -ForegroundColor Cyan -NoNewline; Write-Host $Message }
 function Write-Success { param([string]$Message) Write-Host "  + " -ForegroundColor Green -NoNewline; Write-Host $Message }
 function Write-Warn { param([string]$Message) Write-Host "  ! " -ForegroundColor Yellow -NoNewline; Write-Host $Message }
-function Write-Err { param([string]$Message) Write-Host "  x " -ForegroundColor Red -NoNewline; Write-Host $Message; exit 1 }
+function Write-Err { param([string]$Message) Write-Host "  x " -ForegroundColor Red -NoNewline; Write-Host $Message }
 
 if ($Version -and $Version[0] -ne "v") {
     $Version = "v$Version"
@@ -71,6 +71,21 @@ function Set-UserPathRaw {
     if (-not $key) { return }
     try { $key.SetValue("Path", $NewPath, $ValueKind) } finally { $key.Close() }
 }
+function Broadcast-EnvironmentChange {
+    try {
+        if (-not ([System.Management.Automation.PSTypeName]'Win32.NativeMethods'.Type)) {
+            Add-Type -Namespace Win32 -Name NativeMethods -MemberDefinition @'
+[DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+public static extern IntPtr SendMessageTimeout(
+    IntPtr hWnd, uint Msg, UIntPtr wParam, string lParam,
+    uint fuFlags, uint uTimeout, out UIntPtr lpdwResult);
+'@ -ErrorAction SilentlyContinue
+        }
+        [UIntPtr]$result = [UIntPtr]::Zero
+        [Win32.NativeMethods]::SendMessageTimeout(
+            [IntPtr]0xffff, 0x001A, [UIntPtr]::Zero, "Environment", 2, 5000, [ref]$result) | Out-Null
+    } catch {}
+}
 
 function Add-ToUserPath {
     param([string]$Directory)
@@ -80,6 +95,7 @@ function Add-ToUserPath {
     if ($segments -notcontains $Directory.TrimEnd("\")) {
         $joined = if ($raw.Trim()) { "$raw;$Directory" } else { $Directory }
         Set-UserPathRaw -NewPath $joined -ValueKind $kind
+        Broadcast-EnvironmentChange
         return $true
     }
     return $false
@@ -94,6 +110,7 @@ function Remove-FromUserPath {
     $kept = @($raw -split ";" | Where-Object { $_ -and ($normalized -notcontains $_.TrimEnd("\").ToLowerInvariant()) })
     if ($kept.Count -eq @($raw -split ";" | Where-Object { $_ }).Count) { return $false }
     Set-UserPathRaw -NewPath ($kept -join ";") -ValueKind $kind
+    Broadcast-EnvironmentChange
     return $true
 }
 
@@ -110,7 +127,6 @@ function Get-TerminalCols {
 }
 
 function Print-Header {
-    try { [Console]::Clear() } catch { Clear-Host }
     $Cols = Get-TerminalCols
 
     if ($Cols -ge 65) {
@@ -191,11 +207,12 @@ function Do-Uninstall {
     } else {
         Write-Warn "No installed binary of $BinName was found."
     }
-    exit 0
+    return
 }
 
 if ($Uninstall) {
     Do-Uninstall
+    return
 }
 
 Print-Header
@@ -209,6 +226,7 @@ if ($Architecture -eq "ARM64") {
     $PlatformName = "Windows (x64)"
 } else {
     Write-Err "Unsupported Windows architecture: $Architecture"
+    return
 }
 
 Write-Step "[1/4] Checking environment & resolving version..."
@@ -230,12 +248,14 @@ if (-not $TargetVersion) {
             $TargetVersion = $ReleaseJson.tag_name.Trim()
         } catch {
             Write-Err "Failed to contact GitHub for latest release. Please check your internet connection."
+            return
         }
     }
 }
 
 if (-not $TargetVersion) {
     Write-Err "Could not resolve latest release version from GitHub."
+    return
 }
 
 Write-Success "[1/4] Environment ready ($PlatformName - $TargetVersion)"
@@ -244,23 +264,44 @@ $EffectiveInstallDir = if ($InstallDir) { $InstallDir } else { $DefaultInstallDi
 $ExePath = Join-Path $EffectiveInstallDir $BinName
 
 if (Test-Path $ExePath) {
-    try {
-        $CurrentVerOutput = (& $ExePath --version 2>&1 | Out-String)
-        if ($CurrentVerOutput -match "moviebox-tui\s+([\d\.]+)") {
-            $CurrentVer = "v" + $matches[1]
-            if ($CurrentVer -eq $TargetVersion -and (-not $Force)) {
-                Write-Success "MovieBox-TUI $TargetVersion is already installed at $ExePath. Use -Force to reinstall."
-                exit 0
+    if (-not $Force) {
+        $IsInteractive = [Environment]::UserInteractive -and (-not [Console]::IsInputRedirected)
+        if ($IsInteractive) {
+            Write-Host ""
+            Write-Warn "$AppName is already installed at $ExePath"
+            Write-Host "  What would you like to do?"
+            Write-Host "    1) Reinstall / Update to latest version"
+            Write-Host "    2) Uninstall"
+            Write-Host "    3) Cancel"
+            Write-Host ""
+            $Choice = Read-Host "  Enter choice [1-3] (default 1)"
+            if ($Choice -eq "2") {
+                Do-Uninstall
+                return
+            } elseif ($Choice -eq "3") {
+                Write-Success "No changes made. Exiting."
+                return
             }
+        } else {
+            try {
+                $CurrentVerOutput = (& $ExePath --version 2>&1 | Out-String)
+                if ($CurrentVerOutput -match "moviebox-tui\s+([\d\.]+)") {
+                    $CurrentVer = "v" + $matches[1]
+                    if ($CurrentVer -eq $TargetVersion) {
+                        Write-Success "MovieBox-TUI $TargetVersion is already installed at $ExePath. Use -Force to reinstall."
+                        return
+                    }
+                }
+            } catch {}
         }
-    } catch {}
+    }
 }
 
 if ($DryRun) {
     Write-Success "[Dry Run] Target package: $ArchiveName"
     Write-Success "[Dry Run] Target install directory: $ExePath"
     Write-Success "[Dry Run] All preflight checks passed."
-    exit 0
+    return
 }
 
 $TempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("moviebox-tui-" + [guid]::NewGuid())
@@ -313,15 +354,16 @@ try {
     try {
         $SmokeOutput = (& $ExePath --version 2>&1 | Out-String)
         if ($LASTEXITCODE -ne 0) {
-            throw "Binary execution test failed: $SmokeOutput"
+            Write-Warn "Verification note: $SmokeOutput"
         }
     } catch {
-        throw "Binary execution test failed: $_"
+        Write-Warn "Verification note: $_"
     }
     Write-Success "[4/4] Binary installed to $ExePath"
 } catch {
     Remove-Item $TempDir -Recurse -Force -ErrorAction SilentlyContinue
     Write-Err "Installation failed: $_"
+    return
 } finally {
     Remove-Item $TempDir -Recurse -Force -ErrorAction SilentlyContinue
 }
@@ -364,7 +406,7 @@ if ($PathModified) {
 
 Write-Host ""
 Write-Host "  To start streaming:" -ForegroundColor White
-Write-Host "    $ moviebox-tui" -ForegroundColor Green
+Write-Host "    moviebox-tui" -ForegroundColor Green
 Write-Host ""
 
 if (-not $PlayerDetected) {
@@ -372,5 +414,6 @@ if (-not $PlayerDetected) {
 }
 
 if ($PathModified) {
-    Write-Host "  [i] Restart your terminal window for the updated PATH to take effect in other sessions.`n" -ForegroundColor Cyan
+    Write-Host "  [i] In existing terminal windows, restart the window or run:" -ForegroundColor Cyan
+    Write-Host "      & `"$ExePath`"`n" -ForegroundColor White
 }

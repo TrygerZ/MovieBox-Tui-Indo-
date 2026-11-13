@@ -98,62 +98,34 @@ jobs:
       - name: Build Linux binary
         if: matrix.os == 'ubuntu-latest'
         env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: "-C relocation-model=pic -C link-arg=-pie"
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: "-C link-arg=-Wl,-z,max-page-size=65536"
         run: cross build --release --all-features --locked --target ${{ matrix.target }}
       - name: Build macOS or Windows binary
         if: matrix.os != 'ubuntu-latest'
         run: cargo build --release --all-features --locked --target ${{ matrix.target }}
 
+      - name: Install QEMU for AArch64 smoke test
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y qemu-user-static
+
       - name: Smoke-test produced Unix binary
-        if: matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'x86_64-apple-darwin' || matrix.target == 'aarch64-apple-darwin'
+        if: matrix.os != 'windows-latest'
         run: target/${{ matrix.target }}/release/moviebox-tui --version
 
-      - name: Align aarch64 ELF PT_TLS for Android Termux
-        if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: |
-          python3 - << 'EOF'
-          import struct
-
-          path = "target/aarch64-unknown-linux-musl/release/moviebox-tui"
-          with open(path, "r+b") as f:
-              data = f.read()
-              fmt = "<HHIQQQIHHH"
-              e_type, e_machine, e_version, e_entry, e_phoff, e_shoff, e_flags, e_ehsize, e_phentsize, e_phnum = struct.unpack(
-                  fmt, data[16 : 16 + struct.calcsize(fmt)]
-              )
-              for i in range(e_phnum):
-                  off = e_phoff + i * e_phentsize
-                  ptype, pflags, poff, pvaddr, ppaddr, pfilesz, pmemsz, palign = struct.unpack(
-                      "<IIQQQQQQ", data[off : off + 56]
-                  )
-                  if ptype == 7 and palign < 64:
-                      f.seek(off + 48)
-                      f.write(struct.pack("<Q", 64))
-                      print(f"Patched PT_TLS p_align from {hex(palign)} to 0x40 (64 bytes)")
-          EOF
-
-      - name: Validate aarch64 ELF header for Android Termux (ET_DYN & TLS alignment)
+      - name: Validate aarch64 ELF segment page alignment
         if: matrix.target == 'aarch64-unknown-linux-musl'
         run: |
           BIN="target/${{ matrix.target }}/release/moviebox-tui"
-          ETYPE=$(od -An -tx1 -j16 -N2 "$BIN" | tr -d ' \n')
-          echo "ELF e_type: $ETYPE"
-          if [ "$ETYPE" != "0300" ]; then
-            echo "::error::Expected ELF e_type 0300 (ET_DYN/PIE) for Android compatibility, got $ETYPE"
-            exit 1
-          fi
-
-          if readelf -lW "$BIN" | grep -F 'INTERP' >/dev/null; then
-            echo "::error::Binary contains PT_INTERP; expected static-PIE"
-            exit 1
-          fi
-
-          TLS_ALIGN=$(readelf -lW "$BIN" | awk '$1 == "TLS" {print $NF}')
-          echo "PT_TLS p_align: $TLS_ALIGN"
-          if [ -n "$TLS_ALIGN" ] && [ "$((TLS_ALIGN))" -lt 64 ]; then
-            echo "::error::PT_TLS p_align is $TLS_ALIGN, must be >= 64 for Android Bionic"
-            exit 1
-          fi
+          python3 -c '
+          import subprocess, sys
+          out = subprocess.check_output(["readelf", "-lW", sys.argv[1]], text=True)
+          for line in out.splitlines():
+              if line.strip().startswith("LOAD"):
+                  align = int(line.split()[-1], 16)
+                  if align < 65536:
+                      sys.exit(f"PT_LOAD alignment {hex(align)} is less than 64KB (0x10000)")
+          print("Verified PT_LOAD segments aligned to >= 64KB")
+          ' "$BIN"
       - name: Smoke-test produced Windows binary
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh

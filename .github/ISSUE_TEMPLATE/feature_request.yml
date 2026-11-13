@@ -1,20 +1,35 @@
 name: Feature request
-description: Suggest a new feature or improvement.
+description: Suggest a new feature, improvement, or provider for MovieBox-Tui.
 title: "feat: "
 labels: ["enhancement"]
 body:
+  - type: markdown
+    attributes:
+      value: |
+        Please verify your idea has not already been proposed in existing issues or discussions.
+
   - type: textarea
     id: problem
     attributes:
-      label: What problem does this solve?
-      description: What are you trying to do that MovieBox-Tui makes hard or impossible?
+      label: Problem Statement
+      description: Explain the problem or limitation you are trying to solve.
+      placeholder: Describe the current limitation or use case.
     validations:
       required: true
 
   - type: textarea
-    id: solution
+    id: proposal
     attributes:
-      label: Proposed solution
-      description: Optional. How could it work?
+      label: Proposed Solution
+      description: Describe the desired behavior or implementation.
+      placeholder: Describe how the feature should behave.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternative Solutions
+      description: Any alternative solutions or workarounds you considered.
     validations:
       required: false

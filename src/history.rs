@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
-use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WatchHistoryItem {
@@ -20,6 +19,8 @@ pub struct WatchHistoryItem {
     pub progress_seconds: u64,
     #[serde(default)]
     pub completed: bool,
+    #[serde(default)]
+    pub stream_filename: Option<String>,
 }
 
 impl WatchHistoryItem {
@@ -33,7 +34,7 @@ impl WatchHistoryItem {
         let title = if title.trim().is_empty() {
             details.title.clone()
         } else {
-            title
+            title.to_string()
         };
         let stype = if details.is_series() { 2 } else { 1 };
         let release_year = details.year.clone().unwrap_or_default();
@@ -59,6 +60,7 @@ impl WatchHistoryItem {
             duration_seconds,
             progress_seconds: 0,
             completed: false,
+            stream_filename: None,
         }
     }
 
@@ -79,10 +81,11 @@ impl WatchHistoryItem {
         if self.progress_seconds < 30 {
             return false;
         }
-        if let Some(dur) = self.duration_seconds {
-            if dur > 0 && self.progress_seconds >= (dur as f64 * 0.90) as u64 {
-                return false;
-            }
+        let Some(dur) = self.duration_seconds else {
+            return false;
+        };
+        if dur == 0 || self.progress_seconds >= (dur as f64 * 0.90) as u64 {
+            return false;
         }
         true
     }
@@ -197,6 +200,8 @@ pub struct PendingPlaybackState {
     pub stype: Option<i64>,
     #[serde(default)]
     pub release_year: Option<String>,
+    #[serde(default)]
+    pub stream_filename: Option<String>,
 }
 
 impl PendingPlaybackState {
@@ -222,6 +227,7 @@ impl PendingPlaybackState {
             cover_url: item.cover_url.clone(),
             stype: Some(item.stype),
             release_year: Some(item.release_year.clone()),
+            stream_filename: item.stream_filename.clone(),
         }
     }
 }
@@ -236,24 +242,14 @@ pub struct HistoryManager {
 
 impl HistoryManager {
     pub fn new() -> Self {
-        let mut history = if let Some(path) = Self::history_file_path() {
+        let mut history = if let Some(path) = crate::config::history_path() {
             if path.exists() {
                 if let Ok(content) = fs::read_to_string(&path) {
                     if let Ok(mut hist) = serde_json::from_str::<Self>(&content) {
                         hist.hydrate_watched_index();
                         hist
                     } else {
-                        let stamp = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs();
-                        let corrupt_path = path.with_extension(format!("corrupt.{stamp}"));
-                        log::error!(
-                            "failed to parse watch history from {}, rotating to {}",
-                            crate::logging::sanitize_path(&path),
-                            crate::logging::sanitize_path(&corrupt_path)
-                        );
-                        let _ = fs::rename(&path, corrupt_path);
+                        crate::config::rotate_corrupt_file(&path, "watch history");
                         Self::default()
                     }
                 } else {
@@ -270,22 +266,23 @@ impl HistoryManager {
         history
     }
 
-    fn history_file_path() -> Option<PathBuf> {
-        crate::config::history_path()
-    }
-
-    pub fn playback_state_dir() -> Option<PathBuf> {
-        crate::config::playback_state_dir()
-    }
-
     pub fn save(&self) {
-        if let Some(path) = Self::history_file_path() {
+        if let Some(path) = crate::config::history_path() {
             if let Ok(content) = serde_json::to_string(self) {
                 if let Err(error) = crate::cache::atomic_write_file(&path, content.as_bytes()) {
                     log::warn!("failed to save watch history: {error}");
                 }
             }
         }
+    }
+
+    fn same_provider(a: &str, b: &str) -> bool {
+        crate::providers::models::ProviderKind::parse(a)
+            .zip(crate::providers::models::ProviderKind::parse(b))
+            .map_or_else(
+                || a.trim().eq_ignore_ascii_case(b.trim()),
+                |(p1, p2)| p1 == p2,
+            )
     }
 
     fn key(provider: &str, subject_id: &str, season: usize, episode: usize) -> String {
@@ -362,12 +359,7 @@ impl HistoryManager {
         title: Option<&str>,
     ) -> Option<&WatchHistoryItem> {
         self.recent.iter().find(|i| {
-            let same_provider = crate::providers::models::ProviderKind::parse(&i.provider)
-                .zip(crate::providers::models::ProviderKind::parse(provider))
-                .map_or_else(
-                    || i.provider.trim().eq_ignore_ascii_case(provider.trim()),
-                    |(p1, p2)| p1 == p2,
-                );
+            let same_provider = Self::same_provider(&i.provider, provider);
 
             if same_provider && i.subject_id == subject_id {
                 if i.stype == 1 {
@@ -381,7 +373,7 @@ impl HistoryManager {
             if let Some(t) = title {
                 let clean_i = crate::providers::moviebox::clean_moviebox_title(&i.title);
                 let clean_t = crate::providers::moviebox::clean_moviebox_title(t);
-                if !clean_i.is_empty() && clean_i.eq_ignore_ascii_case(&clean_t) {
+                if !clean_i.is_empty() && clean_i.eq_ignore_ascii_case(clean_t) {
                     if i.stype == 1 {
                         return true;
                     }
@@ -501,12 +493,7 @@ impl HistoryManager {
         let key = Self::key(provider, subject_id, season, episode);
         self.watched.remove(&key);
         self.recent.retain(|i| {
-            let same_provider = crate::providers::models::ProviderKind::parse(&i.provider)
-                .zip(crate::providers::models::ProviderKind::parse(provider))
-                .map_or_else(
-                    || i.provider.trim().eq_ignore_ascii_case(provider.trim()),
-                    |(p1, p2)| p1 == p2,
-                );
+            let same_provider = Self::same_provider(&i.provider, provider);
             !(same_provider
                 && i.subject_id == subject_id
                 && i.season == season
@@ -552,7 +539,7 @@ impl HistoryManager {
     }
 
     pub fn reconcile_pending_playback_states(&mut self) {
-        if let Some(dir) = Self::playback_state_dir() {
+        if let Some(dir) = crate::config::playback_state_dir() {
             if self.reconcile_from_dir(&dir) {
                 self.save();
             }
@@ -594,18 +581,7 @@ impl HistoryManager {
             }
 
             if let Some(existing) = self.recent.iter_mut().find(|i| {
-                let same_provider = crate::providers::models::ProviderKind::parse(&i.provider)
-                    .zip(crate::providers::models::ProviderKind::parse(
-                        &state.provider,
-                    ))
-                    .map_or_else(
-                        || {
-                            i.provider
-                                .trim()
-                                .eq_ignore_ascii_case(state.provider.trim())
-                        },
-                        |(p1, p2)| p1 == p2,
-                    );
+                let same_provider = Self::same_provider(&i.provider, &state.provider);
                 if !same_provider {
                     return false;
                 }
@@ -621,23 +597,15 @@ impl HistoryManager {
                 existing.duration_seconds = state.duration_seconds;
                 existing.completed = state.completed;
                 existing.timestamp = state.timestamp;
+                if state.stream_filename.is_some() {
+                    existing.stream_filename = state.stream_filename.clone();
+                }
                 if !existing.completed {
                     self.watched.remove(&key);
                 }
                 modified = true;
             } else if let Some(existing_series) = self.recent.iter_mut().find(|i| {
-                let same_provider = crate::providers::models::ProviderKind::parse(&i.provider)
-                    .zip(crate::providers::models::ProviderKind::parse(
-                        &state.provider,
-                    ))
-                    .map_or_else(
-                        || {
-                            i.provider
-                                .trim()
-                                .eq_ignore_ascii_case(state.provider.trim())
-                        },
-                        |(p1, p2)| p1 == p2,
-                    );
+                let same_provider = Self::same_provider(&i.provider, &state.provider);
                 same_provider && i.stype == 2 && i.subject_id == state.subject_id
             }) {
                 if (state.season, state.episode)
@@ -650,6 +618,9 @@ impl HistoryManager {
                     existing_series.duration_seconds = state.duration_seconds;
                     existing_series.completed = state.completed;
                     existing_series.timestamp = state.timestamp;
+                    if state.stream_filename.is_some() {
+                        existing_series.stream_filename = state.stream_filename.clone();
+                    }
                     if !existing_series.completed {
                         self.watched.remove(&key);
                     }
@@ -675,6 +646,7 @@ impl HistoryManager {
                     duration_seconds: state.duration_seconds,
                     progress_seconds: state.progress_seconds,
                     completed: state.completed,
+                    stream_filename: state.stream_filename,
                 };
                 if new_item.completed {
                     self.watched.insert(key);
@@ -720,6 +692,7 @@ mod tests {
             duration_seconds: Some(3600),
             progress_seconds: 1800,
             completed: false,
+            stream_filename: None,
         }
     }
 
@@ -785,6 +758,7 @@ mod tests {
             cover_url: None,
             stype: None,
             release_year: None,
+            stream_filename: None,
         };
         std::fs::write(&state_file, serde_json::to_string(&state).unwrap()).unwrap();
 
@@ -795,5 +769,18 @@ mod tests {
         assert!(!state_file.exists());
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+    #[test]
+    fn test_history_item_live_stream_without_duration_not_in_progress() {
+        let mut item = dummy_item("tv", "live_1", "BBC News", 1, "", 0, 0);
+        item.duration_seconds = None;
+        item.progress_seconds = 600;
+        assert!(!item.is_in_progress());
+
+        item.duration_seconds = Some(0);
+        assert!(!item.is_in_progress());
+
+        item.duration_seconds = Some(3600);
+        assert!(item.is_in_progress());
     }
 }

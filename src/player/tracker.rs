@@ -19,8 +19,10 @@ local meta_title = ""
 local meta_cover = ""
 local meta_stype = 0
 local meta_year = ""
+local meta_stream = ""
 local seed_read = false
-
+local last_written_pos = -1
+local last_written_completed = false
 local function read_seed_meta()
     if seed_read or opts.state_file == "" then return end
     seed_read = true
@@ -34,6 +36,7 @@ local function read_seed_meta()
     local st = content:match('"stype":%s*(%d+)')
     if st then meta_stype = tonumber(st) or 0 end
     meta_year = content:match('"release_year":%s*"([^"]-)"') or ""
+    meta_stream = content:match('"stream_filename":%s*"([^"]-)"') or ""
 end
 
 mp.observe_property("time-pos", "number", function(name, val)
@@ -52,8 +55,6 @@ local function write_state(force_completed)
     if opts.state_file == "" then return end
     if last_dur <= 0 and last_pos <= 0 then return end
 
-    read_seed_meta()
-
     if force_completed then
         has_completed = true
     end
@@ -61,7 +62,16 @@ local function write_state(force_completed)
         has_completed = true
     end
 
-    local now = os.time()
+    local pos_floor = math.floor(last_pos + 0.5)
+    local is_paused = mp.get_property_native("pause") == true
+    if not force_completed and is_paused and pos_floor == last_written_pos and has_completed == last_written_completed then
+        return
+    end
+    if not force_completed and math.abs(pos_floor - last_written_pos) < 1 and has_completed == last_written_completed then
+        return
+    end
+
+    read_seed_meta()
     local dur_val = "null"
     if last_dur > 0 then
         dur_val = string.format("%d", math.floor(last_dur + 0.5))
@@ -77,7 +87,11 @@ local function write_state(force_completed)
             meta_year
         )
     end
+    if meta_stream ~= "" then
+        meta_json = meta_json .. string.format(',"stream_filename":%q', meta_stream)
+    end
 
+    local now = os.time()
     local json = string.format(
         '{"provider":%q,"subject_id":%q,"season":%d,"episode":%d,"progress_seconds":%d,"duration_seconds":%s,"completed":%s,"timestamp":%d%s}',
         opts.provider,
@@ -99,8 +113,16 @@ local function write_state(force_completed)
         f:close()
         os.remove(opts.state_file)
         os.rename(tmp_file, opts.state_file)
+        last_written_pos = pos_floor
+        last_written_completed = has_completed
     end
 end
+
+mp.observe_property("pause", "bool", function(name, val)
+    if val then
+        write_state(false)
+    end
+end)
 
 mp.register_event("end-file", function(event)
     if event and event.reason == "eof" then
@@ -121,7 +143,10 @@ pub fn ensure_tracker_script() -> Option<PathBuf> {
     let dir = crate::config::scripts_dir()?;
     if !dir.exists() {
         if let Err(e) = fs::create_dir_all(&dir) {
-            log::warn!("failed to create scripts dir {}: {e}", dir.display());
+            log::warn!(
+                "failed to create scripts dir {}: {e}",
+                crate::logging::sanitize_path(&dir)
+            );
             return None;
         }
     }
@@ -132,7 +157,10 @@ pub fn ensure_tracker_script() -> Option<PathBuf> {
             .unwrap_or(true)
     {
         if let Err(e) = fs::write(&path, TRACKER_LUA_CONTENT.as_bytes()) {
-            log::warn!("failed to write tracker script {}: {e}", path.display());
+            log::warn!(
+                "failed to write tracker script {}: {e}",
+                crate::logging::sanitize_path(&path)
+            );
             return None;
         }
     }
@@ -148,7 +176,10 @@ pub fn state_file_path(
     let dir = crate::config::playback_state_dir()?;
     if !dir.exists() {
         if let Err(e) = fs::create_dir_all(&dir) {
-            log::warn!("failed to create playback state dir {}: {e}", dir.display());
+            log::warn!(
+                "failed to create playback state dir {}: {e}",
+                crate::logging::sanitize_path(&dir)
+            );
             return None;
         }
     }
@@ -201,5 +232,10 @@ mod tests {
             sanitize_component("subject*with?forbidden<chars>|quote\""),
             "subject_with_forbidden_chars__quote"
         );
+    }
+
+    #[test]
+    fn lua_tracker_defines_now_before_formatting_json() {
+        assert!(super::TRACKER_LUA_CONTENT.contains("local now = os.time()"));
     }
 }

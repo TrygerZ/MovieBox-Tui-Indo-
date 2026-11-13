@@ -30,6 +30,7 @@ fn dummy_history_item(
         duration_seconds: duration,
         progress_seconds: progress,
         completed,
+        stream_filename: None,
     }
 }
 
@@ -314,6 +315,7 @@ fn test_reconciliation_from_lua_tracker_state_files() {
         cover_url: None,
         stype: None,
         release_year: None,
+        stream_filename: None,
     };
     let state_file_1 = temp_dir.path().join("moviebox_show_alpha_1_1.json");
     std::fs::write(&state_file_1, serde_json::to_string(&state1).unwrap()).unwrap();
@@ -331,6 +333,7 @@ fn test_reconciliation_from_lua_tracker_state_files() {
         cover_url: None,
         stype: None,
         release_year: None,
+        stream_filename: None,
     };
     let state_file_2 = temp_dir.path().join("moviebox_show_alpha_1_2.json");
     std::fs::write(&state_file_2, serde_json::to_string(&state2).unwrap()).unwrap();
@@ -427,6 +430,22 @@ async fn test_history_slash_command_populates_search_results_accurately() {
     assert!(providers.contains(&ProviderKind::MovieBox));
     assert!(providers.contains(&ProviderKind::Addons));
 }
+
+#[tokio::test]
+async fn test_empty_history_slash_command_settles_search_state() {
+    let mut app = App::new();
+    app.state_mut().history.clear();
+    app.state_mut().active_screen = Screen::Home;
+    app.handle_action(Action::Search {
+        query: "/history".to_string(),
+        force_refresh: false,
+    })
+    .await;
+
+    assert!(app.state().search_results.is_empty());
+    assert!(!app.state().is_loading);
+    assert!(app.state().has_search_settled);
+}
 #[test]
 fn test_update_progress_precision_preservation() {
     let mut manager = HistoryManager::default();
@@ -507,6 +526,7 @@ fn test_reconciliation_self_heals_unseen_items_with_metadata() {
         cover_url: Some("https://example.com/inception.jpg".to_string()),
         stype: Some(1),
         release_year: Some("2010".to_string()),
+        stream_filename: None,
     };
     std::fs::write(&state_file, serde_json::to_string(&state).unwrap()).unwrap();
 

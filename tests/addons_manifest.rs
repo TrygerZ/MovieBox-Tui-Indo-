@@ -1,11 +1,12 @@
 use moviebox_tui::models::MediaType;
 use moviebox_tui::providers::addons::adapter::{
     meta_detail_to_media_details, parse_audio_tracks, parse_codec, parse_quality,
-    parse_season_episode, parse_size_bytes_from_text, stream_item_to_release,
+    parse_season_episode, stream_item_to_release,
 };
 use moviebox_tui::providers::addons::models::{
     AddonManifest, InstalledAddon, MetaDetail, StreamBehaviorHints, StreamItem,
 };
+use moviebox_tui::providers::models::parse_size_bytes;
 use std::collections::HashMap;
 
 #[test]
@@ -66,7 +67,7 @@ fn test_addon_series_classification_and_default_season_structure() {
     };
 
     let details = meta_detail_to_media_details(&off_campus_series);
-    assert_eq!(details.id.value, "tt32034988");
+    assert_eq!(details.id.value, "series:tt32034988");
     assert_eq!(details.title, "Off Campus");
     assert_eq!(details.media_type, MediaType::Series);
     assert_eq!(details.year.as_deref(), Some("2026"));
@@ -256,14 +257,8 @@ fn test_addon_token_and_audio_parsers() {
     assert_eq!(parse_codec("H.264 AVC"), Some("AVC/x264".to_string()));
     assert_eq!(parse_codec("Movie AV1 HDR"), Some("AV1".to_string()));
 
-    assert_eq!(
-        parse_size_bytes_from_text("Size: 1.15 GB"),
-        Some(1_234_803_097)
-    );
-    assert_eq!(
-        parse_size_bytes_from_text("File size: 850 MB"),
-        Some(891_289_600)
-    );
+    assert_eq!(parse_size_bytes("Size: 1.15 GB"), Some(1_234_803_097));
+    assert_eq!(parse_size_bytes("File size: 850 MB"), Some(891_289_600));
 
     assert_eq!(
         parse_audio_tracks("Hindi + English Dual Audio"),

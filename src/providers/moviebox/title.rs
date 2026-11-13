@@ -1,7 +1,7 @@
-pub fn clean_moviebox_title(raw_title: &str) -> String {
+pub fn clean_moviebox_title(raw_title: &str) -> &str {
     let mut title = raw_title.trim();
     if title.is_empty() {
-        return String::new();
+        return "";
     }
 
     while title.starts_with('[') {
@@ -39,40 +39,39 @@ pub fn clean_moviebox_title(raw_title: &str) -> String {
     }
 
     if let Some(pos) = title.rfind(" - ") {
-        let suffix = title[pos + 3..].to_lowercase();
-        let is_tag = suffix.contains("hindi")
-            || suffix.contains("tamil")
-            || suffix.contains("telugu")
-            || suffix.contains("kannada")
-            || suffix.contains("malayalam")
-            || suffix.contains("bengali")
-            || suffix.contains("marathi")
-            || suffix.contains("punjabi")
-            || suffix.contains("gujarati")
-            || suffix.contains("urdu")
-            || suffix.contains("english")
-            || suffix.contains("spanish")
-            || suffix.contains("french")
-            || suffix.contains("german")
-            || suffix.contains("italian")
-            || suffix.contains("japanese")
-            || suffix.contains("korean")
-            || suffix.contains("chinese")
-            || suffix.contains("russian")
-            || suffix.contains("portuguese")
-            || suffix.contains("turkish")
-            || suffix.contains("arabic")
-            || suffix.contains("dub")
-            || suffix.contains("audio")
-            || suffix.contains("multi")
-            || suffix.contains("season")
-            || (suffix.starts_with('s')
+        let suffix = &title[pos + 3..];
+        let is_tag = contains_ignore_ascii_case(suffix, "hindi")
+            || contains_ignore_ascii_case(suffix, "tamil")
+            || contains_ignore_ascii_case(suffix, "telugu")
+            || contains_ignore_ascii_case(suffix, "kannada")
+            || contains_ignore_ascii_case(suffix, "malayalam")
+            || contains_ignore_ascii_case(suffix, "bengali")
+            || contains_ignore_ascii_case(suffix, "marathi")
+            || contains_ignore_ascii_case(suffix, "punjabi")
+            || contains_ignore_ascii_case(suffix, "gujarati")
+            || contains_ignore_ascii_case(suffix, "urdu")
+            || contains_ignore_ascii_case(suffix, "english")
+            || contains_ignore_ascii_case(suffix, "spanish")
+            || contains_ignore_ascii_case(suffix, "french")
+            || contains_ignore_ascii_case(suffix, "german")
+            || contains_ignore_ascii_case(suffix, "italian")
+            || contains_ignore_ascii_case(suffix, "japanese")
+            || contains_ignore_ascii_case(suffix, "korean")
+            || contains_ignore_ascii_case(suffix, "chinese")
+            || contains_ignore_ascii_case(suffix, "russian")
+            || contains_ignore_ascii_case(suffix, "portuguese")
+            || contains_ignore_ascii_case(suffix, "turkish")
+            || contains_ignore_ascii_case(suffix, "arabic")
+            || contains_ignore_ascii_case(suffix, "dub")
+            || contains_ignore_ascii_case(suffix, "audio")
+            || contains_ignore_ascii_case(suffix, "multi")
+            || contains_ignore_ascii_case(suffix, "season")
+            || (suffix.chars().next().is_some_and(|c| c == 's' || c == 'S')
                 && suffix[1..].chars().all(|c| c.is_ascii_digit() || c == '-'));
         if is_tag {
             title = title[..pos].trim();
         }
     }
-
     if let Some(s_idx) = title.rfind(" S") {
         let suffix = &title[s_idx + 2..];
         let is_season = suffix
@@ -83,7 +82,7 @@ pub fn clean_moviebox_title(raw_title: &str) -> String {
         }
     }
 
-    if let Some(s_idx) = title.to_lowercase().rfind(" season ") {
+    if let Some(s_idx) = rfind_ignore_ascii_case(title, " season ") {
         title = title[..s_idx].trim();
     }
 
@@ -103,16 +102,31 @@ pub fn clean_moviebox_title(raw_title: &str) -> String {
             }
         }
     }
-    let cleaned = title
-        .trim_end_matches(['-', ':', '_', '.', ' '])
-        .trim()
-        .to_string();
+    let cleaned = title.trim_end_matches(['-', ':', '_', '.', ' ']).trim();
 
     if cleaned.is_empty() {
-        raw_title.trim().to_string()
+        raw_title.trim()
     } else {
         cleaned
     }
+}
+
+fn rfind_ignore_ascii_case(haystack: &str, needle: &str) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(haystack.len());
+    }
+    if haystack.len() < needle.len() {
+        return None;
+    }
+    let h = haystack.as_bytes();
+    let n = needle.as_bytes();
+    (0..=h.len() - n.len())
+        .rev()
+        .find(|&i| h[i..i + n.len()].eq_ignore_ascii_case(n))
+}
+
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    rfind_ignore_ascii_case(haystack, needle).is_some()
 }
 
 pub fn language_to_code(name: &str) -> Option<&'static str> {

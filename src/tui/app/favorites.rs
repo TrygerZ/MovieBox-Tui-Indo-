@@ -128,9 +128,9 @@ impl App {
             },
             "Favorites",
             if now_favorited {
-                format!("Added \"{title}\" to Favorites.")
+                format!("Added: {title}")
             } else {
-                format!("Removed \"{title}\" from Favorites.")
+                format!("Removed: {title}")
             },
         );
     }
@@ -243,6 +243,7 @@ impl App {
     pub(super) fn load_favorites_virtual_list(&mut self) {
         self.state.input_mode = InputMode::Normal;
         self.state.is_loading = false;
+        self.state.has_search_settled = true;
         self.state.is_homepage_mode = false;
         self.state.active_browse_preset = None;
         self.state.browse_metrics.clear();
@@ -268,7 +269,7 @@ impl App {
             self.state.notify(
                 NotificationKind::Info,
                 "Favorites",
-                "No favorites yet. Favorite a title with 'f' to add one.",
+                "No favorites yet (add with 'f')",
             );
         } else {
             items.sort_by_key(|item| std::cmp::Reverse(item.added_at));

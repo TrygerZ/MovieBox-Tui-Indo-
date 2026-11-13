@@ -1,0 +1,25 @@
+name: Close Stale Issues
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  issues: write
+
+jobs:
+  stale:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/stale@v11
+        with:
+          stale-issue-label: needs-info
+          close-issue-label: needs-info
+          days-before-stale: 7
+          days-before-close: 0
+          stale-issue-message: >
+            This issue has had the `needs-info` label for 7 days without response
+            and is now closed. Reopen with actionable reproduction details once available.
+          close-issue-message: ''
+          only-labels: needs-info
+          operations-per-run: 50

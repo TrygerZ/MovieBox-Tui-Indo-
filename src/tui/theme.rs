@@ -92,7 +92,6 @@ pub struct Theme {
     pub sapphire: Style,
     pub subtext1: Style,
     pub base: Color,
-    pub bg: Style,
     pub rosewater: Style,
     pub flamingo: Style,
     pub maroon: Style,
@@ -122,16 +121,29 @@ pub enum ColorSupport {
 }
 impl ColorSupport {
     pub fn current() -> Self {
-        if std::env::var("NO_COLOR").is_ok() {
-            return ColorSupport::NoColor;
-        }
-        if std::env::var("WT_SESSION").is_ok() {
-            return ColorSupport::Truecolor;
-        }
-        let colorterm = std::env::var("COLORTERM").unwrap_or_default();
-        let term = std::env::var("TERM").unwrap_or_default();
-        let term_program = std::env::var("TERM_PROGRAM").unwrap_or_default();
-        classify_terminal(&colorterm, &term, &term_program)
+        static CACHED: std::sync::LazyLock<ColorSupport> = std::sync::LazyLock::new(|| {
+            if std::env::var("NO_COLOR").is_ok_and(|v| !v.is_empty()) {
+                return ColorSupport::NoColor;
+            }
+            if std::env::var("WT_SESSION").is_ok()
+                || std::env::var("WEZTERM_EXECUTABLE").is_ok()
+                || std::env::var("ALACRITTY_WINDOW_ID").is_ok()
+                || std::env::var("ALACRITTY_SOCKET").is_ok()
+                || std::env::var("TILIX_ID").is_ok()
+                || std::env::var("TERMUX_VERSION").is_ok()
+                || std::env::var("KONSOLE_VERSION").is_ok()
+                || std::env::var("VTE_VERSION")
+                    .ok()
+                    .is_some_and(|v| is_vte_version_truecolor(&v))
+            {
+                return ColorSupport::Truecolor;
+            }
+            let colorterm = std::env::var("COLORTERM").unwrap_or_default();
+            let term = std::env::var("TERM").unwrap_or_default();
+            let term_program = std::env::var("TERM_PROGRAM").unwrap_or_default();
+            classify_terminal(&colorterm, &term, &term_program)
+        });
+        *CACHED
     }
     pub fn label(&self) -> &'static str {
         match self {
@@ -143,9 +155,14 @@ impl ColorSupport {
     }
 }
 
+pub(crate) fn is_vte_version_truecolor(vte_version: &str) -> bool {
+    vte_version.parse::<u32>().ok().is_some_and(|v| v >= 3600)
+}
+
 pub(crate) fn classify_terminal(colorterm: &str, term: &str, term_program: &str) -> ColorSupport {
     let colorterm = colorterm.to_lowercase();
     let term = term.to_lowercase();
+    let term_program = term_program.to_lowercase();
     let truecolor = colorterm == "truecolor"
         || colorterm == "24bit"
         || term.contains("truecolor")
@@ -153,25 +170,26 @@ pub(crate) fn classify_terminal(colorterm: &str, term: &str, term_program: &str)
         || term.contains("ghostty")
         || term.starts_with("foot")
         || term.contains("alacritty")
-        || term_program == "iTerm.app"
-        || term_program == "Hyper"
-        || term_program == "Tabby"
-        || term_program == "WezTerm"
-        || term_program == "WarpTerminal"
+        || term_program == "iterm.app"
+        || term_program == "hyper"
+        || term_program == "tabby"
+        || term_program == "wezterm"
+        || term_program == "warpterminal"
+        || term_program == "warp"
         || term_program == "vscode"
-        || term_program == "ghostty";
+        || term_program == "ghostty"
+        || term_program == "konsole"
+        || term_program == "xfce4-terminal";
     let basic =
         term == "dumb" || term == "linux" || term.contains("fbterm") || term.starts_with("vt");
-    let apple_term = term.contains("apple") || term_program == "Apple_Terminal";
+    let apple_term = term.contains("apple") || term_program == "apple_terminal";
     let has_256 = term.contains("256") || term.contains("xterm") || term.contains("screen");
-    if basic || (apple_term && !has_256) || term == "xterm" {
+    if basic || (apple_term && !has_256) || (term == "xterm" && !truecolor) {
         ColorSupport::Basic
     } else if truecolor {
         ColorSupport::Truecolor
-    } else if has_256 {
+    } else if has_256 || cfg!(target_os = "windows") {
         ColorSupport::Color256
-    } else if cfg!(target_os = "windows") {
-        ColorSupport::Truecolor
     } else {
         ColorSupport::Basic
     }
@@ -210,7 +228,6 @@ impl Theme {
             sapphire: Style::default().fg(cp(116, 199, 236)),
             subtext1: Style::default().fg(cp(186, 194, 222)),
             base: cp(30, 30, 46),
-            bg: Style::default(),
             rosewater: Style::default().fg(cp(245, 224, 220)),
             flamingo: Style::default().fg(cp(242, 205, 205)),
             maroon: Style::default().fg(cp(235, 160, 172)),
@@ -229,33 +246,32 @@ impl Theme {
     pub fn latte() -> Self {
         Self {
             border: Style::default().fg(cp(140, 143, 161)),
-            border_focus: Style::default().fg(cp(30, 102, 245)),
+            border_focus: Style::default().fg(cp(20, 80, 200)),
             text: Style::default().fg(cp(76, 79, 105)),
             text_dim: Style::default().fg(cp(108, 111, 133)),
             title: Style::default()
                 .fg(cp(136, 57, 239))
                 .add_modifier(Modifier::BOLD),
             highlight: Style::default()
-                .fg(cp(30, 102, 245))
+                .fg(cp(20, 80, 200))
                 .add_modifier(Modifier::BOLD),
             header: Style::default()
                 .fg(cp(234, 118, 203))
                 .add_modifier(Modifier::BOLD),
             error: Style::default().fg(cp(210, 15, 57)),
-            success: Style::default().fg(cp(64, 160, 43)),
-            shortcut: Style::default().fg(cp(254, 100, 11)),
+            success: Style::default().fg(cp(42, 120, 28)),
+            shortcut: Style::default().fg(cp(168, 66, 0)),
             overlay: Style::default().fg(cp(108, 111, 133)),
-            rating: Style::default().fg(cp(223, 142, 29)),
+            rating: Style::default().fg(cp(140, 85, 0)),
             accent: Style::default()
-                .fg(cp(23, 146, 153))
+                .fg(cp(20, 110, 118))
                 .add_modifier(Modifier::BOLD),
             muted: Style::default().fg(cp(108, 111, 133)),
-            teal: Style::default().fg(cp(23, 146, 153)),
-            lavender: Style::default().fg(cp(114, 135, 253)),
-            sapphire: Style::default().fg(cp(32, 159, 181)),
+            teal: Style::default().fg(cp(20, 110, 118)),
+            lavender: Style::default().fg(cp(60, 80, 210)),
+            sapphire: Style::default().fg(cp(22, 111, 125)),
             subtext1: Style::default().fg(cp(92, 95, 119)),
             base: cp(239, 241, 245),
-            bg: Style::default(),
             rosewater: Style::default().fg(cp(220, 138, 120)),
             flamingo: Style::default().fg(cp(221, 120, 120)),
             maroon: Style::default().fg(cp(230, 69, 83)),
@@ -284,8 +300,10 @@ impl Theme {
             ThemeKind::Mocha => Self::mocha(),
         };
         match ColorSupport::current() {
+            ColorSupport::NoColor => Self::monochrome(base.is_light),
+            ColorSupport::Basic => Self::fallback(base.is_light),
             ColorSupport::Color256 => base.quantized_to_256(),
-            _ => base,
+            ColorSupport::Truecolor => base,
         }
     }
     pub fn palette_swatch_spans(theme_name: &str, basic_terminal: bool) -> Vec<Span<'static>> {
@@ -296,12 +314,16 @@ impl Theme {
             return vec![Span::styled("* * *", sample.text_dim)];
         }
 
-        let accent_color = sample.accent.fg.unwrap_or(Color::Cyan);
+        let accent_color = sample
+            .accent
+            .fg
+            .or(sample.highlight.fg)
+            .unwrap_or(sample.base);
         let surface_color = sample
             .surface0
             .fg
             .or(sample.surface1.fg)
-            .unwrap_or(Color::DarkGray);
+            .unwrap_or(sample.base);
         let base_color = sample.base;
 
         vec![
@@ -319,7 +341,7 @@ impl Theme {
 
     pub fn detect_with_light(light: Option<bool>) -> Self {
         let resolved_light = light.unwrap_or_else(crate::tui::terminal::background_is_light);
-        if std::env::var("NO_COLOR").is_ok() {
+        if std::env::var("NO_COLOR").is_ok_and(|v| !v.is_empty()) {
             return Self::monochrome(resolved_light);
         }
         Self::detect_from(ColorSupport::current(), resolved_light)
@@ -366,7 +388,6 @@ impl Theme {
         self.sapphire = quantize_style(self.sapphire);
         self.subtext1 = quantize_style(self.subtext1);
         self.base = to_indexed_256(self.base);
-        self.bg = quantize_style(self.bg);
         self.rosewater = quantize_style(self.rosewater);
         self.flamingo = quantize_style(self.flamingo);
         self.maroon = quantize_style(self.maroon);
@@ -383,6 +404,7 @@ impl Theme {
 
     pub fn monochrome(is_light: bool) -> Self {
         let foreground = if is_light { Color::Black } else { Color::White };
+        let inverse = if is_light { Color::White } else { Color::Black };
         let dim = if is_light {
             Color::DarkGray
         } else {
@@ -408,7 +430,6 @@ impl Theme {
             sapphire: Style::default().fg(foreground),
             subtext1: Style::default().fg(foreground),
             base: Color::Reset,
-            bg: Style::default(),
             rosewater: Style::default().fg(foreground),
             flamingo: Style::default().fg(foreground),
             maroon: Style::default().fg(foreground),
@@ -418,8 +439,8 @@ impl Theme {
             overlay0: Style::default().fg(Color::DarkGray),
             overlay1: Style::default().fg(dim),
             overlay2: Style::default().fg(dim),
-            mantle: Style::default().fg(foreground),
-            crust: Style::default().fg(foreground),
+            mantle: Style::default().fg(inverse),
+            crust: Style::default().fg(inverse),
             is_light,
         }
     }
@@ -456,13 +477,12 @@ impl Theme {
                 sapphire: Style::default().fg(Color::Blue),
                 subtext1: Style::default().fg(Color::Black),
                 base: Color::White,
-                bg: Style::default(),
                 rosewater: Style::default().fg(Color::Black),
                 flamingo: Style::default().fg(Color::Magenta),
                 maroon: Style::default().fg(Color::Red),
                 surface0: Style::default().fg(Color::DarkGray),
                 surface1: Style::default().fg(Color::DarkGray),
-                surface2: Style::default().fg(Color::Black),
+                surface2: Style::default().fg(Color::Gray),
                 overlay0: Style::default().fg(Color::DarkGray),
                 overlay1: Style::default().fg(Color::DarkGray),
                 overlay2: Style::default().fg(Color::Black),
@@ -501,7 +521,6 @@ impl Theme {
             sapphire: Style::default().fg(Color::Cyan),
             subtext1: Style::default().fg(Color::White),
             base: Color::Black,
-            bg: Style::default(),
             rosewater: Style::default().fg(Color::White),
             flamingo: Style::default().fg(Color::Magenta),
             maroon: Style::default().fg(Color::Red),
@@ -546,7 +565,6 @@ impl Theme {
             sapphire: Style::default().fg(cp(125, 196, 228)),
             subtext1: Style::default().fg(cp(184, 192, 224)),
             base: cp(36, 39, 58),
-            bg: Style::default(),
             rosewater: Style::default().fg(cp(244, 219, 214)),
             flamingo: Style::default().fg(cp(240, 198, 198)),
             maroon: Style::default().fg(cp(238, 153, 160)),
@@ -591,7 +609,6 @@ impl Theme {
             sapphire: Style::default().fg(cp(133, 193, 220)),
             subtext1: Style::default().fg(cp(181, 191, 226)),
             base: cp(48, 52, 70),
-            bg: Style::default(),
             rosewater: Style::default().fg(cp(242, 213, 207)),
             flamingo: Style::default().fg(cp(238, 190, 190)),
             maroon: Style::default().fg(cp(234, 153, 156)),
@@ -636,7 +653,6 @@ impl Theme {
             sapphire: Style::default().fg(cp(94, 129, 172)),
             subtext1: Style::default().fg(cp(229, 233, 240)),
             base: cp(46, 52, 64),
-            bg: Style::default(),
             rosewater: Style::default().fg(cp(216, 222, 233)),
             flamingo: Style::default().fg(cp(216, 222, 233)),
             maroon: Style::default().fg(cp(191, 97, 106)),
@@ -681,7 +697,6 @@ impl Theme {
             sapphire: Style::default().fg(cp(125, 207, 255)),
             subtext1: Style::default().fg(cp(169, 177, 214)),
             base: cp(26, 27, 38),
-            bg: Style::default(),
             rosewater: Style::default().fg(cp(224, 175, 104)),
             flamingo: Style::default().fg(cp(247, 118, 142)),
             maroon: Style::default().fg(cp(247, 118, 142)),
@@ -726,7 +741,6 @@ impl Theme {
             sapphire: Style::default().fg(cp(139, 233, 253)),
             subtext1: Style::default().fg(cp(248, 248, 242)),
             base: cp(40, 42, 54),
-            bg: Style::default(),
             rosewater: Style::default().fg(cp(248, 248, 242)),
             flamingo: Style::default().fg(cp(255, 121, 198)),
             maroon: Style::default().fg(cp(255, 85, 85)),
@@ -771,7 +785,6 @@ impl Theme {
             sapphire: Style::default().fg(cp(131, 165, 152)),
             subtext1: Style::default().fg(cp(235, 219, 178)),
             base: cp(40, 40, 40),
-            bg: Style::default(),
             rosewater: Style::default().fg(cp(235, 219, 178)),
             flamingo: Style::default().fg(cp(211, 134, 155)),
             maroon: Style::default().fg(cp(251, 73, 52)),
@@ -816,7 +829,6 @@ impl Theme {
             sapphire: Style::default().fg(cp(156, 207, 216)),
             subtext1: Style::default().fg(cp(224, 222, 244)),
             base: cp(25, 23, 36),
-            bg: Style::default(),
             rosewater: Style::default().fg(cp(224, 222, 244)),
             flamingo: Style::default().fg(cp(235, 188, 186)),
             maroon: Style::default().fg(cp(235, 111, 146)),
@@ -830,6 +842,28 @@ impl Theme {
             crust: Style::default().fg(cp(21, 19, 30)),
             is_light: false,
         }
+    }
+}
+
+impl Theme {
+    pub fn surface0_color(&self) -> Color {
+        self.surface0.fg.unwrap_or(self.base)
+    }
+
+    pub fn surface1_color(&self) -> Color {
+        self.surface1.fg.unwrap_or(self.base)
+    }
+
+    pub fn surface2_color(&self) -> Color {
+        self.surface2.fg.unwrap_or(self.base)
+    }
+
+    pub fn crust_color(&self) -> Color {
+        self.crust.fg.unwrap_or(self.base)
+    }
+
+    pub fn mantle_color(&self) -> Color {
+        self.mantle.fg.unwrap_or(self.base)
     }
 }
 
@@ -867,7 +901,8 @@ fn rgb_to_xterm256(red: u8, green: u8, blue: u8) -> u8 {
         }
         return 232 + ((u16::from(red) - 8) / 10) as u8;
     }
-    let nearest = |channel: u8| -> u16 {
+
+    let nearest_level = |channel: u8| -> u16 {
         let channel = u16::from(channel);
         let mut best_index = 0_u16;
         let mut best_distance = u16::MAX;
@@ -880,7 +915,42 @@ fn rgb_to_xterm256(red: u8, green: u8, blue: u8) -> u8 {
         }
         best_index
     };
-    (16 + 36 * nearest(red) + 6 * nearest(green) + nearest(blue)) as u8
+    let ri = nearest_level(red);
+    let gi = nearest_level(green);
+    let bi = nearest_level(blue);
+    let cube_index = (16 + 36 * ri + 6 * gi + bi) as u8;
+    let cube_r = CUBE_LEVELS[ri as usize] as i32;
+    let cube_g = CUBE_LEVELS[gi as usize] as i32;
+    let cube_b = CUBE_LEVELS[bi as usize] as i32;
+    let cube_dist = (i32::from(red) - cube_r).pow(2)
+        + (i32::from(green) - cube_g).pow(2)
+        + (i32::from(blue) - cube_b).pow(2);
+
+    let lum =
+        (0.2126 * f32::from(red) + 0.7152 * f32::from(green) + 0.0722 * f32::from(blue)) as u8;
+    let gray_index = if lum < 8 {
+        16u8
+    } else if lum > 238 {
+        231u8
+    } else {
+        232 + (u16::from(lum).saturating_sub(8) / 10) as u8
+    };
+    let gray_v = if gray_index == 16 {
+        0i32
+    } else if gray_index == 231 {
+        255i32
+    } else {
+        i32::from(8 + (gray_index - 232) * 10)
+    };
+    let gray_dist = (i32::from(red) - gray_v).pow(2)
+        + (i32::from(green) - gray_v).pow(2)
+        + (i32::from(blue) - gray_v).pow(2);
+
+    if gray_dist <= cube_dist {
+        gray_index
+    } else {
+        cube_index
+    }
 }
 
 #[cfg(test)]
@@ -902,6 +972,20 @@ mod tests {
     }
 
     #[test]
+    fn dark_low_sat_routes_to_gray_ramp() {
+        assert_eq!(rgb_to_xterm256(30, 30, 46), 234);
+        assert_eq!(rgb_to_xterm256(46, 52, 64), 236);
+        assert_eq!(rgb_to_xterm256(40, 42, 54), 235);
+        assert_eq!(rgb_to_xterm256(56, 58, 74), 237);
+        assert_eq!(rgb_to_xterm256(73, 76, 94), 238);
+        assert_eq!(rgb_to_xterm256(20, 80, 20), 22);
+        assert_eq!(rgb_to_xterm256(137, 180, 250), 111);
+        assert_eq!(rgb_to_xterm256(0, 0, 0), 16);
+        assert_eq!(rgb_to_xterm256(128, 128, 128), 244);
+        assert_eq!(rgb_to_xterm256(255, 255, 255), 231);
+    }
+
+    #[test]
     fn non_rgb_colors_pass_through() {
         assert_eq!(to_indexed_256(Color::Red), Color::Red);
         assert_eq!(to_indexed_256(Color::Indexed(42)), Color::Indexed(42));
@@ -915,7 +999,7 @@ mod tests {
             quantized.border,
             quantized.text,
             quantized.accent,
-            quantized.bg,
+            quantized.title,
             quantized.lavender,
         ] {
             assert!(
@@ -945,7 +1029,7 @@ mod tests {
         );
         assert!(
             quantized
-                .bg
+                .accent
                 .fg
                 .map(|c| !matches!(c, Color::Rgb(..)))
                 .unwrap_or(true)
@@ -963,6 +1047,10 @@ mod tests {
         use crate::tui::theme::ColorSupport;
         assert_eq!(
             classify_terminal("truecolor", "xterm-256color", ""),
+            ColorSupport::Truecolor
+        );
+        assert_eq!(
+            classify_terminal("truecolor", "xterm", ""),
             ColorSupport::Truecolor
         );
         assert_eq!(
@@ -992,20 +1080,42 @@ mod tests {
         );
         assert_eq!(classify_terminal("", "vt100", ""), ColorSupport::Basic);
         assert_eq!(classify_terminal("", "dumb", ""), ColorSupport::Basic);
+        assert_eq!(classify_terminal("", "xterm", ""), ColorSupport::Basic);
         assert_eq!(
             classify_terminal("", "xterm", "Apple_Terminal"),
             ColorSupport::Basic
         );
+        assert_eq!(
+            classify_terminal("", "", "iterm.app"),
+            ColorSupport::Truecolor
+        );
+        assert_eq!(
+            classify_terminal("", "", "wezterm"),
+            ColorSupport::Truecolor
+        );
+        assert_eq!(
+            classify_terminal("", "", "warpterminal"),
+            ColorSupport::Truecolor
+        );
+        assert_eq!(classify_terminal("", "", "warp"), ColorSupport::Truecolor);
         #[cfg(target_os = "windows")]
-        assert_eq!(classify_terminal("", "", ""), ColorSupport::Truecolor);
+        assert_eq!(classify_terminal("", "", ""), ColorSupport::Color256);
         #[cfg(not(target_os = "windows"))]
         assert_eq!(classify_terminal("", "", ""), ColorSupport::Basic);
     }
 
     #[test]
+    fn vte_version_threshold_respects_truecolor_boundary() {
+        assert!(!is_vte_version_truecolor("3599"));
+        assert!(is_vte_version_truecolor("3600"));
+        assert!(is_vte_version_truecolor("4000"));
+        assert!(!is_vte_version_truecolor("invalid"));
+    }
+
+    #[test]
     fn detect_from_matches_support_matrix() {
         let quantized = Theme::detect_from(ColorSupport::Color256, false);
-        for style in [quantized.border, quantized.accent, quantized.bg] {
+        for style in [quantized.border, quantized.accent, quantized.title] {
             assert!(
                 style
                     .fg
@@ -1093,10 +1203,14 @@ mod tests {
         }
     }
     #[test]
-    fn test_theme_color() {
-        let with_fg = Style::default().fg(Color::Red);
-        assert_eq!(theme_color(with_fg, Color::Blue), Color::Red);
-        let without_fg = Style::default();
-        assert_eq!(theme_color(without_fg, Color::Blue), Color::Blue);
+    fn test_classify_terminal_konsole_and_xfce4_are_truecolor() {
+        assert_eq!(
+            classify_terminal("", "xterm-256color", "Konsole"),
+            ColorSupport::Truecolor
+        );
+        assert_eq!(
+            classify_terminal("", "xterm-256color", "xfce4-terminal"),
+            ColorSupport::Truecolor
+        );
     }
 }

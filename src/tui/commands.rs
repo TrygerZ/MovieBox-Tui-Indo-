@@ -3,6 +3,7 @@ use crate::tui::state::AppState;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlashCommand {
     Settings,
+    Config,
     Browse,
     History,
     Favorites,
@@ -13,8 +14,9 @@ pub enum SlashCommand {
 }
 
 impl SlashCommand {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Settings,
+        Self::Config,
         Self::Browse,
         Self::History,
         Self::Favorites,
@@ -23,19 +25,10 @@ impl SlashCommand {
         Self::List,
         Self::Exit,
     ];
-
-    pub const PRIMARY: [Self; 6] = [
-        Self::Settings,
-        Self::Browse,
-        Self::History,
-        Self::Favorites,
-        Self::Clear,
-        Self::Help,
-    ];
-
     pub fn name(self) -> &'static str {
         match self {
             Self::Settings => "/settings",
+            Self::Config => "/config",
             Self::Browse => "/browse",
             Self::History => "/history",
             Self::Favorites => "/favorites",
@@ -45,10 +38,18 @@ impl SlashCommand {
             Self::Exit => "/exit",
         }
     }
-
-    pub fn description(self, _state: &AppState) -> &'static str {
+    pub fn description(self, state: &AppState) -> &'static str {
         match self {
             Self::Settings => "Interactive preferences, content modes & configuration",
+            Self::Config => {
+                if state.is_tv_mode {
+                    "Manage TV playlist sources"
+                } else if state.active_provider == crate::providers::models::ProviderKind::Addons {
+                    "Manage Stremio addon manifests"
+                } else {
+                    "Configure TV playlists or Addons"
+                }
+            }
             Self::Browse => "Curated, rated & most-watched views",
             Self::History => "Watch history",
             Self::Favorites => "Starred titles",
@@ -62,35 +63,22 @@ impl SlashCommand {
     pub fn is_available(self, state: &AppState) -> bool {
         match self {
             Self::Settings => true,
-            Self::Browse => {
-                (state.streaming_enabled && !state.is_tv_mode && !state.is_addon_mode)
-                    || (state.addons_enabled && state.is_addon_mode)
+            Self::Config => {
+                state.is_tv_mode
+                    || state.active_provider == crate::providers::models::ProviderKind::Addons
             }
-            Self::History => {
-                (state.streaming_enabled && !state.is_tv_mode && !state.is_addon_mode)
-                    || (state.addons_enabled && state.is_addon_mode)
-            }
+            Self::Browse | Self::History => state.streaming_enabled && !state.is_tv_mode,
             Self::Favorites => state.favorites_available(),
             Self::List => state.tv_enabled && state.is_tv_mode,
             Self::Clear | Self::Help | Self::Exit => true,
         }
     }
-
     pub fn suggest(state: &AppState, query: &str) -> Vec<String> {
         let lower = query.to_ascii_lowercase();
         let mut results = Vec::new();
 
-        let candidates: [(&str, Self); 7] = [
-            ("/settings", Self::Settings),
-            ("/browse", Self::Browse),
-            ("/history", Self::History),
-            ("/favorites", Self::Favorites),
-            ("/clear", Self::Clear),
-            ("/help", Self::Help),
-            ("/list", Self::List),
-        ];
-
-        for (name, cmd) in candidates {
+        for cmd in Self::ALL {
+            let name = cmd.name();
             if !cmd.is_available(state) {
                 continue;
             }
@@ -109,24 +97,14 @@ impl SlashCommand {
             return None;
         };
 
-        if trimmed == "/pref"
-            || trimmed == "/preferences"
-            || trimmed == "/options"
-            || trimmed == "/config"
-        {
-            return Some(Self::Settings.description(state));
-        }
-        if trimmed == "/?" {
-            return Some(Self::Help.description(state));
-        }
-
         match trimmed {
             "/settings" => Some(Self::Settings.description(state)),
+            "/config" => Some(Self::Config.description(state)),
             "/browse" => Some(Self::Browse.description(state)),
             "/history" => Some(Self::History.description(state)),
             "/favorites" => Some(Self::Favorites.description(state)),
             "/clear" => Some(Self::Clear.description(state)),
-            "/help" => Some(Self::Help.description(state)),
+            "/help" | "/?" => Some(Self::Help.description(state)),
             "/list" => Some(Self::List.description(state)),
             "/exit" | "/quit" | "/q" => Some(Self::Exit.description(state)),
             _ => None,
@@ -143,7 +121,8 @@ impl SlashCommand {
         let command_name = parts.next()?;
 
         match command_name.to_ascii_lowercase().as_str() {
-            "/settings" | "/config" | "/pref" | "/preferences" | "/options" => Some(Self::Settings),
+            "/settings" => Some(Self::Settings),
+            "/config" => Some(Self::Config),
             "/browse" => Some(Self::Browse),
             "/history" => Some(Self::History),
             "/favorites" => Some(Self::Favorites),
@@ -173,6 +152,7 @@ mod tests {
                 "/favorites".to_string(),
                 "/clear".to_string(),
                 "/help".to_string(),
+                "/exit".to_string(),
             ]
         );
 
@@ -182,6 +162,23 @@ mod tests {
         let c_sug = SlashCommand::suggest(&state, "/c");
         assert_eq!(c_sug, vec!["/clear".to_string()]);
 
+        let tv_state = AppState {
+            is_tv_mode: true,
+            tv_enabled: true,
+            ..Default::default()
+        };
+        let tv_c_sug = SlashCommand::suggest(&tv_state, "/c");
+        assert_eq!(tv_c_sug, vec!["/config".to_string(), "/clear".to_string()]);
+
+        let addons_state = AppState {
+            active_provider: crate::providers::models::ProviderKind::Addons,
+            ..Default::default()
+        };
+        let addons_c_sug = SlashCommand::suggest(&addons_state, "/c");
+        assert_eq!(
+            addons_c_sug,
+            vec!["/config".to_string(), "/clear".to_string()]
+        );
         let t_sug = SlashCommand::suggest(&state, "/t");
         assert!(t_sug.is_empty());
         let p_sug = SlashCommand::suggest(&state, "/p");
@@ -222,8 +219,7 @@ mod tests {
     #[test]
     fn test_core_commands_and_aliases_parse() {
         let state = AppState::default();
-        assert_eq!(SlashCommand::ALL.len(), 8);
-        assert_eq!(SlashCommand::PRIMARY.len(), 6);
+        assert_eq!(SlashCommand::ALL.len(), 9);
         assert_eq!(SlashCommand::parse("/exit"), Some(SlashCommand::Exit));
         assert_eq!(SlashCommand::parse("/quit"), Some(SlashCommand::Exit));
         assert_eq!(SlashCommand::parse("/q"), Some(SlashCommand::Exit));
@@ -243,20 +239,19 @@ mod tests {
             SlashCommand::parse("/settings"),
             Some(SlashCommand::Settings)
         );
-        assert_eq!(SlashCommand::parse("/config"), Some(SlashCommand::Settings));
-        assert_eq!(SlashCommand::parse("/pref"), Some(SlashCommand::Settings));
-        assert_eq!(
-            SlashCommand::parse("/preferences"),
-            Some(SlashCommand::Settings)
-        );
-        assert_eq!(
-            SlashCommand::parse("/options"),
-            Some(SlashCommand::Settings)
-        );
-
+        assert_eq!(SlashCommand::parse("/config"), Some(SlashCommand::Config));
+        assert_eq!(SlashCommand::Config.name(), "/config");
+        assert_eq!(SlashCommand::parse("/pref"), None);
+        assert_eq!(SlashCommand::parse("/preferences"), None);
+        assert_eq!(SlashCommand::parse("/options"), None);
         assert_eq!(SlashCommand::parse("/list"), Some(SlashCommand::List));
         assert_eq!(SlashCommand::parse("/browse"), Some(SlashCommand::Browse));
         assert_eq!(SlashCommand::parse("/history"), Some(SlashCommand::History));
+        assert_eq!(
+            SlashCommand::parse("/favorites"),
+            Some(SlashCommand::Favorites)
+        );
+        assert_eq!(SlashCommand::parse("/fav"), None);
         assert_eq!(SlashCommand::parse("/theme"), None);
         assert_eq!(SlashCommand::parse("/themes"), None);
         assert_eq!(SlashCommand::parse("/toggle-tv"), None);
@@ -284,16 +279,37 @@ mod tests {
         );
         assert_eq!(
             SlashCommand::description_for("/config", &state),
-            Some("Interactive preferences, content modes & configuration")
+            Some("Configure TV playlists or Addons")
         );
+        let tv_state = AppState {
+            is_tv_mode: true,
+            tv_enabled: true,
+            ..Default::default()
+        };
         assert_eq!(
-            SlashCommand::description_for("/pref", &state),
-            Some("Interactive preferences, content modes & configuration")
+            SlashCommand::description_for("/config", &tv_state),
+            Some("Manage TV playlist sources")
         );
+        let addons_state = AppState {
+            active_provider: crate::providers::models::ProviderKind::Addons,
+            ..Default::default()
+        };
+        assert_eq!(
+            SlashCommand::description_for("/config", &addons_state),
+            Some("Manage Stremio addon manifests")
+        );
+        assert_eq!(SlashCommand::description_for("/pref", &state), None);
+        assert_eq!(SlashCommand::description_for("/preferences", &state), None);
+        assert_eq!(SlashCommand::description_for("/options", &state), None);
         assert_eq!(
             SlashCommand::description_for("/?", &state),
             Some("Open interactive keybinding help menu")
         );
+        assert_eq!(
+            SlashCommand::description_for("/browse", &state),
+            Some("Curated, rated & most-watched views")
+        );
+        assert_eq!(SlashCommand::description_for("/fav", &state), None);
         assert_eq!(SlashCommand::description_for("/download-dir", &state), None);
         assert_eq!(SlashCommand::description_for("/toggle-tv", &state), None);
         assert_eq!(SlashCommand::description_for("/theme", &state), None);

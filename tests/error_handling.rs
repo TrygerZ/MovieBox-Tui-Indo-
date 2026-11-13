@@ -102,8 +102,7 @@ async fn test_active_player_session_blocks_duplicate_playback_and_recovers_on_ex
     assert!(!app.state().notifications.is_empty());
     let notif = app.state().notifications.back().unwrap();
     assert_eq!(notif.kind, NotificationKind::Warning);
-    assert_eq!(notif.title, "Playback already active");
-
+    assert_eq!(notif.title, "Playback active");
     app.handle_action(Action::PlayerExited).await;
     assert!(!app.state().is_playing);
     assert!(!app.state().is_resolving_playback);
@@ -114,10 +113,13 @@ async fn test_authoritative_launch_player_blocks_bypass_attempts() {
     app.state_mut().update_available = None;
     app.state_mut().is_playing = false;
 
-    app.handle_action(Action::LaunchPlayer(
+    app.handle_action(Action::LaunchPlayback(
         PlayerKind::Mpv,
-        "magnet:?xt=urn:btih:d08244124e9f0863014f56947ab51404ec102770".to_string(),
-        None,
+        moviebox_tui::providers::models::PlaybackSource::bare(
+            moviebox_tui::providers::models::ProviderKind::MovieBox,
+            "magnet:?xt=urn:btih:d08244124e9f0863014f56947ab51404ec102770",
+            None,
+        ),
     ))
     .await;
 
@@ -130,10 +132,13 @@ async fn test_authoritative_launch_player_blocks_bypass_attempts() {
     assert_eq!(notif.kind, NotificationKind::Error);
     assert_eq!(notif.title, "Unsupported stream");
 
-    app.handle_action(Action::LaunchPlayer(
+    app.handle_action(Action::LaunchPlayback(
         PlayerKind::Mpv,
-        "file:///etc/shadow".to_string(),
-        None,
+        moviebox_tui::providers::models::PlaybackSource::bare(
+            moviebox_tui::providers::models::ProviderKind::MovieBox,
+            "file:///etc/shadow",
+            None,
+        ),
     ))
     .await;
 

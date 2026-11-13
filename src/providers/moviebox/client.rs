@@ -65,7 +65,7 @@ impl MovieBoxClient {
             .pool_idle_timeout(std::time::Duration::from_secs(90))
             .pool_max_idle_per_host(4)
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .unwrap_or_default();
 
         let (user_agent, client_info) =
             crate::providers::moviebox::crypto::generate_client_info_and_ua();
@@ -95,7 +95,6 @@ impl MovieBoxClient {
     }
 
     pub async fn ensure_session(&self) -> Result<String, ScraperError> {
-        // Fast path: valid in-memory session
         if let Some(session) = self
             .session
             .read()
@@ -107,7 +106,6 @@ impl MovieBoxClient {
             }
         }
 
-        // Cache path: valid persisted session
         if let Some(persisted) = load_persisted_session() {
             if persisted.is_valid() {
                 let mut write_guard = self.session.write().unwrap_or_else(|e| e.into_inner());
@@ -116,10 +114,8 @@ impl MovieBoxClient {
             }
         }
 
-        // Single-flight lock: serialize concurrent guest logins
         let _guard = self.init_lock.lock().await;
 
-        // Double check after acquiring lock
         if let Some(session) = self
             .session
             .read()
@@ -287,6 +283,8 @@ impl MovieBoxClient {
                             "moviebox host {idx} returned retryable status {status}: {}",
                             crate::logging::sanitize_url(&url)
                         );
+                        self.active_base_idx
+                            .store((idx + 1) % HOST_POOL.len(), Ordering::Relaxed);
                         if status == 429 {
                             backoff_ms = resp
                                 .headers()
@@ -317,6 +315,8 @@ impl MovieBoxClient {
                         "moviebox host {idx} request failed: {error} [{}]",
                         crate::logging::sanitize_url(&url)
                     );
+                    self.active_base_idx
+                        .store((idx + 1) % HOST_POOL.len(), Ordering::Relaxed);
                     continue;
                 }
             }

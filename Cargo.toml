@@ -3,6 +3,7 @@ name = "moviebox-tui"
 exclude = [
     "docs/",
     "Formula/",
+    "bucket/",
     ".github/",
     ".githooks/",
     ".cargo/",
@@ -13,7 +14,7 @@ exclude = [
     "book.toml",
     "book/",
 ]
-version = "0.1.18"
+version = "0.1.29"
 edition = "2024"
 description = "Terminal interface to find, download, and stream movies, TV shows, and live TV using local media players."
 repository = "https://github.com/mesamirh/MovieBox-Tui"
@@ -28,23 +29,24 @@ rust-version = "1.90.0"
 base64 = "0.23.0"
 rmp-serde = "1.3.1"
 crossterm = { version = "0.29.0", features = ["event-stream"] }
-dirs = "6.0.0"
+dirs = "7.0.0"
 dotenvy = "0.15"
-futures = "0.3.31"
+futures = "0.3.34"
 hmac = "0.13.0"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
-lru = "0.18.1"
+lru = "0.19.0"
 md-5 = "0.11.0"
 rand = "0.10.2"
-ratatui = "0.30.2"
-ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm"] }
+ratatui = { version = "0.30.2", default-features = false, features = ["std", "layout-cache"] }
+ratatui-crossterm = { version = "0.1.2", default-features = false, features = ["crossterm_0_29"] }
+ratatui-image = { version = "11.0.6", default-features = false }
 rustls = { version = "0.23.42", default-features = false, features = ["ring", "std"] }
-scraper = "0.27.0"
+scraper = "0.29.0"
 semver = "1.0.28"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 thiserror = "2.0.18"
-tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "signal", "process"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "signal", "process", "net"] }
 url = "2.5.8"
 unicode-segmentation = "1.12.0"
 unicode-width = "0.2.0"
@@ -53,11 +55,11 @@ percent-encoding = "2.3.2"
 log = "0.4.33"
 flexi_logger = "0.31.10"
 hickory-resolver = { version = "0.25.2", default-features = false, features = ["system-config", "tokio"] }
-reqwest = { version = "0.12.12", default-features = false, features = ["json", "rustls-tls-webpki-roots"] }
-sha2 = "0.10.8"
+reqwest = { version = "0.12.12", default-features = false, features = ["json", "rustls-tls-webpki-roots", "stream"] }
+sha2 = "0.11.0"
 flate2 = "1.0.35"
 tar = "0.4.44"
-zip = "7.2.0"
+zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
 tempfile = "3.17.1"
 
 [lib]
@@ -78,3 +80,6 @@ strip = true
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 mimalloc = "0.1.52"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

@@ -3,7 +3,7 @@ use ratatui::{
     layout::Rect,
     style::Modifier,
     text::{Line, Span},
-    widgets::{Paragraph, Wrap},
+    widgets::Paragraph,
 };
 
 use crate::tui::{text::TextInputBuffer, theme::Theme};
@@ -31,7 +31,12 @@ pub fn render_single_line_input(
     };
     let cursor_w = crate::tui::text::width(cursor_grapheme).max(1);
 
-    let max_before_w = available_width.saturating_sub(cursor_w);
+    let after_reserve = if cursor.saturating_add(1) < segments.len() {
+        3
+    } else {
+        0
+    };
+    let max_before_w = available_width.saturating_sub(cursor_w + after_reserve);
     let mut start = cursor;
     let mut current_before_w = 0;
     while start > 0 {
@@ -43,20 +48,26 @@ pub fn render_single_line_input(
         start -= 1;
     }
 
-    let mut before_cursor: String = segments[start..cursor].concat();
-    if start > 0 {
-        let before_w = crate::tui::text::width(&before_cursor);
-        if before_w > 3 {
-            before_cursor = format!(
-                "...{}",
-                crate::tui::text::truncate_width(&before_cursor, before_w.saturating_sub(3))
-            );
+    let before_cursor = if start > 0 {
+        let budget = max_before_w.saturating_sub(3);
+        let mut adj_start = cursor;
+        let mut adj_w = 0;
+        while adj_start > 0 {
+            let gw = crate::tui::text::width(segments[adj_start - 1]);
+            if adj_w + gw > budget {
+                break;
+            }
+            adj_w += gw;
+            adj_start -= 1;
         }
-    }
+        format!("...{}", segments[adj_start..cursor].concat())
+    } else {
+        segments[..cursor].concat()
+    };
 
     let cursor_char = cursor_grapheme.to_string();
-
-    let remaining_after_w = available_width.saturating_sub(current_before_w + cursor_w);
+    let before_w = crate::tui::text::width(&before_cursor);
+    let remaining_after_w = available_width.saturating_sub(before_w + cursor_w);
     let mut end = cursor.saturating_add(1).min(segments.len());
     let mut current_after_w = 0;
     while end < segments.len() {
@@ -68,17 +79,29 @@ pub fn render_single_line_input(
         end += 1;
     }
 
-    let after_slice = &segments[cursor.saturating_add(1).min(segments.len())..end];
-    let mut after_cursor: String = after_slice.concat();
-    if end < segments.len() {
-        let after_w = crate::tui::text::width(&after_cursor);
-        if after_w > 3 {
-            let keep = crate::tui::text::truncate_width(&after_cursor, after_w.saturating_sub(3));
-            after_cursor = format!("{keep}...");
-        } else if !after_cursor.is_empty() {
-            after_cursor = "...".to_string();
+    let after_cursor = if end < segments.len() {
+        if remaining_after_w >= 3 {
+            let budget = remaining_after_w.saturating_sub(3);
+            let mut adj_end = cursor.saturating_add(1).min(segments.len());
+            let mut adj_w = 0;
+            while adj_end < segments.len() {
+                let gw = crate::tui::text::width(segments[adj_end]);
+                if adj_w + gw > budget {
+                    break;
+                }
+                adj_w += gw;
+                adj_end += 1;
+            }
+            format!(
+                "{}...",
+                segments[cursor.saturating_add(1).min(segments.len())..adj_end].concat()
+            )
+        } else {
+            segments[cursor.saturating_add(1).min(segments.len())..end].concat()
         }
-    }
+    } else {
+        segments[cursor.saturating_add(1).min(segments.len())..end].concat()
+    };
     let lines = vec![
         Line::from(vec![Span::raw(" "), Span::styled(label, theme.sapphire)]),
         Line::from(vec![
@@ -89,7 +112,7 @@ pub fn render_single_line_input(
         ]),
     ];
 
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 #[cfg(test)]
@@ -158,5 +181,73 @@ mod tests {
                 );
             })
             .unwrap();
+    }
+    #[test]
+    fn test_render_single_line_input_truncation_no_double_ellipsis() {
+        let backend = TestBackend::new(20, 5);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let buffer =
+            TextInputBuffer::from_str("https://very-long-domain-name.example.com/stream.m3u8");
+        let theme = Theme::default();
+        terminal
+            .draw(|f| {
+                render_single_line_input(f, Rect::new(0, 0, 20, 3), "URL:", &buffer, &theme, false);
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn test_render_single_line_input_cursor_movement_no_line_overflow() {
+        let backend = TestBackend::new(46, 5);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let long_str = "a".repeat(80);
+        let theme = Theme::default();
+
+        for cursor_pos in 0..=80 {
+            let mut buffer = TextInputBuffer::from_str(&long_str);
+            for _ in 0..80 {
+                buffer.move_left();
+            }
+            for _ in 0..cursor_pos {
+                buffer.move_right();
+            }
+            terminal
+                .draw(|f| {
+                    render_single_line_input(
+                        f,
+                        Rect::new(0, 0, 46, 3),
+                        "Enter Addon Manifest URL:",
+                        &buffer,
+                        &theme,
+                        false,
+                    );
+                })
+                .unwrap();
+
+            let line_0: String = (0..46)
+                .map(|x| terminal.backend().buffer().cell((x, 0)).unwrap().symbol())
+                .collect();
+            let line_1: String = (0..46)
+                .map(|x| terminal.backend().buffer().cell((x, 1)).unwrap().symbol())
+                .collect();
+            let line_2: String = (0..46)
+                .map(|x| terminal.backend().buffer().cell((x, 2)).unwrap().symbol())
+                .collect();
+
+            assert!(line_0.contains("Enter Addon Manifest URL:"));
+            assert!(
+                line_1.contains('❯'),
+                "line 1 must contain prompt symbol at cursor {cursor_pos}: {line_1}"
+            );
+            assert!(
+                line_1.contains('a') || line_1.contains('.'),
+                "line 1 must contain input text at cursor {cursor_pos}: {line_1}"
+            );
+            assert_eq!(
+                line_2.trim(),
+                "",
+                "line 2 must be empty and not wrapped at cursor {cursor_pos}: {line_2}"
+            );
+        }
     }
 }

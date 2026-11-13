@@ -99,7 +99,7 @@ async fn test_stale_details_response_protection() {
         context_a,
         1,
         "movie_a".to_string(),
-        stale_payload,
+        Box::new(stale_payload),
     ))
     .await;
 
@@ -134,7 +134,7 @@ async fn test_stale_details_response_protection() {
         context_b,
         2,
         "movie_b".to_string(),
-        valid_payload,
+        Box::new(valid_payload),
     ))
     .await;
 
@@ -240,8 +240,9 @@ async fn test_mode_switch_stale_response_protection() {
     app.state_mut().active_search_request = 1;
     app.state_mut().search_query.set_content("avatar");
 
-    app.handle_action(Action::ToggleAddonMode).await;
-    assert_eq!(app.state().mode(), AppMode::Addon);
+    app.handle_action(Action::SwitchProvider(ProviderKind::Addons))
+        .await;
+    assert_eq!(app.state().active_provider, ProviderKind::Addons);
     assert_ne!(app.state().provider_generation, streaming_generation);
 
     let moviebox_items = vec![CatalogItem {
@@ -333,7 +334,6 @@ async fn test_search_preview_and_details_metadata_isolation() {
         provider: ProviderKind::Addons,
     };
 
-    // Mismatched preview should NOT leak description/director/stars/rating into fallback
     let fallback = MediaDetails::from_search_result(&new_search_result, Some(&old_preview));
     assert_eq!(fallback.id.value, "tt_new_movie");
     assert_eq!(fallback.title, "New Movie Title");
@@ -343,7 +343,6 @@ async fn test_search_preview_and_details_metadata_isolation() {
     assert!(fallback.stars.is_none());
     assert!(fallback.imdb_rating.is_none());
 
-    // Matching preview SHOULD preserve preview details
     let matching_preview = MediaDetails {
         id: ProviderMediaId {
             provider: ProviderKind::Addons,
@@ -397,6 +396,7 @@ async fn test_series_details_defaults_to_season_one_when_no_history() {
                     season: s,
                     number: e,
                     title: None,
+                    overview: None,
                 })
                 .collect(),
         })
@@ -428,7 +428,7 @@ async fn test_series_details_defaults_to_season_one_when_no_history() {
         context,
         1,
         "bb_series".to_string(),
-        details,
+        Box::new(details),
     ))
     .await;
 
@@ -461,6 +461,7 @@ async fn test_series_details_resumes_watch_history() {
             timestamp: 1000,
             release_year: "2008".to_string(),
             cover_url: None,
+            stream_filename: None,
         });
     app.state_mut().active_details_request = 1;
 
@@ -477,6 +478,7 @@ async fn test_series_details_resumes_watch_history() {
                     season: s,
                     number: e,
                     title: None,
+                    overview: None,
                 })
                 .collect(),
         })
@@ -508,7 +510,7 @@ async fn test_series_details_resumes_watch_history() {
         context,
         1,
         "bb_series".to_string(),
-        details,
+        Box::new(details),
     ))
     .await;
 
@@ -543,6 +545,7 @@ async fn test_series_details_preserves_season_and_episode_on_language_switch() {
                     season: s,
                     number: e,
                     title: None,
+                    overview: None,
                 })
                 .collect(),
         })
@@ -574,7 +577,7 @@ async fn test_series_details_preserves_season_and_episode_on_language_switch() {
         context,
         1,
         "bb_series".to_string(),
-        details,
+        Box::new(details),
     ))
     .await;
 

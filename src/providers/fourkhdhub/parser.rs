@@ -39,6 +39,12 @@ static SEL_FILE_TITLE: LazyLock<Selector> =
 static SEL_LINK_HREF: LazyLock<Selector> = LazyLock::new(|| Selector::parse("a[href]").unwrap());
 static SEL_BADGE_SIZE: LazyLock<Selector> =
     LazyLock::new(|| Selector::parse(".badge-size, .badge").unwrap());
+static SEL_OG_IMAGE: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("meta[property=\"og:image\"]").unwrap());
+static SEL_OG_TITLE: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("meta[property=\"og:title\"]").unwrap());
+static SEL_META_DESC: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("meta[name=\"description\"]").unwrap());
 
 pub fn parse_search(base: &Url, html: &str) -> Result<Vec<CatalogItem>, FourKHdHubError> {
     let document = Html::parse_document(html);
@@ -89,7 +95,7 @@ pub fn parse_details(id: &str, html: &str) -> Result<MediaDetails, FourKHdHubErr
         .select(&SEL_H1)
         .find_map(|node| text_of(Some(node)))
         .filter(|text| !text.is_empty())
-        .or_else(|| meta_content(&document, "meta[property=\"og:title\"]"))
+        .or_else(|| meta_content(&document, &SEL_OG_TITLE))
         .ok_or_else(|| FourKHdHubError::Parse("title missing".into()))?;
     let title = strip_trailing_year(&raw_title);
     let media_type = if id.contains("-series-") {
@@ -100,14 +106,14 @@ pub fn parse_details(id: &str, html: &str) -> Result<MediaDetails, FourKHdHubErr
     let description = document
         .select(&SEL_CONTENT_DESC)
         .find_map(|node| text_of(Some(node)))
-        .or_else(|| meta_content(&document, "meta[name=\"description\"]"));
+        .or_else(|| meta_content(&document, &SEL_META_DESC));
     let tagline = document
         .select(&SEL_TAGLINE)
         .find_map(|node| text_of(Some(node)));
     let imdb_rating = document
         .select(&SEL_IMDB)
         .find_map(|node| text_of(Some(node)));
-    let poster_url = meta_content(&document, "meta[property=\"og:image\"]");
+    let poster_url = meta_content(&document, &SEL_OG_IMAGE);
     let year = find_metadata(&document, "Release:")
         .and_then(|value| first_four_digit_year(&value))
         .or_else(|| {
@@ -187,7 +193,10 @@ pub fn parse_releases(
                     label,
                     resolver_url: href.to_string(),
                     headers: Vec::new(),
-                    direct_file: !href.contains("hubcloud.") && !href.contains("hubdrive."),
+                    direct_file: !href.contains("hubcloud.")
+                        && !href.contains("hubdrive.")
+                        && !href.contains("greenmotors.")
+                        && !href.contains("greenmountmotors."),
                 })
             })
             .collect::<Vec<_>>();
@@ -197,14 +206,16 @@ pub fn parse_releases(
         let size_text = item
             .select(size_selector)
             .filter_map(|node| text_of(Some(node)))
-            .find(|text| parse_size_bytes(text).is_some());
+            .find(|text| crate::providers::models::parse_size_bytes(text).is_some());
         let key = normalize_filename(&filename);
         let release = grouped.entry(key).or_insert_with(|| Release {
             provider: ProviderKind::FourKHdHub,
             quality: detect_quality(&filename),
             codec: detect_codec(&filename),
             language: detect_language(&filename).or_else(|| page_language.clone()),
-            size_bytes: size_text.as_deref().and_then(parse_size_bytes),
+            size_bytes: size_text
+                .as_deref()
+                .and_then(crate::providers::models::parse_size_bytes),
             season: parsed_episode.map(|value| value.0),
             episode: parsed_episode.map(|value| value.1),
             filename: filename.clone(),
@@ -222,7 +233,12 @@ pub fn parse_releases(
         }
     }
     let mut releases = grouped.into_values().collect::<Vec<_>>();
-    releases.sort_by(|left, right| right.quality.cmp(&left.quality));
+    releases.sort_by(|left, right| {
+        right
+            .resolution_u64()
+            .cmp(&left.resolution_u64())
+            .then_with(|| right.size_bytes.cmp(&left.size_bytes))
+    });
     Ok(releases)
 }
 
@@ -243,6 +259,7 @@ fn parse_seasons(document: &Html) -> Result<Vec<Season>, FourKHdHubError> {
                 season,
                 number: episode,
                 title: None,
+                overview: None,
             });
     }
     Ok(seasons
@@ -260,10 +277,9 @@ fn text_of(node: Option<ElementRef<'_>>) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
-fn meta_content(document: &Html, query: &str) -> Option<String> {
-    let selector = Selector::parse(query).ok()?;
+fn meta_content(document: &Html, selector: &Selector) -> Option<String> {
     document
-        .select(&selector)
+        .select(selector)
         .next()
         .and_then(|node| node.value().attr("content"))
         .map(str::to_string)
@@ -277,7 +293,7 @@ fn find_metadata(document: &Html, label: &str) -> Option<String> {
 }
 
 fn first_four_digit_year(value: &str) -> Option<String> {
-    let year = crate::tui::text::extract_4digit_year(value);
+    let year = crate::providers::models::extract_4digit_year(value);
     (!year.is_empty()).then_some(year)
 }
 
@@ -330,7 +346,7 @@ fn parse_season_count(value: &str) -> Option<usize> {
     let suffix = &value[marker..];
     suffix
         .split(['-', ' ', '•'])
-        .filter_map(|part| part.trim_start_matches('S').parse::<usize>().ok())
+        .filter_map(|part| part.strip_prefix('S')?.parse::<usize>().ok())
         .max()
 }
 
@@ -369,31 +385,23 @@ fn parse_season_episode(value: &str) -> Option<(usize, usize)> {
     None
 }
 
-fn parse_size_bytes(value: &str) -> Option<u64> {
-    let normalized = value.replace(' ', "").to_ascii_uppercase();
-    for (suffix, multiplier) in [
-        ("GB", 1024_u64.pow(3)),
-        ("MB", 1024_u64.pow(2)),
-        ("KB", 1024_u64),
-    ] {
-        if let Some(number) = normalized.strip_suffix(suffix)
-            && let Ok(number) = number.parse::<f64>()
-        {
-            return Some((number * multiplier as f64) as u64);
-        }
-    }
-    None
-}
-
 fn detect_quality(value: &str) -> Option<String> {
-    ["2160p", "1080p", "720p", "480p"]
-        .into_iter()
-        .find(|quality| {
-            value
-                .to_ascii_lowercase()
-                .contains(&quality.to_ascii_lowercase())
-        })
-        .map(str::to_string)
+    let lower = value.to_ascii_lowercase();
+    if lower.contains("2160p")
+        || lower.contains("2160")
+        || lower.contains("4k")
+        || lower.contains("uhd")
+    {
+        Some("2160p".to_string())
+    } else if lower.contains("1080p") || lower.contains("1080") || lower.contains("fhd") {
+        Some("1080p".to_string())
+    } else if lower.contains("720p") || lower.contains("720") || lower.contains("hd") {
+        Some("720p".to_string())
+    } else if lower.contains("480p") || lower.contains("480") || lower.contains("sd") {
+        Some("480p".to_string())
+    } else {
+        None
+    }
 }
 
 fn detect_codec(value: &str) -> Option<String> {
@@ -585,5 +593,28 @@ mod tests {
         assert_eq!(strip_trailing_year("(2024)"), "");
         assert_eq!(strip_trailing_year("12345"), "12345");
         assert_eq!(strip_trailing_year("123456"), "123456");
+    }
+    #[test]
+    fn test_detect_quality_tokens() {
+        use super::detect_quality;
+        assert_eq!(
+            detect_quality("Inception (2010) 4K UHD BluRay REMUX").as_deref(),
+            Some("2160p")
+        );
+        assert_eq!(
+            detect_quality("Movie.2160p.HDR.x265").as_deref(),
+            Some("2160p")
+        );
+        assert_eq!(
+            detect_quality("Show.S01E01.FHD.1080p.mkv").as_deref(),
+            Some("1080p")
+        );
+        assert_eq!(
+            detect_quality("Video.1080.WEB-DL").as_deref(),
+            Some("1080p")
+        );
+        assert_eq!(detect_quality("Film.720p.HD.x264").as_deref(), Some("720p"));
+        assert_eq!(detect_quality("Old.Show.480p.SD").as_deref(), Some("480p"));
+        assert_eq!(detect_quality("Unknown.Release.Title"), None);
     }
 }

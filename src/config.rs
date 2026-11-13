@@ -12,12 +12,20 @@ pub struct Config {
     pub active_mode: String,
     pub active_provider: ProviderKind,
     pub active_theme: String,
-    pub bdix_enabled: bool,
+    pub moviebox_enabled: bool,
+    pub fourkhdhub_enabled: bool,
+    pub dramachi_enabled: bool,
+    pub bdix_circleftp_enabled: bool,
+    pub bdix_dhakaflix_enabled: bool,
+    pub bdix_probed: bool,
     pub streaming_enabled: bool,
     pub tv_enabled: bool,
     pub addons_enabled: bool,
     pub default_player: Option<String>,
     pub download_dir: Option<String>,
+    pub vlc_path: Option<String>,
+    pub mpv_path: Option<String>,
+    pub iina_path: Option<String>,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -27,19 +35,59 @@ impl Default for Config {
             active_mode: "streaming".to_string(),
             active_provider: ProviderKind::MovieBox,
             active_theme: String::new(),
-            bdix_enabled: false,
+            moviebox_enabled: true,
+            fourkhdhub_enabled: true,
+            dramachi_enabled: true,
+            bdix_circleftp_enabled: false,
+            bdix_dhakaflix_enabled: false,
+            bdix_probed: false,
             streaming_enabled: true,
             tv_enabled: true,
             addons_enabled: false,
             default_player: None,
             download_dir: None,
+            vlc_path: None,
+            mpv_path: None,
+            iina_path: None,
         }
     }
 }
 
 pub const APP_NAME: &str = "moviebox-tui";
 
+static TEST_SANDBOX_DIR: std::sync::LazyLock<Option<PathBuf>> = std::sync::LazyLock::new(|| {
+    let is_test_binary = cfg!(test)
+        || std::env::var_os("NEXTEST").is_some()
+        || std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().and_then(|d| d.file_name()).map(|n| n == "deps"))
+            .unwrap_or(false);
+    if is_test_binary {
+        let dir =
+            std::env::temp_dir().join(format!("moviebox_test_sandbox_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        Some(dir)
+    } else {
+        None
+    }
+});
+
+pub fn is_test_environment() -> bool {
+    TEST_SANDBOX_DIR.is_some()
+}
+pub const TERMUX_PREFIX_USR: &str = "/data/data/com.termux/files/usr";
+
+pub fn is_termux_environment() -> bool {
+    cfg!(target_os = "android")
+        || std::env::var("TERMUX_VERSION").is_ok()
+        || std::env::var("PREFIX").is_ok_and(|p| p.contains("com.termux"))
+        || std::path::Path::new(TERMUX_PREFIX_USR).exists()
+}
+
 pub fn config_dir() -> Option<PathBuf> {
+    if let Some(sandbox) = TEST_SANDBOX_DIR.as_ref() {
+        return Some(sandbox.join("config").join(APP_NAME));
+    }
     if let Ok(dir) = std::env::var("MOVIEBOX_CONFIG_DIR") {
         return Some(PathBuf::from(dir));
     }
@@ -58,10 +106,21 @@ pub fn config_dir() -> Option<PathBuf> {
             return Some(p);
         }
     }
-    dirs::home_dir().map(|h| h.join(".config").join(APP_NAME))
+    if let Some(dir) = dirs::home_dir().map(|h| h.join(".config").join(APP_NAME)) {
+        return Some(dir);
+    }
+    let fallback = std::env::temp_dir().join(APP_NAME).join("config");
+    log::warn!(
+        "unable to locate user config directory, falling back to {}",
+        fallback.display()
+    );
+    Some(fallback)
 }
 
 pub fn data_dir() -> Option<PathBuf> {
+    if let Some(sandbox) = TEST_SANDBOX_DIR.as_ref() {
+        return Some(sandbox.join("data").join(APP_NAME));
+    }
     if let Ok(dir) = std::env::var("MOVIEBOX_DATA_DIR") {
         return Some(PathBuf::from(dir));
     }
@@ -80,10 +139,21 @@ pub fn data_dir() -> Option<PathBuf> {
             return Some(p);
         }
     }
-    dirs::home_dir().map(|h| h.join(".local").join("share").join(APP_NAME))
+    if let Some(dir) = dirs::home_dir().map(|h| h.join(".local").join("share").join(APP_NAME)) {
+        return Some(dir);
+    }
+    let fallback = std::env::temp_dir().join(APP_NAME).join("data");
+    log::warn!(
+        "unable to locate user data directory, falling back to {}",
+        fallback.display()
+    );
+    Some(fallback)
 }
 
 pub fn cache_dir() -> PathBuf {
+    if let Some(sandbox) = TEST_SANDBOX_DIR.as_ref() {
+        return sandbox.join("cache").join(APP_NAME);
+    }
     if let Ok(dir) = std::env::var("MOVIEBOX_CACHE_DIR") {
         return PathBuf::from(dir);
     }
@@ -111,6 +181,12 @@ pub fn cache_dir() -> PathBuf {
 }
 
 pub fn logs_dir() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(dir) = dirs::data_local_dir() {
+            return dir.join(APP_NAME).join("logs");
+        }
+    }
     data_dir()
         .map(|dir| dir.join("logs"))
         .unwrap_or_else(|| std::env::temp_dir().join(APP_NAME).join("logs"))
@@ -144,27 +220,49 @@ pub fn favorites_path() -> Option<PathBuf> {
     data_dir().map(|dir| dir.join("favorites.json"))
 }
 
+pub fn rotate_corrupt_file(path: &std::path::Path, label: &str) {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let corrupt_path = path.with_extension(format!("corrupt.{stamp}"));
+    log::error!(
+        "failed to parse {label} from {}, rotating to {}",
+        crate::logging::sanitize_path(path),
+        crate::logging::sanitize_path(&corrupt_path)
+    );
+    let _ = std::fs::rename(path, corrupt_path);
+}
+
 pub fn load() -> Config {
     let Some(path) = config_path() else {
         return Config::default();
     };
     if path.exists() {
         if let Ok(content) = std::fs::read_to_string(&path) {
-            if let Ok(config) = serde_json::from_str::<Config>(&content) {
+            let mut val: serde_json::Value = match serde_json::from_str(&content) {
+                Ok(v) => v,
+                Err(e) => {
+                    log::warn!("config invalid JSON: {e}; resetting");
+                    serde_json::Value::default()
+                }
+            };
+            let old_bdix = val
+                .get("bdix_enabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if let Some(obj) = val.as_object_mut() {
+                obj.remove("bdix_enabled");
+            }
+            if let Ok(mut config) = serde_json::from_value::<Config>(val) {
+                if old_bdix {
+                    config.bdix_circleftp_enabled = true;
+                    config.bdix_dhakaflix_enabled = true;
+                }
                 return config;
             }
         }
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let corrupt_path = path.with_extension(format!("corrupt.{stamp}"));
-        log::error!(
-            "failed to parse config from {}, rotating to {}",
-            crate::logging::sanitize_path(&path),
-            crate::logging::sanitize_path(&corrupt_path)
-        );
-        let _ = std::fs::rename(&path, corrupt_path);
+        rotate_corrupt_file(&path, "config");
     }
     Config::default()
 }
@@ -190,17 +288,7 @@ pub fn load_addons() -> Vec<InstalledAddon> {
                 Ok(content) => match serde_json::from_str::<Vec<InstalledAddon>>(&content) {
                     Ok(parsed) => parsed,
                     Err(e) => {
-                        let stamp = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs();
-                        let corrupt_path = path.with_extension(format!("corrupt.{stamp}"));
-                        log::error!(
-                            "failed to parse addons config from {} ({e}), rotating to {}",
-                            crate::logging::sanitize_path(&path),
-                            crate::logging::sanitize_path(&corrupt_path)
-                        );
-                        let _ = std::fs::rename(&path, corrupt_path);
+                        rotate_corrupt_file(&path, &format!("addons config ({e})"));
                         Vec::new()
                     }
                 },

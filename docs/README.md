@@ -1,32 +1,37 @@
+<div align="center">
+
 # Introduction
 
-A fast, lightweight terminal client for streaming and downloading movies, TV shows, anime, and live TV — powered by your local media player.
+**Terminal interface to find, download, and stream movies, TV shows, and live TV using local media players.**
 
-[moviebox-tui walkthrough.webm](https://github.com/user-attachments/assets/51802c09-abb1-46dd-bd04-d96a9cf836bb)
+[ English ](../README.md) • [ বাংলা ](../README_BN.md) • [ हिन्दी ](../README_HI.md) • [ Español ](../README_ES.md)
 
-MovieBox-TUI replaces ad-heavy streaming websites and clunky browser players with a clean, keyboard-driven terminal interface. It scrapes stream links directly from multiple sources and launches playback in your native media player with hardware acceleration, audio track switching, and automatic subtitle synchronization.
+[![CI](https://img.shields.io/github/actions/workflow/status/mesamirh/MovieBox-Tui/ci.yml?branch=main&label=CI&logo=github&style=flat)](https://github.com/mesamirh/MovieBox-Tui/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/moviebox-tui.svg?logo=rust&style=flat)](https://crates.io/crates/moviebox-tui)
+[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg?style=flat)](../README.md#license)
+[![Telegram](https://img.shields.io/badge/Telegram-Channel-2CA5E0?style=flat&logo=telegram&logoColor=white)](https://t.me/getfromme)
+[![Support](https://img.shields.io/badge/Support-Crypto-F7931A?style=flat&logo=bitcoin&logoColor=white)](../README.md#optional-support)
+</div>
+
+[moviebox-tui-walkthrough.webm](https://github.com/user-attachments/assets/7554a7e5-6ff5-49ec-9d87-f821ea99950e)
 
 ## Features
 
-- **Multi-Source Streaming**: Search and stream titles across MovieBox, 4KHDHub, BDIX mirrors, custom IPTV playlists, and community Stremio HTTP addons. Press `Ctrl+P` on the Details screen to switch providers in-place.
-- **Hardware-Accelerated Playback**: Direct playback in `mpv`, `IINA` (macOS), or `VLC` with stream authentication headers forwarded automatically.
-- **Automatic Subtitles**: Automatically searches, downloads, and syncs subtitles in your preferred language directly into your player.
-- **Season Batch Downloads**: Download individual episodes or entire seasons with one keypress (`d`), with HTTP range resume support and clean folder structure (`Movies/` and `Series/`).
-- **Interactive Settings Hub**: Configure your default media player, download folder, content modes, and themes inside an in-app visual modal via `/settings` (`Ctrl+S`).
-- **Modes**: Switch instantly between standard Streaming, Live TV (`Ctrl+T`), and Addon Mode (`Ctrl+A`).
-- **Ergonomics & Themes**: Full keyboard navigation (vim-style `j`/`k`, `/`, `Tab`) and mouse support (click, scroll, drag) with 6 built-in themes (Catppuccin, TokyoNight, Nord, Dracula, Gruvbox, Rosé Pine) and terminal theme autodetection.
+- **Streaming:** Movies, TV series, anime, Asian dramas, and community Stremio addons across multiple native providers.
+- **Live TV:** M3U playlist import with channel categories, EPG support, and search.
+- **Resolution Picker:** Direct stream quality selection (`4K`, `1080p`, `720p`, `480p`, `Auto`) before playback.
+- **Hardware Players:** Seamless launch in `mpv`, `VLC`, or `IINA` with custom auth header and cookie forwarding.
+- **Batch Downloader:** Multi-segment concurrent downloader with HTTP range pause and resume for episodes and full seasons.
+- **Subtitle Picker:** Multi-language subtitle tracks extracted and selectable via an interactive picker before playback or download.
+- **Terminal UI:** Vim navigation, mouse interaction, slash command palette (`/help`, `/settings`), and 9 built-in themes.
+- **Cover Art:** Native Kitty, Sixel, and iTerm2 poster rendering with automatic text fallback.
+- **Resume & Library:** Home deck with continue-watching timestamps, watch history, and favorites stored strictly on local disk. Zero telemetry.
 
 ## Prerequisites
 
-MovieBox-TUI delegates video decoding to an external media player. Install at least one of the following:
-
-| Player | Platform | Quick Install |
-| :--- | :--- | :--- |
-| **mpv** *(Recommended)* | Linux, macOS, Windows | `brew install mpv` / `sudo apt install mpv` / `winget install mpv` |
-| **IINA** | macOS (Native GUI) | `brew install --cask iina` |
-| **VLC** | Cross-platform | `brew install --cask vlc` / `sudo apt install vlc` / `winget install VideoLAN.VLC` |
-| **Android Player** | Android (Termux) | `pkg install -y termux-tools termux-am` *(launches external player)* |
-
+- **Media Player:** `mpv`, `VLC`, or `IINA` (macOS) / any external video player (Android).
+- **Posters:** Terminal with Sixel, Kitty, or iTerm2 support (Ghostty, Kitty, WezTerm, iTerm2, foot, Windows Terminal v1.22+).
+- **DASH Downloads:** `yt-dlp` and `ffmpeg` (required only for MovieBox DASH downloads).
 ---
 
 ## Documentation Directory Map

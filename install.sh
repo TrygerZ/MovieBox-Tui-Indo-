@@ -396,12 +396,25 @@ elif [ "$OS" = "Linux" ]; then
         FILE="MovieBox_Linux_x64.tar.gz"
         PLATFORM_NAME="Linux (x86_64)"
     elif [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
+        if command -v getconf >/dev/null 2>&1 && [ "$(getconf LONG_BIT 2>/dev/null)" = "32" ]; then
+            log_error "Detected 32-bit userland on 64-bit ARM hardware ($ARCH kernel with 32-bit armhf OS)."
+            log_error "Prebuilt Linux ARM64 binaries require 64-bit userland (aarch64)."
+            printf "\n  %bℹ%b To run on 32-bit Raspberry Pi OS, compile natively via cargo:\n" "$C_SAPPHIRE" "$C_RESET" >&2
+            printf "    %bsudo apt update && sudo apt install -y pkg-config libssl-dev%b\n" "$C_BOLD" "$C_RESET" >&2
+            printf "    %bcargo install moviebox-tui --locked%b\n\n" "$C_BOLD" "$C_RESET" >&2
+            exit 1
+        fi
         FILE="MovieBox_Linux_arm64.tar.gz"
         PLATFORM_NAME="Linux (arm64)"
     else
         log_error "Unsupported Linux architecture ($ARCH). Only x86_64 and arm64 are supported."
         exit 1
     fi
+elif case "$OS" in MINGW*|MSYS*|CYGWIN*) true ;; *) false ;; esac; then
+    log_error "Windows environment detected ($OS)."
+    printf "\n  %bℹ%b Please use the official Windows PowerShell installer:\n" "$C_SAPPHIRE" "$C_RESET" >&2
+    printf "    %birm https://raw.githubusercontent.com/%s/main/install.ps1 | iex%b\n\n" "$C_BOLD" "$REPO" "$C_RESET" >&2
+    exit 1
 else
     log_error "Unsupported Operating System ($OS)."
     exit 1
@@ -412,6 +425,10 @@ TMP_VER_FILE=$(mktemp)
 resolve_version() {
     if [ -n "$VERSION" ]; then
         printf "%s" "$VERSION" > "$TMP_VER_FILE"
+        return 0
+    fi
+    if [ -n "${MOVIEBOX_RELEASE_URL:-}" ]; then
+        printf "%s" "local-test" > "$TMP_VER_FILE"
         return 0
     fi
 
@@ -495,8 +512,13 @@ fi
 
 TMP_DIR=$(mktemp -d)
 
-URL="https://github.com/$REPO/releases/download/$TARGET_VERSION/$FILE"
-CHECKSUM_URL="https://github.com/$REPO/releases/download/$TARGET_VERSION/SHA256SUMS"
+if [ -n "${MOVIEBOX_RELEASE_URL:-}" ]; then
+    URL="${MOVIEBOX_RELEASE_URL%/}/$FILE"
+    CHECKSUM_URL="${MOVIEBOX_RELEASE_URL%/}/SHA256SUMS"
+else
+    URL="https://github.com/$REPO/releases/download/$TARGET_VERSION/$FILE"
+    CHECKSUM_URL="https://github.com/$REPO/releases/download/$TARGET_VERSION/SHA256SUMS"
+fi
 
 download_files() {
     if ! curl -fsSL "$URL" -o "$TMP_DIR/$FILE"; then
@@ -517,7 +539,7 @@ log_success "[2/4] Downloaded $FILE"
 
 verify_checksum() {
     local expected_sha
-    expected_sha=$(awk -v file="$FILE" '$2 == file {print $1}' "$TMP_DIR/SHA256SUMS")
+    expected_sha=$(awk -v file="$FILE" '{gsub(/^\*/, "", $2); if ($2 == file) print $1}' "$TMP_DIR/SHA256SUMS")
     if [ -z "$expected_sha" ]; then
         return 1
     fi
@@ -561,12 +583,23 @@ run_spinner "[4/4] Installing binary to $INSTALL_DIR" install_binary || exit 1
 log_success "[4/4] Binary installed to $APP_PATH"
 
 if [ "$DRY_RUN" -eq 0 ]; then
-    if ! smoke_output=$("$APP_PATH" --version 2>&1); then
-        log_error "Installed binary failed execution smoke test ($APP_PATH):"
-        printf "  %s\n" "$smoke_output" >&2
+    set +e
+    smoke_output=$("$APP_PATH" --version 2>&1)
+    smoke_status=$?
+    set -e
+    if [ "$smoke_status" -ne 0 ]; then
+        log_error "Installed binary failed execution smoke test ($APP_PATH, exit code $smoke_status):"
+        if [ -n "$smoke_output" ]; then
+            printf "  %s\n" "$smoke_output" >&2
+        else
+            printf "  (Process terminated with exit status %d without output)\n" "$smoke_status" >&2
+        fi
         if [ "$IS_TERMUX" -eq 1 ]; then
             printf "\n  %bℹ%b If Termux rejects the binary, install via cargo:\n" "$C_SAPPHIRE" "$C_RESET" >&2
             printf "    %bpkg install -y rust clang && cargo install moviebox-tui --locked%b\n\n" "$C_BOLD" "$C_RESET" >&2
+        elif [ "$OS" = "Linux" ] && { [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; }; then
+            printf "\n  %bℹ%b If your Linux distribution kernel or environment rejects the binary, install via cargo:\n" "$C_SAPPHIRE" "$C_RESET" >&2
+            printf "    %bcargo install moviebox-tui --locked%b\n\n" "$C_BOLD" "$C_RESET" >&2
         fi
         exit 1
     fi
@@ -635,7 +668,7 @@ printf "  %b•%b %bBinary:%b  %b%s%b\n" "$C_MUTED" "$C_RESET" "$C_MUTED" "$C_RE
 if [ -n "$PLAYER_DETECTED" ]; then
     printf "  %b•%b %bPlayer:%b  %b%s (ready)%b\n" "$C_MUTED" "$C_RESET" "$C_MUTED" "$C_RESET" "$C_GREEN" "$PLAYER_DETECTED" "$C_RESET"
 elif [ "$IS_TERMUX" -eq 1 ]; then
-    printf "  %b•%b %bPlayer:%b  %bNone detected (run 'pkg install -y termux-tools termux-am')%b\n" "$C_MUTED" "$C_RESET" "$C_MUTED" "$C_RESET" "$C_SAPPHIRE" "$C_RESET"
+    printf "  %b•%b %bPlayer:%b  %bNone detected (run 'pkg install -y termux-tools')%b\n" "$C_MUTED" "$C_RESET" "$C_MUTED" "$C_RESET" "$C_SAPPHIRE" "$C_RESET"
 else
     printf "  %b•%b %bPlayer:%b  %bNone detected (mpv, VLC, or IINA recommended)%b\n" "$C_MUTED" "$C_RESET" "$C_MUTED" "$C_RESET" "$C_SAPPHIRE" "$C_RESET"
 fi
@@ -650,7 +683,7 @@ printf "    %b$ moviebox-tui%b\n\n" "$C_GREEN" "$C_RESET"
 
 if [ -z "$PLAYER_DETECTED" ]; then
     if [ "$IS_TERMUX" -eq 1 ]; then
-        printf "  %bℹ%b Note: Run %b'pkg install -y termux-tools termux-am'%b to enable video playback on Termux.\n" "$C_SAPPHIRE" "$C_RESET" "$C_BOLD" "$C_RESET"
+        printf "  %bℹ%b Note: Run %b'pkg install -y termux-tools'%b to enable video playback on Termux.\n" "$C_SAPPHIRE" "$C_RESET" "$C_BOLD" "$C_RESET"
         printf "    Streams play via external Android players (VLC, MX Player, or Just Player).\n\n"
     else
         printf "  %bℹ%b Note: A media player (mpv, VLC, or IINA) is recommended for video playback.\n\n" "$C_SAPPHIRE" "$C_RESET"

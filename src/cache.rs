@@ -25,6 +25,7 @@ pub fn get_typed_cache<T: DeserializeOwned + Serialize>(
 ) -> Option<T> {
     use std::io::Read;
     let mut file = fs::File::open(path).ok()?;
+    let mut file_len = 0;
     if let Ok(metadata) = file.metadata() {
         if let Some(elapsed) = metadata.modified().ok().and_then(|m| m.elapsed().ok()) {
             if elapsed.as_secs() > expiry_secs {
@@ -32,8 +33,9 @@ pub fn get_typed_cache<T: DeserializeOwned + Serialize>(
                 return None;
             }
         }
+        file_len = metadata.len() as usize;
     }
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity(file_len);
     if file.read_to_end(&mut bytes).is_err() {
         return None;
     }
@@ -72,19 +74,28 @@ pub fn set_typed_cache<T: Serialize + ?Sized>(path: &Path, expiry_secs: u64, dat
         expires_at: now + expiry_secs,
         data,
     };
-    if let Ok(msgpack_bytes) = rmp_serde::to_vec(&envelope) {
-        let mut file_bytes = Vec::with_capacity(4 + msgpack_bytes.len());
-        file_bytes.extend_from_slice(&CACHE_MAGIC);
-        file_bytes.extend_from_slice(&msgpack_bytes);
-        let _ = atomic_write_file(path, &file_bytes);
+    let mut file_bytes = Vec::with_capacity(512);
+    file_bytes.extend_from_slice(&CACHE_MAGIC);
+    if rmp_serde::encode::write(&mut file_bytes, &envelope).is_ok() {
+        if let Err(error) = atomic_write_cache_file(path, &file_bytes) {
+            log::warn!(
+                "failed to write cache file {}: {error}",
+                crate::logging::sanitize_path(path)
+            );
+        }
+    } else {
+        log::warn!(
+            "failed to serialize cache envelope for {}",
+            crate::logging::sanitize_path(path)
+        );
     }
 }
 
-pub fn md5_hex(value: &str) -> String {
+pub fn md5_hex_bytes(bytes: &[u8]) -> String {
     use md5::{Digest, Md5};
     const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
     let mut hasher = Md5::new();
-    hasher.update(value.as_bytes());
+    hasher.update(bytes);
     let result = hasher.finalize();
     let mut safe_query = String::with_capacity(32);
     for &b in &result {
@@ -92,6 +103,10 @@ pub fn md5_hex(value: &str) -> String {
         safe_query.push(HEX_CHARS[(b & 0x0f) as usize] as char);
     }
     safe_query
+}
+
+pub fn md5_hex(value: &str) -> String {
+    md5_hex_bytes(value.as_bytes())
 }
 
 pub fn atomic_write_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -105,6 +120,29 @@ pub fn atomic_write_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Resul
     let temporary = path.with_extension(format!("tmp-{}-{stamp}", std::process::id()));
     write_durable(&temporary, bytes)?;
     match durable_replace(&temporary, path, &format!("{stamp}-f")) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            Err(error)
+        }
+    }
+}
+
+pub fn atomic_write_cache_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).ok();
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary = path.with_extension(format!("tmp-{}-{stamp}", std::process::id()));
+    fs::write(&temporary, bytes)?;
+    if fs::rename(&temporary, path).is_ok() {
+        return Ok(());
+    }
+    let _ = fs::remove_file(path);
+    match fs::rename(&temporary, path) {
         Ok(()) => Ok(()),
         Err(error) => {
             let _ = fs::remove_file(&temporary);
@@ -170,69 +208,11 @@ fn sync_parent_dir(path: &std::path::Path) {
 fn sync_parent_dir(_path: &std::path::Path) {}
 
 pub async fn atomic_write_file_async(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await.ok();
-    }
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let temporary = path.with_extension(format!("tmp-{}-{stamp}", std::process::id()));
-    write_durable_async(&temporary, bytes).await?;
-    match durable_replace_async(&temporary, path, &format!("{stamp}-f")).await {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let _ = tokio::fs::remove_file(&temporary).await;
-            Err(error)
-        }
-    }
-}
-
-async fn write_durable_async(target: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    use tokio::io::AsyncWriteExt;
-    let mut file = tokio::fs::File::create(target).await?;
-    file.write_all(bytes).await?;
-    file.sync_all().await
-}
-
-async fn durable_replace_async(
-    temporary: &std::path::Path,
-    path: &std::path::Path,
-    suffix: &str,
-) -> std::io::Result<()> {
-    if tokio::fs::rename(temporary, path).await.is_ok() {
-        sync_parent_dir(path);
-        return Ok(());
-    }
-    let _ = tokio::fs::remove_file(path).await;
-    if tokio::fs::rename(temporary, path).await.is_ok() {
-        sync_parent_dir(path);
-        return Ok(());
-    }
-    let copy_target = path.with_extension(format!("tmp-{}-{suffix}", std::process::id()));
-    let outcome: std::io::Result<()> = async {
-        tokio::fs::copy(temporary, &copy_target).await?;
-        let file = tokio::fs::File::open(&copy_target).await?;
-        file.sync_all().await?;
-        let _ = tokio::fs::remove_file(path).await;
-        tokio::fs::rename(&copy_target, path).await
-    }
-    .await;
-    let _ = tokio::fs::remove_file(&copy_target).await;
-    match outcome {
-        Ok(()) => {
-            sync_parent_dir(path);
-            Ok(())
-        }
-        Err(_) => Err(std::io::Error::other(format!(
-            "atomic replace async failed for {}",
-            crate::logging::sanitize_path(path)
-        ))),
-    }
-}
-
-fn hash_key(value: &str) -> String {
-    md5_hex(value)
+    let path_buf = path.to_path_buf();
+    let payload = bytes.to_vec();
+    tokio::task::spawn_blocking(move || atomic_write_file(&path_buf, &payload))
+        .await
+        .map_err(|err| std::io::Error::other(format!("atomic write task failed: {err}")))?
 }
 
 pub fn get_provider_cache_dir(provider: ProviderKind, subdir: &str) -> PathBuf {
@@ -248,12 +228,13 @@ pub fn get_provider_stream_path(
     episode: usize,
 ) -> PathBuf {
     let mut path = get_provider_cache_dir(provider, "streams");
-    let schema = if provider == ProviderKind::FourKHdHub {
-        "v3_"
-    } else {
-        ""
+    let schema = match provider {
+        ProviderKind::FourKHdHub => "v4_",
+        // Discard streams cached with the DASH referer on recovered MP4 files.
+        ProviderKind::MovieBox => "v2_",
+        _ => "",
     };
-    let hashed_id = hash_key(subject_id);
+    let hashed_id = md5_hex(subject_id);
     path.push(format!("{schema}{hashed_id}_{season}_{episode}.cache"));
     path
 }
@@ -266,7 +247,20 @@ pub fn get_provider_stream_cache_typed(
 ) -> Option<Vec<Release>> {
     let path = get_provider_stream_path(provider, subject_id, season, episode);
     let releases: Vec<Release> = get_typed_cache(&path, STREAM_CACHE_EXPIRY_SECS)?;
-    (!releases.is_empty()).then_some(releases)
+    if releases.is_empty() {
+        return None;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if let Some(min_exp) = min_stream_cookie_expiry(&releases) {
+        if min_exp <= now.saturating_add(60) {
+            let _ = fs::remove_file(&path);
+            return None;
+        }
+    }
+    Some(releases)
 }
 
 pub fn set_provider_stream_cache_typed(
@@ -280,7 +274,81 @@ pub fn set_provider_stream_cache_typed(
         return;
     }
     let path = get_provider_stream_path(provider, subject_id, season, episode);
-    set_typed_cache(&path, STREAM_CACHE_EXPIRY_SECS, releases);
+    let ttl = stream_cache_ttl_secs(releases);
+    set_typed_cache(&path, ttl, releases);
+}
+
+fn min_stream_cookie_expiry(releases: &[Release]) -> Option<u64> {
+    releases
+        .iter()
+        .flat_map(|r| &r.mirrors)
+        .flat_map(|mirror| &mirror.headers)
+        .filter(|(name, _)| name.eq_ignore_ascii_case("cookie"))
+        .flat_map(|(_, val)| val.split(';'))
+        .filter_map(|part| {
+            let trimmed = part.trim();
+            if let Some(policy_raw) = trimmed.strip_prefix("CloudFront-Policy=") {
+                cf_policy_date_less_than(policy_raw)
+            } else if let Some(edge_cookie) = trimmed.strip_prefix("Edge-Cache-Cookie=") {
+                edge_cache_cookie_expiry(edge_cookie)
+            } else {
+                None
+            }
+        })
+        .min()
+}
+
+fn edge_cache_cookie_expiry(cookie_val: &str) -> Option<u64> {
+    for field in cookie_val.split(':') {
+        let trimmed = field.trim();
+        if let Some(raw_ts) = trimmed.strip_prefix("t=") {
+            if let Ok(ts) = raw_ts.parse::<u64>() {
+                return Some(ts);
+            }
+        }
+    }
+    None
+}
+
+fn stream_cache_ttl_secs(releases: &[Release]) -> u64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let min_expiry = min_stream_cookie_expiry(releases);
+    let remaining = min_expiry
+        .and_then(|exp| exp.checked_sub(now))
+        .unwrap_or(STREAM_CACHE_EXPIRY_SECS);
+    remaining.clamp(60, STREAM_CACHE_EXPIRY_SECS)
+}
+
+fn cf_policy_date_less_than(policy_raw: &str) -> Option<u64> {
+    use base64::Engine as _;
+    let mut normalized: String = policy_raw
+        .trim()
+        .chars()
+        .map(|c| match c {
+            '-' => '+',
+            '_' => '=',
+            '~' => '/',
+            other => other,
+        })
+        .collect();
+    let padding = (4 - normalized.len() % 4) % 4;
+    if padding > 0 {
+        normalized.push_str(&"=".repeat(padding));
+    }
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(normalized.as_bytes())
+        .ok()?;
+    let json: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+    json.get("Statement")?
+        .as_array()?
+        .first()?
+        .get("Condition")?
+        .get("DateLessThan")?
+        .get("AWS:EpochTime")?
+        .as_u64()
 }
 
 pub fn invalidate_provider_stream_cache(
@@ -302,7 +370,7 @@ pub fn get_provider_details_path(provider: ProviderKind, subject_id: &str) -> Pa
     } else {
         ""
     };
-    let hashed_id = hash_key(subject_id);
+    let hashed_id = md5_hex(subject_id);
     path.push(format!("details_{schema}{hashed_id}.cache"));
     path
 }
@@ -331,7 +399,7 @@ pub fn invalidate_provider_details_cache(provider: ProviderKind, subject_id: &st
 
 pub fn get_provider_search_path(provider: ProviderKind, query: &str, page: usize) -> PathBuf {
     let mut path = get_provider_cache_dir(provider, "search");
-    let hashed = hash_key(query);
+    let hashed = md5_hex(query);
     path.push(format!("{hashed}_{page}.cache"));
     path
 }
@@ -384,7 +452,7 @@ pub fn set_homepage_cache_typed(
 
 pub fn get_addon_catalog_path(manifest_url: &str, r_type: &str, catalog_id: &str) -> PathBuf {
     let mut path = get_provider_cache_dir(ProviderKind::Addons, "catalogs");
-    let hashed = hash_key(&format!("{manifest_url}_{r_type}_{catalog_id}"));
+    let hashed = md5_hex(&format!("{manifest_url}_{r_type}_{catalog_id}"));
     path.push(format!("catalog_{hashed}.cache"));
     path
 }
@@ -410,7 +478,7 @@ pub fn set_addon_catalog_cache_typed(
 
 pub fn get_addon_manifest_path(manifest_url: &str) -> PathBuf {
     let mut path = get_provider_cache_dir(ProviderKind::Addons, "manifests");
-    let hashed = hash_key(manifest_url);
+    let hashed = md5_hex(manifest_url);
     path.push(format!("manifest_{hashed}.cache"));
     path
 }
@@ -429,7 +497,7 @@ fn get_namespaced_image_path(namespace: &str, id: &str) -> PathBuf {
     let mut path = crate::config::cache_dir();
     path.push(namespace);
     path.push("images");
-    let safe_name = hash_key(id);
+    let safe_name = md5_hex(id);
     path.push(format!("{safe_name}.img"));
     path
 }
@@ -438,18 +506,13 @@ const IMAGE_CACHE_EXPIRY_SECS: u64 = 30 * 24 * 60 * 60;
 
 fn check_image_file(path: &PathBuf) -> Option<Vec<u8>> {
     if path.exists() {
-        if let Ok(metadata) = std::fs::metadata(path) {
-            match metadata.modified().ok().and_then(|m| m.elapsed().ok()) {
-                Some(elapsed) if elapsed.as_secs() > IMAGE_CACHE_EXPIRY_SECS => {
-                    let _ = std::fs::remove_file(path);
-                    return None;
-                }
-                None => {
-                    let _ = std::fs::remove_file(path);
-                    return None;
-                }
-                _ => {}
-            }
+        if let Ok(metadata) = std::fs::metadata(path)
+            && let Ok(modified) = metadata.modified()
+            && let Ok(elapsed) = modified.elapsed()
+            && elapsed.as_secs() > IMAGE_CACHE_EXPIRY_SECS
+        {
+            let _ = std::fs::remove_file(path);
+            return None;
         }
         return std::fs::read(path).ok();
     }
@@ -463,7 +526,7 @@ pub fn get_namespaced_image_cache(namespace: &str, id: &str) -> Option<Vec<u8>> 
 
 pub fn set_namespaced_image_cache(namespace: &str, id: &str, bytes: &[u8]) {
     let path = get_namespaced_image_path(namespace, id);
-    if let Err(error) = atomic_write_file(&path, bytes) {
+    if let Err(error) = atomic_write_cache_file(&path, bytes) {
         log::warn!(
             "failed to commit image cache to {}: {error}",
             crate::logging::sanitize_path(&path)
@@ -473,7 +536,7 @@ pub fn set_namespaced_image_cache(namespace: &str, id: &str, bytes: &[u8]) {
 
 pub fn get_captions_path(subject_id: &str, resource_id: &str) -> PathBuf {
     let mut path = get_provider_cache_dir(ProviderKind::MovieBox, "captions");
-    let hashed_id = hash_key(&format!("{}_{}", subject_id, resource_id));
+    let hashed_id = md5_hex(&format!("{}_{}", subject_id, resource_id));
     path.push(format!("captions_{}.cache", hashed_id));
     path
 }
@@ -491,6 +554,7 @@ pub fn set_captions_cache_typed(subject_id: &str, resource_id: &str, captions: &
     set_typed_cache(&path, CACHE_EXPIRY_SECS, captions);
 }
 
+#[cfg_attr(windows, allow(clippy::permissions_set_readonly_false))]
 fn resilient_remove_file(path: &Path) -> std::io::Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -585,7 +649,10 @@ fn purge_subtitle_cache_files(dir: &Path, errors: &mut Vec<String>) {
         if path.is_file() {
             if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
                 let lower = ext.to_ascii_lowercase();
-                if matches!(lower.as_str(), "srt" | "vtt" | "sub" | "ass" | "tmp") {
+                if matches!(
+                    lower.as_str(),
+                    "srt" | "vtt" | "sub" | "ass" | "ssa" | "tmp" | "log"
+                ) {
                     if let Err(err) = resilient_remove_file(&path) {
                         if err.kind() != std::io::ErrorKind::NotFound {
                             errors.push(format!(
@@ -617,11 +684,9 @@ pub fn clear_all_cache() -> Result<(), String> {
             let _ = fs::remove_dir(&legacy);
         }
     }
-    if let Some(home) = dirs::home_dir() {
-        let storage = home.join("storage/downloads/moviebox_subs");
-        if storage.exists() {
-            purge_subtitle_cache_files(&storage, &mut errors);
-        }
+    let sub_dir = crate::service::resolve_subtitle_dir();
+    if sub_dir.exists() {
+        purge_subtitle_cache_files(&sub_dir, &mut errors);
     }
     let temp_subs = std::env::temp_dir().join("moviebox-tui").join("subs");
     if temp_subs.exists() {
@@ -905,5 +970,43 @@ mod tests {
         );
         assert!(!root_file.exists(), "old non-subtitle file must be swept");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_edge_cache_cookie_expiry_parsing() {
+        let cookie = "urlprefix=aHR0cHM6Ly9zYmNkbjMuaGFrdW5heW1hdGF0YS5jb20v:sign=abc:t=1790486259";
+        assert_eq!(edge_cache_cookie_expiry(cookie), Some(1790486259));
+
+        let cookie_no_t = "urlprefix=aHR0cHM6Ly9zYmNkbjMuaGFrdW5heW1hdGF0YS5jb20v:sign=abc";
+        assert_eq!(edge_cache_cookie_expiry(cookie_no_t), None);
+
+        let cookie_invalid_t =
+            "urlprefix=aHR0cHM6Ly9zYmNkbjMuaGFrdW5heW1hdGF0YS5jb20v:sign=abc:t=not_a_number";
+        assert_eq!(edge_cache_cookie_expiry(cookie_invalid_t), None);
+    }
+
+    #[test]
+    fn test_min_stream_cookie_expiry_with_edge_cache_cookie() {
+        let release = Release {
+            provider: ProviderKind::MovieBox,
+            filename: "Test S01E01".to_string(),
+            quality: Some("1080p".to_string()),
+            codec: None,
+            language: None,
+            size_bytes: None,
+            season: Some(1),
+            episode: Some(1),
+            mirrors: vec![crate::models::SourceMirror {
+                label: "MovieBox CDN".to_string(),
+                resolver_url: "https://example.com/index.mpd".to_string(),
+                headers: vec![(
+                    "Cookie".to_string(),
+                    "Edge-Cache-Cookie=urlprefix=aHR0cHM6Ly9zYmNkbjMuaGFrdW5heW1hdGF0YS5jb20v:sign=abc:t=1899999999".to_string(),
+                )],
+                direct_file: true,
+            }],
+            resource_id: Some("res1".to_string()),
+        };
+        assert_eq!(min_stream_cookie_expiry(&[release]), Some(1899999999));
     }
 }

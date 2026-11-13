@@ -23,13 +23,17 @@ fn parse_title_and_year(raw_title: &str) -> (String, Option<String>) {
     let mut year = None;
 
     if let Some(start) = title.rfind('(') {
-        if let Some(end) = title[start..].find(')') {
-            let year_str = &title[start + 1..start + end];
-            let extracted = crate::tui::text::extract_4digit_year(year_str);
-            if extracted.len() == 4 && year_str.trim().len() == 4 {
-                year = Some(extracted);
-                title = title[..start].trim().to_string();
-                return (title, year);
+        if let Some(rel_end) = title.get(start..).and_then(|s| s.find(')')) {
+            let end = start + rel_end;
+            if let (Some(year_slice), Some(title_slice)) =
+                (title.get(start + 1..end), title.get(..start))
+            {
+                let extracted = crate::providers::models::extract_4digit_year(year_slice);
+                if extracted.len() == 4 && year_slice.trim().len() == 4 {
+                    year = Some(extracted);
+                    title = title_slice.trim().to_string();
+                    return (title, year);
+                }
             }
         }
     }
@@ -40,7 +44,10 @@ fn parse_title_and_year(raw_title: &str) -> (String, Option<String>) {
     ];
     for q in qualities {
         if lower.ends_with(q) {
-            title = title[..title.len() - q.len()].trim().to_string();
+            let trim_len = title.len().saturating_sub(q.len());
+            if let Some(prefix) = title.get(..trim_len) {
+                title = prefix.trim().to_string();
+            }
             break;
         }
     }
@@ -61,7 +68,7 @@ fn quality_score(name: &str) -> u8 {
     }
 }
 
-const SERVERS: &[(&str, &str)] = &[
+pub const SERVERS: &[(&str, &str)] = &[
     ("http://172.16.50.7", "/DHAKA-FLIX-7/"),
     ("http://172.16.50.14", "/DHAKA-FLIX-14/"),
     ("http://172.16.50.12", "/DHAKA-FLIX-12/"),
@@ -87,9 +94,9 @@ impl DhakaFlixClient {
         Self {
             client: crate::net::http_client_builder()
                 .timeout(Duration::from_secs(5))
-                .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                .user_agent(crate::net::DEFAULT_BROWSER_USER_AGENT)
                 .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+                .unwrap_or_default(),
             recent_fails: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -222,17 +229,14 @@ impl DhakaFlixClient {
         let item_ids: Vec<(usize, String)> = all_results
             .iter()
             .enumerate()
+            .take(20)
             .map(|(idx, item)| (idx, item.id.value.clone()))
             .collect();
-
         let poster_stream = futures::stream::iter(item_ids.into_iter().map(|(idx, id)| {
             let client = self.client.clone();
 
             async move {
-                let parts: Vec<&str> = id.split(':').collect();
-                if parts.len() >= 3 {
-                    let base_url = parts[0..2].join(":");
-                    let path = parts[2..].join(":");
+                if let Some((base_url, path)) = parse_dhakaflix_id(&id) {
                     let path_parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
                     if !path_parts.is_empty() {
                         let api_href = format!("/{}/", path_parts[0]);
@@ -285,10 +289,8 @@ impl DhakaFlixClient {
     }
 
     pub async fn details(&self, id: &str) -> Result<MediaDetails, DhakaFlixError> {
-        let parts: Vec<&str> = id.split(':').collect();
         let mut title = "Unknown".to_string();
-        if parts.len() >= 3 {
-            let path = parts[2..].join(":");
+        if let Some((_, path)) = parse_dhakaflix_id(id) {
             let path_parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
             if let Some(name) = path_parts.last() {
                 title = percent_encoding::percent_decode_str(name)
@@ -325,13 +327,9 @@ impl DhakaFlixClient {
     pub async fn streams(&self, id: &str) -> Result<Vec<Release>, DhakaFlixError> {
         let mut releases = Vec::new();
 
-        let parts: Vec<&str> = id.split(':').collect();
-        if parts.len() < 3 {
+        let Some((base_url, path)) = parse_dhakaflix_id(id) else {
             return Ok(releases);
-        }
-
-        let base_url = parts[0..2].join(":");
-        let path = parts[2..].join(":");
+        };
         let path_parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
 
         if path_parts.last().is_some() {
@@ -352,91 +350,62 @@ impl DhakaFlixClient {
                 }
             });
 
-            if let Ok(resp) = self.client.post(&api_url).json(&body).send().await {
-                if let Ok(json) = resp.json::<serde_json::Value>().await {
-                    if let Some(items_arr) = json.get("items").and_then(|v| v.as_array()) {
-                        for item in items_arr {
-                            if let (Some(item_href), Some(size)) = (
-                                item.get("href").and_then(|v| v.as_str()),
-                                item.get("size").and_then(|v| v.as_u64()),
-                            ) {
-                                let filename = item_href
-                                    .split('/')
-                                    .next_back()
-                                    .unwrap_or("Unknown")
-                                    .to_string();
-                                let filename_decoded =
-                                    percent_encoding::percent_decode_str(&filename)
-                                        .decode_utf8_lossy()
-                                        .to_string();
+            let resp = self
+                .client
+                .post(&api_url)
+                .json(&body)
+                .send()
+                .await?
+                .error_for_status()?;
+            if let Ok(json) = resp.json::<serde_json::Value>().await {
+                if let Some(items_arr) = json.get("items").and_then(|v| v.as_array()) {
+                    for item in items_arr {
+                        if let (Some(item_href), Some(size)) = (
+                            item.get("href").and_then(|v| v.as_str()),
+                            item.get("size").and_then(|v| v.as_u64()),
+                        ) {
+                            let filename = item_href
+                                .split('/')
+                                .next_back()
+                                .unwrap_or("Unknown")
+                                .to_string();
+                            let filename_decoded = percent_encoding::percent_decode_str(&filename)
+                                .decode_utf8_lossy()
+                                .to_string();
 
-                                let f_lower = filename_decoded.to_lowercase();
-                                if !f_lower.ends_with(".mkv")
-                                    && !f_lower.ends_with(".mp4")
-                                    && !f_lower.ends_with(".avi")
-                                    && !f_lower.ends_with(".webm")
-                                {
-                                    continue;
-                                }
-
-                                let quality = if f_lower.contains("1080p") {
-                                    Some("1080p".to_string())
-                                } else if filename_decoded.to_lowercase().contains("720p") {
-                                    Some("720p".to_string())
-                                } else if filename_decoded.to_lowercase().contains("2160p")
-                                    || filename_decoded.to_lowercase().contains("4k")
-                                {
-                                    Some("4K".to_string())
-                                } else {
-                                    Some("HD".to_string())
-                                };
-
-                                let mut language = None;
-                                let mut codec = None;
-
-                                if f_lower.contains("hindi") {
-                                    language = Some("Hindi".to_string());
-                                } else if f_lower.contains("bengali") || f_lower.contains("bangla")
-                                {
-                                    language = Some("Bengali".to_string());
-                                } else if f_lower.contains("tamil") {
-                                    language = Some("Tamil".to_string());
-                                } else if f_lower.contains("telugu") {
-                                    language = Some("Telugu".to_string());
-                                } else if f_lower.contains("dual") {
-                                    language = Some("Dual Audio".to_string());
-                                } else if f_lower.contains("multi") {
-                                    language = Some("Multi Audio".to_string());
-                                } else if f_lower.contains("english") {
-                                    language = Some("English".to_string());
-                                }
-
-                                if f_lower.contains("hevc") || f_lower.contains("x265") {
-                                    codec = Some("HEVC".to_string());
-                                } else if f_lower.contains("x264") || f_lower.contains("h264") {
-                                    codec = Some("x264".to_string());
-                                } else if f_lower.contains("av1") {
-                                    codec = Some("AV1".to_string());
-                                }
-
-                                releases.push(Release {
-                                    provider: ProviderKind::BdixDhakaFlix,
-                                    filename: filename_decoded,
-                                    quality,
-                                    codec,
-                                    language,
-                                    size_bytes: Some(size),
-                                    season: None,
-                                    episode: None,
-                                    mirrors: vec![crate::providers::models::SourceMirror {
-                                        label: "DhakaFlix".to_string(),
-                                        resolver_url: format!("{}{}", base_url, item_href),
-                                        headers: vec![],
-                                        direct_file: true,
-                                    }],
-                                    resource_id: None,
-                                });
+                            let f_lower = filename_decoded.to_lowercase();
+                            if !f_lower.ends_with(".mkv")
+                                && !f_lower.ends_with(".mp4")
+                                && !f_lower.ends_with(".avi")
+                                && !f_lower.ends_with(".webm")
+                            {
+                                continue;
                             }
+
+                            let quality =
+                                crate::providers::bdix::common::detect_resolution(&f_lower)
+                                    .or_else(|| Some("HD".to_string()));
+                            let language =
+                                crate::providers::bdix::common::detect_audio_language(&f_lower);
+                            let codec = crate::providers::bdix::common::detect_codec(&f_lower);
+
+                            releases.push(Release {
+                                provider: ProviderKind::BdixDhakaFlix,
+                                filename: filename_decoded,
+                                quality,
+                                codec,
+                                language,
+                                size_bytes: Some(size),
+                                season: None,
+                                episode: None,
+                                mirrors: vec![crate::providers::models::SourceMirror {
+                                    label: "DhakaFlix".to_string(),
+                                    resolver_url: format!("{}{}", base_url, item_href),
+                                    headers: vec![],
+                                    direct_file: true,
+                                }],
+                                resource_id: None,
+                            });
                         }
                     }
                 }
@@ -445,8 +414,63 @@ impl DhakaFlixClient {
 
         Ok(releases)
     }
+}
 
-    pub async fn resolve_release(&self, resolver_url: &str) -> Result<String, DhakaFlixError> {
-        Ok(resolver_url.to_string())
+fn parse_dhakaflix_id(id: &str) -> Option<(&str, &str)> {
+    if let Some(pos) = id.rfind(":/") {
+        Some((&id[..pos], &id[pos + 1..]))
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_dhakaflix_id_with_port() {
+        let (base, path) =
+            parse_dhakaflix_id("http://172.16.50.4:8080:/movies/action/film.mkv").unwrap();
+        assert_eq!(base, "http://172.16.50.4:8080");
+        assert_eq!(path, "/movies/action/film.mkv");
+    }
+
+    #[test]
+    fn test_parse_dhakaflix_id_without_port() {
+        let (base, path) =
+            parse_dhakaflix_id("http://172.16.50.4:/movies/action/film.mkv").unwrap();
+        assert_eq!(base, "http://172.16.50.4");
+        assert_eq!(path, "/movies/action/film.mkv");
+    }
+
+    #[tokio::test]
+    async fn test_dhakaflix_streams_extracts_and_parses_video_releases() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let body = r#"{"items":[{"href":"/Movies/Inception.2010.2160p.HEVC.Dual.mkv","size":4294967296},{"href":"/Movies/notes.txt","size":128}]}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let client = DhakaFlixClient::new();
+        let id = format!("http://{addr}:/Movies/Inception/");
+        let releases = client.streams(&id).await.expect("streams");
+        assert_eq!(releases.len(), 1);
+        assert_eq!(releases[0].filename, "Inception.2010.2160p.HEVC.Dual.mkv");
+        assert_eq!(releases[0].quality.as_deref(), Some("4K"));
+        assert_eq!(releases[0].codec.as_deref(), Some("HEVC"));
+        assert_eq!(releases[0].language.as_deref(), Some("Dual Audio"));
+        assert_eq!(releases[0].size_bytes, Some(4_294_967_296));
     }
 }

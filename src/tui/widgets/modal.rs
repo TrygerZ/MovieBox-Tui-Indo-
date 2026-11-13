@@ -13,6 +13,9 @@ pub struct ModalFrame<'a> {
     theme: &'a Theme,
     basic_terminal: bool,
     border_style: Option<Style>,
+    title_style: Option<Style>,
+    title_bottom: Option<Line<'a>>,
+    title_bottom_alignment: Alignment,
 }
 
 impl<'a> ModalFrame<'a> {
@@ -22,7 +25,20 @@ impl<'a> ModalFrame<'a> {
             theme,
             basic_terminal,
             border_style: None,
+            title_style: None,
+            title_bottom: None,
+            title_bottom_alignment: Alignment::Center,
         }
+    }
+
+    pub fn title_bottom(mut self, bottom: Line<'a>) -> Self {
+        self.title_bottom = Some(bottom);
+        self
+    }
+
+    pub fn title_bottom_alignment(mut self, alignment: Alignment) -> Self {
+        self.title_bottom_alignment = alignment;
+        self
     }
 
     pub fn border_style(mut self, style: Style) -> Self {
@@ -30,16 +46,29 @@ impl<'a> ModalFrame<'a> {
         self
     }
 
+    pub fn title_style(mut self, style: Style) -> Self {
+        self.title_style = Some(style);
+        self
+    }
     pub fn render(&self, frame: &mut Frame, area: Rect, full_area: Rect) -> Rect {
         overlay::clear_modal_area(frame, full_area, area, self.theme);
-        let title_budget = (area.width as usize).saturating_sub(4);
-        let display_title = crate::tui::text::truncate_width(self.title.trim(), title_budget);
-        let block = Block::default()
-            .title(format!(" {display_title} "))
-            .title_style(self.theme.title)
+        let trimmed_title = self.title.trim();
+        let mut block = Block::default()
             .borders(Borders::ALL)
             .border_type(overlay::border_type(self.basic_terminal))
             .border_style(self.border_style.unwrap_or(self.theme.lavender));
+        if !trimmed_title.is_empty() {
+            let title_budget = (area.width as usize).saturating_sub(4);
+            let display_title = crate::tui::text::truncate_width(trimmed_title, title_budget);
+            block = block
+                .title(format!(" {display_title} "))
+                .title_style(self.title_style.unwrap_or(self.theme.title));
+        }
+        if let Some(bottom) = self.title_bottom.clone() {
+            block = block
+                .title_bottom(bottom)
+                .title_alignment(self.title_bottom_alignment);
+        }
         let inner = block.inner(area);
         frame.render_widget(block, area);
         inner

@@ -4,8 +4,41 @@ fn env(name: &str) -> String {
 
 pub fn uses_basic_ui() -> bool {
     let term = env("TERM");
+    if term == "dumb" || term == "linux" {
+        return true;
+    }
+    crate::tui::theme::ColorSupport::current() == crate::tui::theme::ColorSupport::Basic
+}
+fn is_inside_tmux() -> bool {
+    std::env::var("TMUX").is_ok()
+}
 
-    term == "dumb" || term == "linux"
+fn outer_terminal_supports_graphics() -> bool {
+    if std::env::var("GHOSTTY_RESOURCES_DIR").is_ok()
+        || std::env::var("KITTY_WINDOW_ID").is_ok()
+        || std::env::var("WEZTERM_EXECUTABLE").is_ok()
+        || std::env::var("ITERM_SESSION_ID").is_ok()
+        || std::env::var("ALACRITTY_LOG").is_ok()
+        || std::env::var("ALACRITTY_WINDOW_ID").is_ok()
+        || std::env::var("ALACRITTY_SOCKET").is_ok()
+        || std::env::var("KONSOLE_VERSION").is_ok()
+        || std::env::var("WT_SESSION").is_ok()
+    {
+        return true;
+    }
+    let term = env("TERM").to_ascii_lowercase();
+    if term.starts_with("foot")
+        || term.contains("kitty")
+        || term.contains("ghostty")
+        || term.contains("alacritty")
+    {
+        return true;
+    }
+    let term_program = env("TERM_PROGRAM").to_ascii_lowercase();
+    matches!(
+        term_program.as_str(),
+        "ghostty" | "wezterm" | "iterm.app" | "vscode" | "rio"
+    )
 }
 
 pub fn should_query_images() -> bool {
@@ -25,7 +58,10 @@ pub fn should_query_images() -> bool {
             return true;
         }
     }
-    if std::env::var("TMUX").is_ok() && std::env::var("MOVIEBOX_IMAGE_PROTOCOL").is_err() {
+    if is_inside_tmux()
+        && std::env::var("MOVIEBOX_IMAGE_PROTOCOL").is_err()
+        && !outer_terminal_supports_graphics()
+    {
         return false;
     }
     if std::env::var("TERM_PROGRAM").is_ok_and(|v| v == "Apple_Terminal") {
@@ -45,8 +81,12 @@ pub fn should_query_images() -> bool {
         let is_modern_terminal = std::env::var("WT_SESSION").is_ok()
             || std::env::var("TERM_PROGRAM").is_ok()
             || std::env::var("ALACRITTY_LOG").is_ok()
+            || std::env::var("ALACRITTY_SOCKET").is_ok()
             || std::env::var("WEZTERM_EXECUTABLE").is_ok()
-            || std::env::var("GHOSTTY_RESOURCES_DIR").is_ok();
+            || std::env::var("GHOSTTY_RESOURCES_DIR").is_ok()
+            || term.contains("alacritty")
+            || term.contains("kitty")
+            || term.contains("ghostty");
         if !is_modern_terminal {
             return false;
         }
@@ -64,7 +104,9 @@ pub fn background_is_light() -> bool {
         return matches!(background, 7 | 10..=15);
     }
 
-    std::env::var("TERM_BACKGROUND").is_ok_and(|value| value.eq_ignore_ascii_case("light"))
+    std::env::var("TERM_BACKGROUND")
+        .or_else(|_| std::env::var("BACKGROUND"))
+        .is_ok_and(|value| value.eq_ignore_ascii_case("light"))
 }
 
 pub fn set_window_title(title: &str) -> std::io::Result<()> {
@@ -95,6 +137,41 @@ mod tests {
             std::env::set_var("MOVIEBOX_IMAGE_PROTOCOL", "kitty");
             assert!(should_query_images());
             std::env::remove_var("MOVIEBOX_IMAGE_PROTOCOL");
+            let saved_vars = [
+                "GHOSTTY_RESOURCES_DIR",
+                "KITTY_WINDOW_ID",
+                "WEZTERM_EXECUTABLE",
+                "ITERM_SESSION_ID",
+                "ALACRITTY_LOG",
+                "ALACRITTY_WINDOW_ID",
+                "ALACRITTY_SOCKET",
+                "KONSOLE_VERSION",
+                "WT_SESSION",
+                "TERM_PROGRAM",
+            ]
+            .map(|k| (k, std::env::var(k).ok()));
+
+            for (k, _) in &saved_vars {
+                std::env::remove_var(k);
+            }
+
+            std::env::set_var("TMUX", "/tmp/tmux-1000/default,12345,0");
+            assert!(!should_query_images());
+
+            std::env::set_var("GHOSTTY_RESOURCES_DIR", "/usr/share/ghostty");
+            assert!(should_query_images());
+            std::env::remove_var("GHOSTTY_RESOURCES_DIR");
+
+            std::env::set_var("MOVIEBOX_IMAGE_PROTOCOL", "kitty");
+            assert!(should_query_images());
+            std::env::remove_var("MOVIEBOX_IMAGE_PROTOCOL");
+            std::env::remove_var("TMUX");
+
+            for (k, val) in saved_vars {
+                if let Some(v) = val {
+                    std::env::set_var(k, v);
+                }
+            }
         }
     }
 }

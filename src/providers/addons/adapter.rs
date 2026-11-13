@@ -1,42 +1,11 @@
 use super::models::{MetaDetail, MetaItem, StreamItem};
-use crate::models::SearchResult;
 use crate::providers::models::{
     CatalogItem, Episode, MediaDetails, MediaType, PlaybackSource, ProviderKind, ProviderMediaId,
     Release, Season, SourceMirror,
 };
 use std::collections::BTreeMap;
 
-pub fn meta_to_search_result(item: &MetaItem) -> SearchResult {
-    let is_series = item.r#type.eq_ignore_ascii_case("series")
-        || item.r#type.eq_ignore_ascii_case("tv")
-        || item.r#type.eq_ignore_ascii_case("anime");
-    let year: String = item
-        .release_info
-        .as_deref()
-        .or(item.year.as_deref())
-        .or(item.released.as_deref())
-        .map(crate::tui::text::extract_4digit_year)
-        .unwrap_or_default();
-
-    let title = if !item.name.trim().is_empty() {
-        item.name.clone()
-    } else {
-        item.title.clone().unwrap_or_else(|| "Unknown".to_string())
-    };
-
-    let cover = item.poster.clone().or_else(|| item.cover.clone());
-
-    SearchResult {
-        id: item.id.clone(),
-        title,
-        stype: if is_series { 2 } else { 1 },
-        release_year: year,
-        cover_url: cover,
-        season: 0,
-        episode: 0,
-        provider: ProviderKind::Addons,
-    }
-}
+type SeasonEpisodeMap = BTreeMap<usize, BTreeMap<usize, (Option<String>, Option<String>)>>;
 
 pub fn meta_to_catalog_item(item: &MetaItem) -> CatalogItem {
     let is_series = item.r#type.eq_ignore_ascii_case("series")
@@ -47,7 +16,7 @@ pub fn meta_to_catalog_item(item: &MetaItem) -> CatalogItem {
         .as_deref()
         .or(item.year.as_deref())
         .or(item.released.as_deref())
-        .map(crate::tui::text::extract_4digit_year)
+        .map(crate::providers::models::extract_4digit_year)
         .filter(|y| !y.is_empty());
 
     let title = if !item.name.trim().is_empty() {
@@ -58,10 +27,13 @@ pub fn meta_to_catalog_item(item: &MetaItem) -> CatalogItem {
 
     let poster_url = item.poster.clone().or_else(|| item.cover.clone());
 
+    let type_prefix = if is_series { "series" } else { "movie" };
+    let composite_id = format!("{type_prefix}:{}", item.id);
+
     CatalogItem {
         id: ProviderMediaId {
             provider: ProviderKind::Addons,
-            value: item.id.clone(),
+            value: composite_id,
         },
         title,
         media_type: if is_series {
@@ -81,18 +53,17 @@ pub fn meta_detail_to_media_details(detail: &MetaDetail) -> MediaDetails {
         || detail.r#type.eq_ignore_ascii_case("anime")
         || !detail.videos.is_empty();
 
-    let mut season_map: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    let mut season_map: SeasonEpisodeMap = BTreeMap::new();
     for video in &detail.videos {
         let s = video.season.unwrap_or(1);
-        let e = video.episode.unwrap_or(1);
-        let eps = season_map.entry(s).or_default();
-        if !eps.contains(&e) {
-            eps.push(e);
-        }
-    }
-
-    for eps in season_map.values_mut() {
-        eps.sort_unstable();
+        let e = video.episode.or(video.number).unwrap_or(1);
+        let ep_title = video.title.clone().or_else(|| video.name.clone());
+        let ep_overview = video.overview.clone().or_else(|| video.description.clone());
+        season_map
+            .entry(s)
+            .or_default()
+            .entry(e)
+            .or_insert((ep_title, ep_overview));
     }
 
     let seasons = season_map
@@ -101,10 +72,11 @@ pub fn meta_detail_to_media_details(detail: &MetaDetail) -> MediaDetails {
             number: season_num,
             episodes: eps
                 .into_iter()
-                .map(|ep_num| Episode {
+                .map(|(ep_num, (ep_title, ep_overview))| Episode {
                     season: season_num,
                     number: ep_num,
-                    title: None,
+                    title: ep_title,
+                    overview: ep_overview,
                 })
                 .collect(),
         })
@@ -116,7 +88,7 @@ pub fn meta_detail_to_media_details(detail: &MetaDetail) -> MediaDetails {
         .or(detail.year.as_deref())
         .or(detail.released.as_deref())
         .unwrap_or_default();
-    let year = crate::tui::text::extract_4digit_year(year_raw);
+    let year = crate::providers::models::extract_4digit_year(year_raw);
     let year = if !year.is_empty() {
         Some(year)
     } else if !year_raw.is_empty() {
@@ -146,10 +118,13 @@ pub fn meta_detail_to_media_details(detail: &MetaDetail) -> MediaDetails {
         .or_else(|| detail.overview.clone())
         .or_else(|| detail.synopsis.clone());
 
+    let type_prefix = if is_series { "series" } else { "movie" };
+    let composite_id = format!("{type_prefix}:{}", detail.id);
+
     MediaDetails {
         id: ProviderMediaId {
             provider: ProviderKind::Addons,
-            value: detail.id.clone(),
+            value: composite_id,
         },
         title,
         media_type: if is_series {
@@ -241,38 +216,6 @@ pub fn parse_codec(text: &str) -> Option<String> {
     }
 }
 
-pub fn parse_size_bytes_from_text(text: &str) -> Option<u64> {
-    let lower = text.to_ascii_lowercase();
-    let parts: Vec<&str> = lower.split_whitespace().collect();
-    for i in 0..parts.len() {
-        let clean = parts[i].trim_matches(|c: char| !c.is_alphanumeric() && c != '.');
-        if let Ok(num) = clean.parse::<f64>() {
-            if i + 1 < parts.len() {
-                let unit = parts[i + 1]
-                    .trim_matches(|c: char| !c.is_alphabetic())
-                    .to_ascii_uppercase();
-                if unit == "GB" || unit == "GIB" || unit == "G" {
-                    return Some((num * 1_073_741_824.0) as u64);
-                } else if unit == "MB" || unit == "MIB" || unit == "M" {
-                    return Some((num * 1_048_576.0) as u64);
-                }
-            }
-        }
-        if clean.ends_with("gb") || clean.ends_with("gib") {
-            let num_str = clean.trim_end_matches("gb").trim_end_matches("gib");
-            if let Ok(num) = num_str.parse::<f64>() {
-                return Some((num * 1_073_741_824.0) as u64);
-            }
-        } else if clean.ends_with("mb") || clean.ends_with("mib") {
-            let num_str = clean.trim_end_matches("mb").trim_end_matches("mib");
-            if let Ok(num) = num_str.parse::<f64>() {
-                return Some((num * 1_048_576.0) as u64);
-            }
-        }
-    }
-    None
-}
-
 pub fn parse_audio_tracks(text: &str) -> Option<String> {
     let upper = text.to_ascii_uppercase();
     let mut langs = Vec::new();
@@ -320,13 +263,10 @@ pub fn parse_audio_tracks(text: &str) -> Option<String> {
 
 fn extract_domain_label(url: &str) -> Option<String> {
     let url_clean = url.trim();
-    let without_proto = if let Some(stripped) = url_clean.strip_prefix("https://") {
-        stripped
-    } else if let Some(stripped) = url_clean.strip_prefix("http://") {
-        stripped
-    } else {
-        url_clean
-    };
+    let without_proto = url_clean
+        .strip_prefix("https://")
+        .or_else(|| url_clean.strip_prefix("http://"))
+        .unwrap_or(url_clean);
 
     let host = without_proto.split(['/', ':', '?', '#']).next()?.trim();
     if host.is_empty() || host.parse::<std::net::IpAddr>().is_ok() {
@@ -550,7 +490,7 @@ pub fn stream_item_to_release(
         .behavior_hints
         .as_ref()
         .and_then(|h| h.video_size)
-        .or_else(|| parse_size_bytes_from_text(&combined_text));
+        .or_else(|| crate::providers::models::parse_size_bytes(&combined_text));
 
     let raw_filename = stream
         .title
@@ -561,18 +501,29 @@ pub fn stream_item_to_release(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| format!("{addon_name} Stream"));
 
-    let filename = crate::tui::text::clean_stream_text(&raw_filename);
+    let filename = crate::providers::models::clean_stream_text(&raw_filename);
     let raw_source_label =
         detect_stream_host(addon_name, stream_name_str, title_str, desc_str, url);
-    let source_label = crate::tui::text::clean_stream_text(&raw_source_label);
-    let language = language.map(|l| crate::tui::text::clean_stream_text(&l));
+    let source_label = crate::providers::models::clean_stream_text(&raw_source_label);
+    let language = language.map(|l| crate::providers::models::clean_stream_text(&l));
 
     let mut headers = Vec::new();
     if let Some(hints) = &stream.behavior_hints
         && let Some(hdr_map) = &hints.headers
     {
+        const ALLOWED_HEADERS: &[&str] = &[
+            "user-agent",
+            "referer",
+            "origin",
+            "range",
+            "x-forwarded-for",
+            "accept",
+            "accept-language",
+        ];
         for (k, v) in hdr_map {
-            headers.push((k.clone(), v.clone()));
+            if ALLOWED_HEADERS.contains(&k.to_ascii_lowercase().as_str()) {
+                headers.push((k.clone(), v.clone()));
+            }
         }
     }
 
@@ -603,6 +554,7 @@ pub fn release_to_playback_source(release: &Release) -> Option<PlaybackSource> {
         headers: mirror.headers.clone(),
         subtitle: None,
         source_label: mirror.label.clone(),
+        max_height: None,
     })
 }
 
@@ -632,7 +584,7 @@ mod tests {
         };
 
         let catalog = meta_to_catalog_item(&item);
-        assert_eq!(catalog.id.value, "tt1234");
+        assert_eq!(catalog.id.value, "movie:tt1234");
         assert_eq!(catalog.title, "Test Movie");
         assert_eq!(catalog.media_type, MediaType::Movie);
         assert_eq!(catalog.year.as_deref(), Some("2022"));
@@ -680,6 +632,8 @@ mod tests {
                     number: None,
                     released: None,
                     thumbnail: None,
+                    overview: Some("Pilot episode overview".to_string()),
+                    description: None,
                 },
                 super::super::models::MetaVideo {
                     id: Some("ep2".to_string()),
@@ -690,12 +644,14 @@ mod tests {
                     number: None,
                     released: None,
                     thumbnail: None,
+                    overview: None,
+                    description: None,
                 },
             ],
         };
 
         let media = meta_detail_to_media_details(&detail);
-        assert_eq!(media.id.value, "tt5678");
+        assert_eq!(media.id.value, "series:tt5678");
         assert_eq!(media.title, "Test Series");
         assert_eq!(media.media_type, MediaType::Series);
         assert_eq!(media.year.as_deref(), Some("2021"));
@@ -704,5 +660,48 @@ mod tests {
         assert_eq!(media.seasons.len(), 1);
         assert_eq!(media.seasons[0].number, 1);
         assert_eq!(media.seasons[0].episodes.len(), 2);
+        assert_eq!(
+            media.seasons[0].episodes[0].overview.as_deref(),
+            Some("Pilot episode overview")
+        );
+        assert_eq!(media.seasons[0].episodes[0].title.as_deref(), Some("Pilot"));
+    }
+
+    #[test]
+    fn test_meta_detail_movie_composite_id() {
+        let detail = MetaDetail {
+            id: "tt9999".to_string(),
+            r#type: "movie".to_string(),
+            name: "Test Movie".to_string(),
+            title: None,
+            poster: Some("https://example.com/movie.jpg".to_string()),
+            cover: None,
+            background: None,
+            logo: None,
+            description: Some("Movie description".to_string()),
+            overview: None,
+            synopsis: None,
+            release_info: Some("2020".to_string()),
+            year: None,
+            released: None,
+            imdb_rating: Some("7.9".to_string()),
+            rating: None,
+            genres: vec!["Sci-Fi".to_string()],
+            genre: Vec::new(),
+            runtime: Some("120m".to_string()),
+            cast: Vec::new(),
+            stars: Vec::new(),
+            director: Vec::new(),
+            directors: Vec::new(),
+            writer: Vec::new(),
+            writers: Vec::new(),
+            videos: Vec::new(),
+        };
+
+        let media = meta_detail_to_media_details(&detail);
+        assert_eq!(media.id.value, "movie:tt9999");
+        assert_eq!(media.title, "Test Movie");
+        assert_eq!(media.media_type, MediaType::Movie);
+        assert!(media.seasons.is_empty());
     }
 }

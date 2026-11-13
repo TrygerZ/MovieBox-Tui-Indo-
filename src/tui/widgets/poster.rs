@@ -13,12 +13,15 @@ pub fn render_poster_placeholder(
     basic_terminal: bool,
     is_in_flight: bool,
     tick: u64,
+    modal_active: bool,
 ) {
     if area.width < 2 || area.height < 2 {
         return;
     }
     let border_type = crate::tui::overlay::border_type(basic_terminal);
-    let border_style = if is_in_flight {
+    let border_style = if modal_active {
+        theme.muted
+    } else if is_in_flight {
         theme.lavender
     } else {
         theme.surface1
@@ -50,7 +53,11 @@ pub fn render_poster_placeholder(
             _ => "····",
         };
         let p = Paragraph::new(dots)
-            .style(theme.lavender)
+            .style(if modal_active {
+                theme.muted
+            } else {
+                theme.lavender
+            })
             .alignment(Alignment::Center);
         frame.render_widget(p, text_area);
     } else {
@@ -62,7 +69,11 @@ pub fn render_poster_placeholder(
             "·"
         };
         let p = Paragraph::new(label)
-            .style(theme.overlay0)
+            .style(if modal_active {
+                theme.muted
+            } else {
+                theme.overlay0
+            })
             .alignment(Alignment::Center);
         frame.render_widget(p, text_area);
     }
@@ -81,14 +92,14 @@ mod tests {
 
         terminal
             .draw(|f| {
-                render_poster_placeholder(f, Rect::new(0, 0, 1, 1), &theme, false, false, 0);
+                render_poster_placeholder(f, Rect::new(0, 0, 1, 1), &theme, false, false, 0, false);
             })
             .unwrap();
 
         terminal
             .draw(|f| {
-                render_poster_placeholder(f, Rect::new(0, 0, 15, 8), &theme, false, true, 4);
-                render_poster_placeholder(f, Rect::new(0, 0, 15, 8), &theme, true, false, 0);
+                render_poster_placeholder(f, Rect::new(0, 0, 15, 8), &theme, false, true, 4, false);
+                render_poster_placeholder(f, Rect::new(0, 0, 15, 8), &theme, true, false, 0, true);
             })
             .unwrap();
     }

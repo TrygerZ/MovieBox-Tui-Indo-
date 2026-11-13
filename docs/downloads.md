@@ -1,65 +1,43 @@
-# Downloads
+# Downloader
 
-The download engine in `download.rs` streams a video URL to disk with resume, ranges,
-and optional segmentation. Orchestration lives in `app/download.rs`.
+MovieBox-TUI includes a multi-segment HTTP chunked downloader supporting pause, resume, and authentication header forwarding.
 
-## How it works
+## Overview
 
-- Single-episode downloads write to `<dest>.part` plus a `<dest>.part.json` metadata
-  sidecar (etag, last-modified, total size, segment count).
-- **Resume**: on a retry, the engine checks what is already in the `.part` file and
-  continues from there using `Range` requests.
-- **Segmentation**: files above a size threshold can be downloaded in parallel
-  segments (up to a capped count), then stitched.
-- **I/O Aggregation**: Download segment writers are buffered with a 256KB `tokio::io::BufWriter`, aggregating incoming 8KB–16KB HTTP response chunks into sequential disk writes and reducing filesystem syscalls by up to 96.8%.
-- **Retries**: a failed attempt is retried a limited number of times; 30s idle
-- **Cancel**: an `AtomicBool` cancel flag pauses/resumes cleanly, preserving the
-  partial file for a later resume.
-- **User-Agent**: the download HTTP client inherits the active provider's mobile `User-Agent`
-  to prevent CDN stream rejections when downloading media segments.
-- **Stream Engines**:
-  - **Progressive Streams** (CircleFTP, DhakaFlix, 4KHDHub, Addons): Handled directly by the native Rust multi-segment range downloader, splitting files into parallel chunks with `.part` state tracking.
-  - **MPEG-DASH Streams** (MovieBox): Multi-track segmented audio/video streams (`index.mpd`) requiring CloudFront cookie authentication. Downloaded via `yt-dlp` with automatic authentication header forwarding (`Cookie`, `Referer`, `User-Agent`), real-time progress parsing, and track multiplexing into `.mp4`.
+- **Storage Location**: Defaults to `~/Downloads/MovieBox-TUI/`. Configurable via `/settings` (General → Download Folder).
+- **Multi-Segment Engine**: Files are partitioned into concurrent byte ranges using HTTP RFC 7233 `Range: bytes=X-Y` requests.
+- **Single-Stream Fallback**: If an upstream server or CDN does not support range requests (returns HTTP `200 OK` instead of `206 Partial Content`) or terminates concurrent connections with HTTP 403 or 429, the engine falls back to single-stream sequential downloading.
+## File Lifecycle & State Files
 
-## External Tool Prerequisites
+During download, files are saved with temporary extensions:
 
-Downloading from **MovieBox** requires `yt-dlp` and `ffmpeg` on the host system to demux and merge MPEG-DASH audio and video streams:
+```text
+destination.mp4.part       # Pre-allocated in-place byte buffer across all workers
+destination.mp4.part.json  # Download state (ETag, Last-Modified, total size, per-segment byte offsets)
+destination.mp4            # Final verified output (atomic rename on completion)
+```
 
-- **macOS**: Install via Homebrew: `brew install yt-dlp ffmpeg`
-- **Linux**: Install via your system package manager (e.g. `sudo apt install yt-dlp ffmpeg`, `sudo pacman -S yt-dlp ffmpeg`)
-- **Windows**: Install via WinGet or Scoop: `winget install yt-dlp.yt-dlp Gyan.FFmpeg`
-- **Android / Termux**: Install via Termux package manager: `pkg install yt-dlp ffmpeg`
+Upon completion, temporary sidecars are verified and renamed atomically to the target filename.
 
-If a MovieBox download is initiated without `yt-dlp` installed, MovieBox-TUI prevents execution and displays an OS-tailored notification with installation guidance. Progressive streams from other providers (CircleFTP, DhakaFlix, 4KHDHub, Addons) do not require `yt-dlp` or `ffmpeg`.
-## File names and directories
+## Download Controls
 
-`safe_file_stem` sanitizes titles for all platforms: control/whitespace/illegal
-characters are replaced, Windows reserved names (`CON`, `COM1`-`COM9`, …) are avoided,
-and length is capped.
+- Press **`d`** on any stream in the Details screen to start downloading immediately.
+- Press **`x`** or **`X`** during an active download to cancel or pause the transfer. Partial `.part` data is preserved on disk for resumption.
+- Downloads run cooperatively in the background so you can browse or search while transfers finish.
 
-- **Series downloads:** Saved under `<base_dir>/Series/<Title>/Season <N>/<Title> - S<N:02>E<E:02>.<ext>` (and subtitle `<Title> - S<N:02>E<E:02>.<lang>.<sub_ext>`).
-- **Movie downloads:** Saved under `<base_dir>/Movies/<Title>/<Title>.<ext>` (and subtitle `<Title>.<lang>.<sub_ext>`).
-- **Default path:** Files go to the user's OS download directory (`~/Downloads/MovieBox-TUI`). On Android-family environments the code prefers shared `storage/downloads` when present.
-- **Custom path:** Users can set a custom download directory in `/settings` → General → Download Folder or reset to default. Target directories are validated with a write probe before saving, and the code creates the `MovieBox-TUI` subfolder hierarchy (`Movies/` and `Series/`). If custom storage becomes unavailable at runtime, the engine falls back to the default download location.
+## Header Forwarding
 
-## Contextual triggers & Seasons
+Authenticated streams (such as MovieBox DASH manifests or 4KHDHub mirrors) forward required headers (`User-Agent`, `Referer`, signed CloudFront cookies) to download workers so CDN transfers complete without `403 Forbidden` errors.
 
-- **Contextual trigger**: Pressing `d` (or clicking `[Download]`) while focused on the **Seasons** pane prompts to download all episodes of the selected season. Triggering download while on the **Episodes** or **Streams** pane prompts to download only that single episode.
-- **Duplication prevention**: When starting a download or processing a season batch queue, the engine checks if the target media file is already completed on disk. Existing completed episodes are skipped.
-- A season download enqueues every episode (`download_queue`) and processes them one at a time, each resolving its stream and subtitle. Progress is reported through `Action::UpdateDownload` and the status bar; failures pause and preserve partial data.
-- Season downloads ask for the subtitle policy once per batch. The selected language, including an explicit `None` choice, is reused for every queued episode.
+## DASH Streams (`yt-dlp`)
 
-Selected subtitle sidecars are saved next to the video using ISO 639-1 language codes (e.g. `.en.srt`, `.hi.srt`) and supported subtitle extensions (`.srt`, `.vtt`, `.ass`, `.ssa`, `.sub`).
+MovieBox DASH streams require `yt-dlp` and `ffmpeg` to download and mux adaptive video and audio representations:
 
-## Download Bar & Progress Architecture
+- **Windows**: `winget install yt-dlp.yt-dlp Gyan.FFmpeg`
+- **macOS**: `brew install yt-dlp ffmpeg`
+- **Android (Termux)**: `pkg install yt-dlp ffmpeg`
+- **Linux**: Install `yt-dlp` and `ffmpeg` via system package manager.
 
-- **High-Contrast Responsive Bar**: Renders a proportional progress track (`[━━━━━────]` on modern terminals and `[=====>----]` on basic terminals) with prominent media title display (`⬇ Downloading: <Title>`), percentage badge, and separated transfer metrics (`<Size> | <Speed> | ETA <Time>`).
-- **Monotonic DASH Normalization**: Multi-stream MPEG-DASH downloads via `yt-dlp` automatically normalize segmented tracks (video 0–90%, audio 90–98%, and track merger 99–100%) so that progress strictly increases and never resets backwards to 0% mid-download.
-- **Throttled Updates**: Progress events are throttled to 250ms intervals, eliminating terminal flicker and event-channel flooding from high-frequency chunk streams.
-- **Background Download Continuity**: Downloads continue running uninterrupted in the background when switching content providers (`Ctrl+P`) or toggling modes (`Ctrl+T`, `Ctrl+A`), keeping all active transfer workers and queues alive.
-- **Isolated Cancellation Hitbox**: Cancellation is bound strictly to the `x` / `X` keyboard shortcut and the `[x] Cancel` button in the top-right corner of the download bar. Clicking anywhere else on the bar safely consumes the mouse event without interrupting active downloads.
+The downloader checks both binaries before starting the transfer and reports which binary is missing if either is absent. Fragments are pulled with `--concurrent-fragments 32` and `--http-chunk-size 95K` (keeping individual range sub-requests under Tengine's `limit_rate_after 96k` throttle boundary) alongside retry bounds (`--fragment-retries 10`, `--retries 5`, `--socket-timeout 30`). Subprocess errors during transfer report the underlying `yt-dlp` diagnostic in the failure notification.
 
-## Outcomes
-
-`DownloadCompleted` / `DownloadPaused` / `DownloadFailed` drive the UI status and
-notifications. `ClearCache` and stale-file cleanup do not touch in-progress downloads.
+All other providers (4KHDHub, Dramachi, BDIX, DhakaFlix, CircleFTP, Stremio Addons, TV mode) download directly through the internal multi-segment HTTP engine (4 to 16 concurrent workers with 1 MiB write buffers writing in-place to the pre-allocated `.part` file).

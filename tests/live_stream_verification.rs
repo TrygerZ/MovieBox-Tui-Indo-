@@ -7,29 +7,52 @@ async fn test_live_movie_stream_real_urls() {
     let client = MovieBoxClient::new();
     client.init().await.expect("client init successful");
 
-    // Ek Deewane Ki Deewaniyat subject_id: 4179386086617137184
     let releases = client
         .episode_streams("4179386086617137184", 0, 0)
         .await
         .expect("fetch movie streams");
     assert!(!releases.is_empty(), "releases should not be empty");
 
-    let notice_hash = "1c7de0bd3393702d9191801f15f88f8d";
     let mut real_streams_found = 0;
 
     for release in &releases {
         if let Some(link) = release.direct_url() {
             println!("Movie stream link: {}", link);
             assert!(
-                !link.contains(notice_hash),
+                !moviebox_tui::providers::moviebox::adapt::is_deprecation_notice_url(link),
                 "Stream URL should NOT be the legacy upgrade notice video: {}",
                 link
             );
             assert!(
-                link.contains("sacdn.hakunaymatata.com") && link.ends_with("/index.mpd"),
-                "Stream URL should be a valid MPEG-DASH manifest: {}",
+                url::Url::parse(link).is_ok_and(|url| {
+                    url.scheme() == "https"
+                        && (url.path().ends_with("/index.mpd") || url.path().ends_with(".mp4"))
+                }),
+                "Stream URL should be a DASH manifest or recovered MP4 file: {}",
                 link
             );
+            // Resolving a URL is insufficient: verify the CDN serves media bytes.
+            let mut request = client.http_client().get(link).header("Range", "bytes=0-31");
+            for (name, value) in &release.mirrors[0].headers {
+                request = request.header(name.as_str(), value.as_str());
+            }
+            let mut response = request.send().await.expect("request media bytes");
+            assert!(
+                response.status().is_success(),
+                "CDN returned {}",
+                response.status()
+            );
+            let chunk = response
+                .chunk()
+                .await
+                .expect("read media bytes")
+                .expect("nonempty media");
+            if url::Url::parse(link).unwrap().path().ends_with(".mp4") {
+                assert!(
+                    chunk.windows(4).any(|bytes| bytes == b"ftyp"),
+                    "expected an MP4 file header"
+                );
+            }
             real_streams_found += 1;
         }
     }
@@ -46,7 +69,6 @@ async fn test_live_series_resolutions_and_streams() {
     let client = MovieBoxClient::new();
     client.init().await.expect("client init successful");
 
-    // Search for a series dynamically
     let search_res = client
         .search("Breaking Bad", 1)
         .await
@@ -72,7 +94,7 @@ async fn test_live_series_resolutions_and_streams() {
     assert!(!releases_ep1.is_empty(), "should find episode 1 streams");
     let ep1_url = releases_ep1[0].direct_url().expect("valid direct url");
     println!("Resolved S01E01 direct URL: {}", ep1_url);
-    assert!(ep1_url.contains("_1_1_"));
+    assert!(!moviebox_tui::providers::moviebox::adapt::is_deprecation_notice_url(ep1_url));
 
     let releases_ep2 = client
         .episode_streams(&series.id.value, 1, 2)
@@ -81,11 +103,70 @@ async fn test_live_series_resolutions_and_streams() {
     assert!(!releases_ep2.is_empty(), "should find episode 2 streams");
     let ep2_url = releases_ep2[0].direct_url().expect("valid direct url");
     println!("Resolved S01E02 direct URL: {}", ep2_url);
-    assert!(ep2_url.contains("_1_2_"));
+    assert!(!moviebox_tui::providers::moviebox::adapt::is_deprecation_notice_url(ep2_url));
     assert_ne!(
         ep1_url, ep2_url,
         "different episodes must have different manifests"
     );
+}
+
+#[tokio::test]
+#[ignore = "live network test; run with cargo test --test live_stream_verification -- --ignored"]
+async fn test_live_multiple_seasons_and_episodes_return_distinct_streams() {
+    let client = MovieBoxClient::new();
+    client.init().await.expect("client init successful");
+
+    for (subject_id, series_title, test_cases) in [
+        (
+            "6207982430134357800",
+            "Breaking Bad",
+            vec![(1, 1), (1, 2), (2, 1), (2, 2), (5, 1)],
+        ),
+        (
+            "4585605580068379856",
+            "One Piece S1-S2",
+            vec![(1, 1), (1, 2), (2, 1), (2, 2)],
+        ),
+    ] {
+        println!("\n=== Verifying {} ({}) ===", series_title, subject_id);
+        let mut urls = Vec::new();
+
+        for (season, episode) in test_cases {
+            let releases = client
+                .episode_streams(subject_id, season, episode)
+                .await
+                .expect("fetch streams");
+            assert!(
+                !releases.is_empty(),
+                "expected streams for {} S{:02}E{:02}",
+                series_title,
+                season,
+                episode
+            );
+            let url = releases[0]
+                .direct_url()
+                .expect("must have direct url")
+                .to_string();
+            println!(
+                "{} S{:02}E{:02} -> filename: {}, url: {}",
+                series_title, season, episode, releases[0].filename, url
+            );
+            assert_eq!(releases[0].season, Some(season));
+            assert_eq!(releases[0].episode, Some(episode));
+            assert!(!moviebox_tui::providers::moviebox::adapt::is_deprecation_notice_url(&url));
+            urls.push(((season, episode), url));
+        }
+
+        for i in 0..urls.len() {
+            for j in (i + 1)..urls.len() {
+                assert_ne!(
+                    urls[i].1, urls[j].1,
+                    "Streams for {} S{:02}E{:02} and S{:02}E{:02} must not be the same! Got identical URL: {}",
+                    series_title, urls[i].0.0, urls[i].0.1, urls[j].0.0, urls[j].0.1, urls[i].1
+                );
+            }
+        }
+    }
 }
 
 #[tokio::test]
@@ -114,8 +195,7 @@ async fn test_inspect_live_mpd_manifest() {
         xml
     );
 
-    // Test quality switching with mpv
-    for (target_label, height_constraint, expected_res) in [
+    for (target_label, _height_constraint, expected_res) in [
         (
             "1080p",
             "bestvideo[height<=1080]+bestaudio/best",
@@ -132,11 +212,16 @@ async fn test_inspect_live_mpd_manifest() {
             None,
             None,
             None,
+            Some(if target_label == "1080p" {
+                1080
+            } else if target_label == "720p" {
+                720
+            } else {
+                480
+            }),
         );
-        cmd.arg("--vo=null")
-            .arg("--ao=null")
-            .arg("--frames=15")
-            .arg(format!("--ytdl-format={height_constraint}"));
+        println!("Generated command: {:?}", cmd);
+        cmd.arg("--vo=null").arg("--ao=null").arg("--frames=15");
 
         let output = cmd.output().expect("run mpv with quality format");
         let out = String::from_utf8_lossy(&output.stdout);
@@ -180,6 +265,7 @@ async fn test_live_moviebox_mpv_end_to_end_playback() {
         None,
         None,
         None,
+        None,
     );
 
     cmd.arg("--vo=null").arg("--ao=null").arg("--frames=20");
@@ -199,7 +285,42 @@ async fn test_live_moviebox_mpv_end_to_end_playback() {
         "mpv should detect audio stream"
     );
 }
+#[tokio::test]
+#[ignore = "live network test; run with cargo test --test live_stream_verification -- --ignored"]
+async fn test_live_moviebox_iina_invocation() {
+    let client = MovieBoxClient::new();
+    client.init().await.expect("client init successful");
 
+    let releases = client
+        .episode_streams("4179386086617137184", 0, 0)
+        .await
+        .expect("fetch movie streams");
+    assert!(!releases.is_empty(), "releases should not be empty");
+
+    let release = &releases[0];
+    let mirror = &release.mirrors[0];
+
+    let cmd = moviebox_tui::player::command(
+        moviebox_tui::player::PlayerKind::Iina,
+        &mirror.resolver_url,
+        None,
+        &mirror.headers,
+        None,
+        None,
+        None,
+        Some(480),
+    );
+    let args: Vec<String> = cmd
+        .get_args()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    println!(
+        "IINA cmd program: {:?}, args: {:?}",
+        cmd.get_program(),
+        args
+    );
+    assert!(args.iter().any(|a| a.contains("height<=480")));
+}
 #[tokio::test]
 #[ignore = "live network test; run with cargo test --test live_stream_verification -- --ignored"]
 async fn test_live_moviebox_dynamic_movie_mpv_playback() {
@@ -235,6 +356,7 @@ async fn test_live_moviebox_dynamic_movie_mpv_playback() {
         &mirror.resolver_url,
         None,
         &mirror.headers,
+        None,
         None,
         None,
         None,
@@ -330,12 +452,69 @@ async fn test_live_moviebox_dash_download_stream_with_headers() {
 
 #[tokio::test]
 #[ignore = "live network test; run with cargo test --test live_stream_verification -- --ignored"]
+async fn test_live_moviebox_download_selected_resolution_verifies_format() {
+    let client = MovieBoxClient::new();
+    client.init().await.expect("client init successful");
+
+    let releases = client
+        .episode_streams("4179386086617137184", 0, 0)
+        .await
+        .expect("fetch movie streams");
+    assert!(
+        releases.len() >= 2,
+        "releases must contain multiple resolutions"
+    );
+
+    for expected_h in [480, 720, 1080] {
+        let format_spec = format!(
+            "bestvideo[height<={expected_h}]+bestaudio/best[height<={expected_h}]/bestvideo+bestaudio/best"
+        );
+        let mirror = &releases[0].mirrors[0];
+        let mut cmd = std::process::Command::new("yt-dlp");
+        for (k, v) in &mirror.headers {
+            if k.eq_ignore_ascii_case("user-agent") {
+                cmd.arg("--user-agent").arg(v);
+            } else {
+                cmd.arg("--add-header").arg(format!("{k}: {v}"));
+            }
+        }
+        cmd.arg("-f")
+            .arg(&format_spec)
+            .arg("-s")
+            .arg("--print")
+            .arg("%(resolution)s|%(height)s")
+            .arg(&mirror.resolver_url);
+
+        let output = cmd.output().expect("execute yt-dlp simulation");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        eprintln!("yt-dlp format resolution for target {expected_h}p: {stdout}");
+
+        let mut selected_height: Option<u64> = None;
+        for line in stdout.lines() {
+            let parts: Vec<&str> = line.trim().split('|').collect();
+            if let Some(h_str) = parts.get(1) {
+                if let Ok(h) = h_str.parse::<u64>() {
+                    selected_height = Some(h);
+                    break;
+                }
+            }
+        }
+
+        let resolved_h = selected_height.expect("yt-dlp must resolve a video height");
+        assert!(
+            resolved_h <= expected_h,
+            "Selected stream height {resolved_h} must not exceed target height {expected_h}"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "live network test; run with cargo test --test live_stream_verification -- --ignored"]
 async fn test_live_moviebox_session_persistence_and_reuse() {
     let client1 = MovieBoxClient::new();
     let token1 = client1.ensure_session().await.expect("ensure session 1");
     assert!(!token1.is_empty(), "token1 should not be empty");
 
-    // Client 2 without explicit init should load persisted session
     let client2 = MovieBoxClient::new();
     let token2 = client2.ensure_session().await.expect("ensure session 2");
     assert_eq!(
@@ -343,14 +522,12 @@ async fn test_live_moviebox_session_persistence_and_reuse() {
         "client2 must reuse the persisted valid session token"
     );
 
-    // Perform search with client 2
     let search_res = client2
         .search("Inception", 1)
         .await
         .expect("search with client2");
     assert!(!search_res.is_null());
 
-    // Invalidation test
     client2.invalidate_session();
     let token3 = client2
         .ensure_session()
@@ -378,7 +555,10 @@ async fn test_live_fourkhdhub_movie_resolution() {
     for release in &releases {
         println!("Attempting resolve for: {}", release.filename);
         let start = std::time::Instant::now();
-        match client.resolve_release(release).await {
+        match client
+            .resolve_release(release, moviebox_tui::providers::ResolutionIntent::Playback)
+            .await
+        {
             Ok(source) => {
                 println!(
                     "Resolved in {:?}: {} [{}]",
@@ -426,7 +606,10 @@ async fn test_live_fourkhdhub_game_of_thrones_resolution() {
             release.filename
         );
         let start = std::time::Instant::now();
-        match client.resolve_release(release).await {
+        match client
+            .resolve_release(release, moviebox_tui::providers::ResolutionIntent::Playback)
+            .await
+        {
             Ok(source) => {
                 println!(
                     "SUCCESS in {:?}: {} [{}]",
@@ -467,7 +650,7 @@ async fn test_live_moviebox_captions_end_to_end() {
 
     let sibling_ids = vec!["3264772588333157424".to_string()];
     let captions = service
-        .get_ext_captions("4179386086617137184", resource_id, &sibling_ids)
+        .get_ext_captions("4179386086617137184", resource_id, &sibling_ids, 0, 0)
         .await
         .expect("fetch captions");
     assert!(
@@ -519,7 +702,7 @@ async fn test_live_moviebox_breaking_bad_series_captions_latency() {
 
     let t0 = std::time::Instant::now();
     let captions = service
-        .get_ext_captions(subject_id, resource_id, &sibling_ids)
+        .get_ext_captions(subject_id, resource_id, &sibling_ids, 1, 1)
         .await
         .expect("fetch captions");
     let elapsed = t0.elapsed();
@@ -540,4 +723,26 @@ async fn test_live_moviebox_breaking_bad_series_captions_latency() {
             .any(|c| c.name.eq_ignore_ascii_case("English")),
         "must include English"
     );
+}
+
+#[tokio::test]
+#[ignore = "live network test; run with cargo test --test live_stream_verification -- --ignored"]
+async fn test_live_dramachi_search_details_and_streams() {
+    let client = moviebox_tui::providers::dramachi::DramachiClient::new();
+    let items = client
+        .search("Squid Game", 1)
+        .await
+        .expect("dramachi search");
+    assert!(!items.is_empty());
+    let details = client
+        .details(&items[0].id.value)
+        .await
+        .expect("dramachi details");
+    assert!(!details.title.is_empty());
+    let streams = client
+        .episode_streams(&items[0].id.value, 1, 1)
+        .await
+        .expect("dramachi streams");
+    assert!(!streams.is_empty());
+    assert!(streams[0].direct_url().unwrap().starts_with("http"));
 }

@@ -34,15 +34,15 @@ Short version:
 
 - `src/tui/app/`: The application object (`App`). `run.rs` holds the thin
   `handle_action` dispatcher that routes every `Action` to a `handle_*` method in its
-  module (`run.rs`, `requests.rs`, `search.rs`, `playback.rs`, `download.rs`,
+  module (`run.rs`, `requests.rs`, `search.rs`, `playback.rs`, `download.rs`, `favorites.rs`,
   `navigation.rs`, `tv.rs`, `addons.rs`, `keyboard.rs`, `mouse.rs`, `system.rs`, `network.rs`).
-- `src/tui/`: UI state, event loop plumbing, slash commands (`commands.rs`), screens, themes.
-- `src/providers/`: HTTP clients for streaming sources (`moviebox`, `fourkhdhub`,
+- `src/tui/`: UI state, event loop plumbing, slash commands (`commands.rs`), screens, themes, and widgets.
+- `src/providers/`: HTTP clients for streaming sources (`moviebox`, `fourkhdhub`, `dramachi`,
   `bdix`), community HTTP addons (`addons/`), and Live TV playlists (`tv/`).
 - `src/service.rs`: Unified headless multi-provider client & engine.
-- `src/download.rs`: Background media downloading.
-- `src/cache.rs`: Local disk caching to minimize API calls.
-
+- `src/proxy.rs`: Local loopback HTTP proxy for authenticated CloudFront streams.
+- `src/download.rs`: Background multi-segment media downloading.
+- `src/cache.rs`: Local binary MessagePack disk caching.
 The app is message-driven. User input and background tasks produce `Action` values,
 handled by the dispatcher in `src/tui/app/run.rs`. When adding behavior, prefer adding a
 new `Action` variant over blocking the UI thread.

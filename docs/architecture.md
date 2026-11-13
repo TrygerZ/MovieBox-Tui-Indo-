@@ -4,65 +4,106 @@ MovieBox-Tui is a terminal client (ratatui + crossterm + tokio) for streaming mo
 series and TV channels from multiple providers. This document describes the shape of the
 code and how data flows through it.
 
-## Module map
+## System Architecture & Data Flow
 
+```text
+               ┌────────────────────────────────────────────────────────┐
+               │              Terminal User Input & Events              │
+               │   Crossterm KeyPress / MouseClick / WindowResize / Tick│
+               └───────────────────────────┬────────────────────────────┘
+                                           │
+                                           ▼
+               ┌────────────────────────────────────────────────────────┐
+               │           EventHandler Channel (mpsc::channel)         │
+               │          Dispatches serialized Action messages         │
+               └───────────────────────────┬────────────────────────────┘
+                                           │
+                                           ▼
+               ┌────────────────────────────────────────────────────────┐
+               │      App Event Loop & State Machine (Single Thread)    │
+               │    src/tui/app/run.rs ─── Mutates AppState atomically  │
+               └──────────────┬───────────────────────────┬─────────────┘
+                              │                           │
+              UI Render Pass  │          Async IO Tasks   │  Background Workers
+                              ▼                           ▼
+        ┌───────────────────────────┐   ┌───────────────────────────────────┐
+        │   Ratatui Terminal Frame  │   │      Tokio Multi-Thread Runtime   │
+        │ Screens / Widgets / Toast │   │  tokio::spawn / spawn_blocking    │
+        └───────────────────────────┘   └─┬───────────────┬───────────────┬─┘
+                                          │               │               │
+                                          ▼               ▼               ▼
+                                 ┌────────────────┐┌─────────────┐┌─────────────────┐
+                                 │ Scrapers & Net ││ Disk Cache  ││ Media Players & │
+                                 │ Providers & TV ││ MessagePack ││ Loopback Proxy  │
+                                 └────────────────┘└─────────────┘└─────────────────┘
 ```
+
+## Subsystem Breakdown & Module Tree
+
+```text
 src/
-  main.rs                       entry point: logging init, panic hook, raw mode,
-                                alternate screen, App::new + App::run
-  lib.rs                        crate root, module declarations
-  cache.rs                      disk cache: provider-namespaced, TTL'd, atomic writes
-  config.rs                     Config load/save (config.json)
-  download.rs                   download engine (resume, ranges, segments, retry)
-  favorites.rs                  starred-titles persistence (favorites.json)
-  history.rs                    watch history persistence
-  logging.rs                    file logging (rotation, sanitization)
-  models.rs                     shared domain models (SearchResult, BrowseMetrics, StreamPool,
-                                Notification, SubjectIdentity)
-  net.rs                        fallback DNS resolution, HTTP client builder, URL validation
-  player.rs                     player detection (OnceLock) and command construction (mpv/VLC/IINA/Android)
-  providers/
-    mod.rs                      provider module tree
-    models.rs                   shared typed models (ProviderKind, CatalogItem,
-                                MediaDetails, Release, PlaybackSource, …)
-    moviebox/                   primary provider (client + request signing)
-    fourkhdhub/                 4KHDHub provider (client, hubcloud resolver, parser)
-    bdix/circleftp/             BDIX CircleFTP provider
-    bdix/dhakaflix/             BDIX DhakaFlix provider
-    addons/                     Community HTTP addons provider
-    tv/                         Live TV / IPTV provider (M3U parser and models)
-  service.rs                    MovieBoxService headless engine (search, details, streams, captions)
-  updater/                      GitHub release update check (mod, check, download, verify,
-                                extract, apply, artifact)
-  tui/
-    app/                        the application object and all behavior
-      mod.rs                    App struct, App::new, helpers
-      run.rs                    terminal event loop (run), rendering (draw),
-                                and handle_action dispatcher (thin routing table)
-      network.rs                poster fetch + provider dispatch helpers
-      search.rs                 search command routing, search request setup,
-                                provider search dispatch, poster prefetch
-      playback.rs               player launching + playback actions
-      download.rs               download orchestration actions
-      favorites.rs              favorite toggle/open actions, /favorites virtual list
-      requests.rs               suggest/history/homepage/details/preview/
-                                episode-stream actions
-      navigation.rs             list navigation, submit actions, provider helpers
-      tv.rs                     TV mode: playlist manager + playback
-      addons.rs                 Addon mode: addon manager + HTTP addon actions
-      keyboard.rs               raw key-event handling
-      mouse.rs                  mouse click handling and hitbox routing
-      system.rs                 help, refresh, cache, theme, updates, focus, resize
-    state.rs                    AppState: all UI state + in-memory LRU caches
-    action.rs                   the Action enum (event/message model)
-    commands.rs                 Slash command registry, parsing, and suggestions
-    event.rs                    EventHandler: input events + tick → Action channel
-    overlay.rs                  popups, pickers, notifications
-    screens/                    render-only modules (home, details, help)
-    terminal.rs                 terminal capability probes
-    theme.rs                    color themes
-    widgets/                    reusable widgets (badge, input, modal, poster, scrollbar, settings)
-    text.rs                     grapheme-safe text helpers and zero-allocation cursor slicing
+├── main.rs                        # Application entrypoint & CLI dispatcher
+├── lib.rs                         # Crate root and module declarations
+│
+├── Core Engine & Networking
+│   ├── models.rs                  # Domain entities (CatalogItem, MediaDetails, Release)
+│   ├── service.rs                 # Central multi-provider facade & aggregation engine
+│   ├── net.rs                     # Hickory DNS fallback resolver & HTTP client builders
+│   ├── logging.rs                 # Rotating file logger with path/URL privacy sanitization
+│   └── proxy.rs                   # Detached loopback HTTP proxy & DASH manifest rewriter
+│
+├── Storage & Persistence
+│   ├── cache.rs                   # Binary MessagePack cache (MBC1 header) with atomic writes
+│   ├── config.rs                  # User configuration schema & atomic persistence (config.json)
+│   ├── favorites.rs               # Bookmark storage & deduplication (favorites.json)
+│   ├── history.rs                 # Watch progress, latched resume, & state reconciliation
+│   └── download.rs                # Chunked multi-segment downloader with HTTP range resume
+│
+├── Media Providers (`src/providers/`)
+│   ├── models.rs                  # Provider traits (Provider, ReleaseProvider) & capabilities
+│   ├── moviebox/                  # CloudFront signed requests, token generation, & scraper
+│   ├── fourkhdhub/                # 4K releases, HTML parser, & HubCloud mirror resolver
+│   ├── dramachi/                  # Asian dramas and series scraper
+│   ├── bdix/                      # BDIX optical intranet scrapers (CircleFTP, DhakaFlix)
+│   │   └── common.rs              # Centralized codec, resolution, & language heuristics
+│   ├── addons/                    # Community Stremio HTTP addon manifest & stream aggregator
+│   └── tv/                        # IPTV M3U playlist parser & stream normalizer
+│
+├── Player & Process Supervisor
+│   ├── player.rs                  # Player detection (mpv, IINA, VLC, Android) & command builder
+│   └── player/tracker.rs          # Embedded Lua tracker script (moviebox_tracker.lua)
+│
+├── Self-Updater (`src/updater/`)
+│   ├── check.rs                   # GitHub release API version checker
+│   ├── download.rs                # Streaming release archive downloader
+│   ├── verify.rs                  # Cryptographic SHA-256 checksum validator
+│   ├── extract.rs                 # Tar.gz and Zip extractor with path traversal guard
+│   └── apply.rs                   # Atomic binary replacement, path resolution, & restart helper
+│
+└── Presentation & TUI (`src/tui/`)
+    ├── action.rs                  # Unified Action enum message bus
+    ├── event.rs                   # Crossterm terminal input event listener & tick driver
+    ├── state.rs                   # Centralized AppState & LRU memory caches
+    ├── commands.rs                # Slash command registry (/settings, /browse, /exit)
+    ├── terminal.rs                # Terminal capability & graphics protocol detection
+    ├── theme.rs                   # Theme registry (Catppuccin, TokyoNight, Nord, etc.)
+    ├── text.rs                    # Grapheme-safe input buffer & Unicode measurement
+    ├── overlay.rs                 # Toasts, modals, confirmation dialogues, & picker frames
+    ├── screens/                   # Declarative renderers (home.rs, details.rs, help.rs)
+    ├── widgets/                   # Modular widgets (badge, input, modal, poster, settings)
+    └── app/                       # State machine action handlers & event loop
+        ├── run.rs                 # Main event loop (App::run) & frame drawing
+        ├── keyboard.rs            # Keyboard shortcuts & vim navigation router
+        ├── mouse.rs               # Mouse click hit-testing & drag coordinates
+        ├── navigation.rs          # Grid steps, pagination, & screen transitions
+        ├── requests.rs            # Async metadata & stream request dispatchers
+        ├── playback.rs            # Player process launching & crash supervision
+        ├── download.rs            # Download queue manager & progress bar updates
+        ├── search.rs              # Search input handler & poster prefetching
+        ├── favorites.rs           # Favorite bookmarks handler
+        ├── tv.rs                  # IPTV channel manager & playlist actions
+        ├── addons.rs              # Stremio addon manager actions
+        └── system.rs              # Terminal resize, theme switching, & self-update UI
 ```
 
 ## The event loop
@@ -91,7 +132,7 @@ interval, forwarding them into the action channel (capacity 128).
 - Background tasks send `Action` messages back (e.g. `SearchSuccess`,
   `EpisodeStreamsReady`, `DownloadCompleted`), which `handle_action` consumes.
 
-## Data flow — a typical search
+## Data flow: a typical search
 
 1. User types a query; the `Key` handler updates `search_query` and sends `Action::Search`.
 2. `handle_action` resolves the active provider, dispatches to the provider client
@@ -107,19 +148,19 @@ interval, forwarding them into the action channel (capacity 128).
 1. User selects a result → `Action::PlayStream` (moviebox) or 4KHDHub/BDIX resolve.
 2. The provider resolves a `PlaybackSource` (url + optional headers/subtitle).
 3. `launch_player` builds the player command (`player.rs`), optionally downloads the
-   subtitle to a temp file, and spawns the player with null stdin/stdout and piped
-   stderr; a blocking task waits and reports crashes.
-4. Playback is handed to mpv / VLC / IINA / Android intent per the active player.
+   subtitle to a temp file, and spawns the player in a detached OS session (`setsid` /
+   `DETACHED_PROCESS`) with null stdin/stdout and file-backed stderr logging; a
+   blocking task waits and reports crashes while the TUI remains open.
 
 ## Configuration and persistence
 
-- `config.json` — settings (mode persistence, mode toggles, theme, provider, auto-update, `default_player`, download directory, BDIX) in the config dir.
-- `addons_config.json` — installed HTTP community addons in the config dir.
-- `tv_config.json` — user M3U playlist sources (URLs or file paths) in the config dir.
-- `history.json` — watch history in the system data dir.
+- `config.json`: settings (mode persistence, mode toggles, theme, provider, auto-update, `default_player`, download directory, BDIX) in the config dir.
+- `addons_config.json`: installed HTTP community addons in the config dir.
+- `tv_config.json`: user M3U playlist sources (URLs or file paths) in the config dir.
+- `history.json`: watch history in the system data dir.
 - `favorites.json`: starred titles in the system data dir, independent of `history.json`.
-- `playback/` — temporary playback states for session crash/kill reconciliation in the system data dir.
-- `scripts/` — bundled player scripts (`moviebox_tracker.lua`) in the system data dir.
+- `playback/`: temporary playback states for session crash/kill reconciliation in the system data dir.
+- `scripts/`: bundled player scripts (`moviebox_tracker.lua`) in the system data dir.
 - Cache lives under the system cache dir, keyed per provider.
 - Logs live under the system data dir with rotation.
 

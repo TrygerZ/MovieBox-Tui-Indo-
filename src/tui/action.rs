@@ -1,7 +1,6 @@
 #[derive(Debug, Clone)]
 pub enum Action {
     FocusChange,
-    LaunchPlayer(crate::tui::state::PlayerKind, String, Option<String>),
     Tick,
     Key(crossterm::event::KeyEvent),
     MouseClick(u16, u16),
@@ -10,8 +9,7 @@ pub enum Action {
     SelectLanguage(usize),
     Resize(u16, u16),
     ToggleHelp,
-    ToggleTvMode,
-    ToggleAddonMode,
+    SwitchToTvMode,
     SwitchToStreamingMode,
     SwitchProvider(crate::providers::models::ProviderKind),
     ShowTvConfig,
@@ -61,12 +59,11 @@ pub enum Action {
     WheelScroll {
         up: bool,
     },
-    ProbeTerminal,
     Submit,
     TabPane,
     BackTabPane,
     FetchPreview(String),
-    PreviewSuccess(u64, String, crate::providers::models::MediaDetails),
+    PreviewSuccess(u64, String, Box<crate::providers::models::MediaDetails>),
     PreviewFailure(u64, String),
     PlayStream,
     ShowSubtitlePopup(String, Vec<crate::providers::models::SubtitleOption>),
@@ -74,8 +71,6 @@ pub enum Action {
     ToggleThemePopup,
     SelectTheme(String),
     ToggleSettingsPopup,
-    ShowSettingsPopup,
-    CloseSettingsPopup,
     SelectSettingsCategory(crate::tui::state::SettingsCategory),
     SettingsAdjustValue(bool),
     SettingsActivateRow,
@@ -83,26 +78,28 @@ pub enum Action {
     ShowBrowseMenu,
     SelectBrowse(crate::tui::state::BrowsePreset),
     SelectAddonCatalog(crate::providers::addons::models::AddonCatalogTarget),
-    LaunchMpv(String, Option<String>),
     DownloadStream(Option<String>),
-    StartDownload(Option<String>, Option<String>, Vec<(String, String)>),
+    StartDownload(
+        Option<String>,
+        Option<String>,
+        Vec<(String, String)>,
+        Option<u64>,
+    ),
     UpdateDownload(Option<f64>, Option<String>),
     DownloadCompleted(String),
     DownloadFailed(String),
     DownloadPaused(String),
     ClearDownload,
     CancelDownload,
-    PromptDownloadEpisode,
-    ConfirmDownloadEpisode,
-    PromptDownloadSeason,
-    ConfirmDownloadSeason,
+    DownloadEpisode,
+    DownloadSeason,
     ProcessDownloadQueue,
     FetchDetails(String, bool),
     DetailsSuccess(
         crate::providers::models::RequestContext,
         u64,
         String,
-        crate::providers::models::MediaDetails,
+        Box<crate::providers::models::MediaDetails>,
     ),
     DetailsFailure(crate::providers::models::RequestContext, u64, String),
     InitStreamPool(String),
@@ -170,9 +167,9 @@ pub enum Action {
         error: String,
     },
     DispatchPlayback(crate::providers::models::PlaybackSource),
-    MarkWatched(crate::history::WatchHistoryItem),
+    MarkWatched(Box<crate::history::WatchHistoryItem>),
     UpdateProgress {
-        item: crate::history::WatchHistoryItem,
+        item: Box<crate::history::WatchHistoryItem>,
         progress: u64,
         duration: Option<u64>,
         completed: bool,
@@ -184,4 +181,21 @@ pub enum Action {
     ShowFavorites,
     OpenFavorite(usize),
     OpenContinueWatching(usize),
+    ToggleProvider(crate::providers::models::ProviderKind),
+    CheckBdixNetwork,
+    BdixProbeResult {
+        circleftp: bool,
+        dhakaflix: bool,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_action_enum_size_bounded() {
+        let size = std::mem::size_of::<Action>();
+        assert!(size <= 128, "Action size is {size} bytes, expected <= 128");
+    }
 }

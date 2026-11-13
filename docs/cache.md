@@ -1,45 +1,38 @@
-# Cache
+# Binary Cache & Storage
 
-Disk caching lives in `cache.rs`; in-memory caches live in `AppState`.
+MovieBox-TUI uses a disk-backed binary MessagePack caching engine to minimize network requests while maintaining fast startup times.
 
-## Disk layout
+## Cache Directory
 
-```
-<cache dir>/moviebox-tui/
-  <provider>/            moviebox, fourkhdhub, bdix_circleftp, bdix_dhakaflix, addons
-    search/<hash>_<page>.cache
-    details/details_<schema><hash>.cache
-    streams/<schema><hash>_<season>_<episode>.cache
-    images/<hash>.img
-  moviebox/
-    homepage/home_<tab>_<page>.cache
-    captions/captions_<hash>.cache
-  addons/
-    catalogs/catalog_<hash>.cache
-    manifests/manifest_<hash>.cache
-    streams/<hash>_<season>_<episode>.cache
-  tv_playlists/<md5>.m3u       cached remote playlist snapshots
+- **Linux / macOS / Termux**: `~/.cache/moviebox-tui/`
+- **Windows**: `%LOCALAPPDATA%\MovieBox-Tui\cache\`
+
+Override with the `MOVIEBOX_CACHE_DIR` environment variable.
+
+## Binary Cache Architecture
+
+Cache files use a structured MessagePack envelope preceded by a 4-byte magic signature (`MBC1`):
+
+```text
+[ 0x4D 0x42 0x43 0x31 ] [ MessagePack Encoded Envelope ]
 ```
 
-The cache directory is `dirs::cache_dir()/moviebox-tui` (macOS
-`~/Library/Caches`, Windows `%LOCALAPPDATA%`, Linux `$XDG_CACHE_HOME`).
+The envelope stores the expiration timestamp (`expires_at: u64`) alongside the serialized payload. On read, if the current time exceeds `expires_at` or the file age exceeds the TTL, the cache is invalidated and refetched.
 
-## Properties
+## Cache TTLs
 
-- **Binary MessagePack Envelopes**: Cache entries are serialized with `rmp-serde` wrapped in a binary envelope starting with the 4-byte magic signature `MBC1` and an 8-byte TTL timestamp (`CacheEnvelope<T>`). Legacy JSON files are read and migrated on the fly.
-- **Fast Table-Lookup Hex Hashing**: Cache file naming and key hashing in `md5_hex` uses static 16-byte lookup table encoding, eliminating dynamic `core::fmt::write` formatting allocations and speeding up digest encoding by 2.51x.
-- **Provider namespacing**: Keys include `provider.cache_key()`, preventing collisions across sources.
-- **Atomic writes**: Entries are written to a unique temp file (`path.with_extension("tmp-PID-STAMP")`) and atomically replaced (`durable_replace`), preventing truncated or corrupt files on unexpected exits.
-- **Validation**: Empty search or stream results are never written or served from cache.
-- **Purge**: Background cleanup runs at startup to delete entries older than 7 days. `/settings` → Maintenance → Clear Disk Cache recursively empties all cached provider responses, images, TV playlists, temporary subtitles across Android/Windows/Unix, resets in-memory LRU caches, and cancels in-flight background request tasks.
+| Namespace | TTL | Description |
+| :--- | :--- | :--- |
+| `homepage` | 1 Hour | Trending, popular, and curated `/browse` feeds |
+| `search` | 24 Hours | Search query results per provider |
+| `details` | Dynamic (CloudFront TTL) | Subject details, cast, and signed streaming cookies (auto-adapts to upstream cookie expiration, min 1h, max 24h) |
+| `streams` | Dynamic (Cookie Expiration) | Direct streaming and DASH manifest URLs (auto-adapts to `CloudFront-Policy` and `Edge-Cache-Cookie` expiration timestamp `:t=`, min 1m, max 2h) |
+| `captions` | 24 Hours | Aggregated MovieBox external subtitle lists (primary + sibling dubs, background-prefetched on Details load) |
+| `posters` | 30 Days | Downloaded poster image buffers |
+| `tv` | 24 Hours | Remote M3U playlist text snapshots |
 
-## In-memory caches (AppState)
+## Durability & Safety
 
-- `image_cache` (30), `search_posters` (300), `failed_posters` (300),
-  `search_poster_protocols` (300), `preview_cache` (30): `lru::LruCache` for poster
-  images, negative lookup cache, and terminal image protocols; `stream_pool`:
-  resolved streams per subject.
-
-All disk access in async code is wrapped in `tokio::task::spawn_blocking` so the event
-loop never blocks. Failures are logged (see [logging.md](logging.md)) and treated as
-cache misses.
+- **Atomic File Writes**: All cache entries write to a temporary sidecar file (`.tmp-<pid>-<stamp>`) and rename atomically to the destination so interrupted writes never corrupt cache files.
+- **Automatic Purging**: Stale cache entries older than 7 days are automatically removed by a background worker at startup.
+- **Manual Purge**: Enter `/settings` → **Maintenance** → **Clear Disk Cache** to immediately wipe all cached files, images, and playlist snapshots.

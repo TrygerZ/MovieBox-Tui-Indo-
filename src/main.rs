@@ -4,35 +4,21 @@ use moviebox_tui::tui::app::App;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
-core::arch::global_asm!(
-    ".section .tdata,\"awT\",@progbits",
-    ".p2align 6",
-    ".globl __bionic_tls_align_anchor",
-    "__bionic_tls_align_anchor:",
-    ".text",
-    ".globl __bionic_tls_align_reference",
-    ".type __bionic_tls_align_reference,%function",
-    "__bionic_tls_align_reference:",
-    "add x0, x0, :tprel_lo12_nc:__bionic_tls_align_anchor",
-    "ret",
-    ".size __bionic_tls_align_reference, .-__bionic_tls_align_reference",
-);
-
-#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
-unsafe extern "C" {
-    fn __bionic_tls_align_reference();
-}
 struct TerminalGuard;
 
 fn restore_terminal() {
+    if !moviebox_tui::config::is_termux_environment() {
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::PopKeyboardEnhancementFlags
+        );
+    }
     let _ = crossterm::execute!(
         std::io::stdout(),
         crossterm::cursor::SetCursorStyle::DefaultUserShape,
         crossterm::cursor::Show,
         crossterm::event::DisableMouseCapture,
         crossterm::event::DisableFocusChange,
-        crossterm::event::PopKeyboardEnhancementFlags,
         crossterm::terminal::LeaveAlternateScreen
     );
     let _ = crossterm::terminal::disable_raw_mode();
@@ -41,16 +27,10 @@ fn restore_terminal() {
 fn purge_stale_subtitles() {
     tokio::task::spawn_blocking(|| {
         let max_age = 24 * 60 * 60;
-        let mut dirs = vec![
-            moviebox_tui::service::resolve_subtitle_dir(),
-            std::env::temp_dir().join("moviebox-tui/subs"),
+        let dirs = [
+            moviebox_tui::config::cache_dir().join("subs"),
+            std::env::temp_dir().join("moviebox-tui").join("subs"),
         ];
-        if let Some(home) = dirs::home_dir() {
-            let android_storage = home.join("storage/downloads/moviebox_subs");
-            if home.join("storage/downloads").exists() {
-                dirs.push(android_storage);
-            }
-        }
 
         for dir in dirs {
             if dir.exists()
@@ -86,15 +66,26 @@ impl Drop for TerminalGuard {
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
-    {
-        core::hint::black_box(__bionic_tls_align_reference as *const ());
-    }
-
     // Load optional .env file from the current directory (never overrides
     // real environment variables; missing file is not an error).
     let _ = dotenvy::dotenv();
     let args: Vec<String> = std::env::args().collect();
+    if let Some(pos) = args.iter().position(|a| a == "--proxy-for-vlc") {
+        let target_url = args.get(pos + 1).cloned().unwrap_or_default();
+        let headers_json = args
+            .get(pos + 2)
+            .cloned()
+            .unwrap_or_else(|| "[]".to_string());
+        let sub_url = args.get(pos + 3).cloned().filter(|s| !s.is_empty());
+        let max_height = args
+            .get(pos + 4)
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|&h| h > 0);
+        let headers: Vec<(String, String)> =
+            serde_json::from_str(&headers_json).unwrap_or_default();
+        moviebox_tui::proxy::run_sidecar(target_url, headers, sub_url, max_height).await;
+        return Ok(());
+    }
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!("moviebox-tui {}", env!("CARGO_PKG_VERSION"));
         println!("A terminal client for finding and streaming movies, TV shows, and anime.\n");
@@ -129,14 +120,17 @@ async fn main() -> std::io::Result<()> {
     moviebox_tui::logging::init();
 
     std::panic::set_hook(Box::new(|info| {
-        log::error!("panic: {info}");
+        let backtrace = std::backtrace::Backtrace::capture();
+        log::error!("panic: {info}\nbacktrace:\n{backtrace}");
+        moviebox_tui::logging::flush();
         restore_terminal();
-        eprintln!("{info}");
+        eprintln!("{info}\n{backtrace}");
     }));
 
     let stdout = std::io::stdout();
-    let backend =
-        ratatui::backend::CrosstermBackend::new(std::io::BufWriter::with_capacity(65536, stdout));
+    let backend = ratatui_crossterm::CrosstermBackend::new(std::io::BufWriter::with_capacity(
+        262_144, stdout,
+    ));
     let mut terminal = ratatui::Terminal::new(backend)?;
     crossterm::terminal::enable_raw_mode()?;
     let _guard = TerminalGuard;
@@ -146,13 +140,15 @@ async fn main() -> std::io::Result<()> {
         crossterm::event::EnableMouseCapture,
         crossterm::event::EnableFocusChange
     )?;
-    let _ = crossterm::execute!(
-        std::io::stdout(),
-        crossterm::event::PushKeyboardEnhancementFlags(
-            crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                | crossterm::event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-        )
-    );
+    if !moviebox_tui::config::is_termux_environment() {
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::PushKeyboardEnhancementFlags(
+                crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | crossterm::event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+            )
+        );
+    }
 
     moviebox_tui::cache::clean_old_cache_background();
     purge_stale_subtitles();

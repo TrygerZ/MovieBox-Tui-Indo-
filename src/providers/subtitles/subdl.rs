@@ -509,7 +509,10 @@ fn extract_first_subtitle_from_zip(bytes: &[u8]) -> Result<(String, Vec<u8>), Su
         if file.is_dir() {
             continue;
         }
-        let Some(basename) = safe_basename(file.name()) else {
+        let Ok(raw_name) = file.name() else {
+            continue;
+        };
+        let Some(basename) = safe_basename(&raw_name) else {
             continue;
         };
         let Some(ext) = subtitle_ext_of(&basename) else {

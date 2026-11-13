@@ -7,7 +7,7 @@ pub mod verify;
 
 pub use apply::{
     InstallationEnvironment, SelfUpdateOutcome, apply_staged_binary, detect_environment,
-    is_homebrew_managed, is_writable, restart_process,
+    is_homebrew_managed, is_scoop_managed, is_writable, resolve_executable_path, restart_process,
 };
 pub use artifact::{Release, ReleaseAsset, TargetPlatform, is_termux_environment};
 pub use check::{check, check_release, is_newer};
@@ -20,24 +20,10 @@ pub async fn perform_self_update(
         .map_err(|e| format!("failed to get current executable path: {e}"))?;
 
     let env = detect_environment(&current_exe);
-    match env {
-        InstallationEnvironment::Homebrew => {
-            return Ok(SelfUpdateOutcome::RequiresManualUpgrade(
-                "This installation is managed by Homebrew. Run: brew upgrade moviebox-tui"
-                    .to_string(),
-            ));
-        }
-        InstallationEnvironment::Termux => {
-            return Ok(SelfUpdateOutcome::RequiresManualUpgrade(
-                "Android / Termux update: run 'curl -fsSL https://raw.githubusercontent.com/mesamirh/MovieBox-Tui/main/install.sh | bash'".to_string(),
-            ));
-        }
-        InstallationEnvironment::ReadOnly => {
-            return Ok(SelfUpdateOutcome::RequiresManualUpgrade(
-                "MovieBox-Tui binary is not user-writable. Please update via your system package manager.".to_string(),
-            ));
-        }
-        InstallationEnvironment::DirectReplace | InstallationEnvironment::WindowsHelper => {}
+    if let Some(instruction) = env.upgrade_instruction() {
+        return Ok(SelfUpdateOutcome::RequiresManualUpgrade(
+            instruction.to_string(),
+        ));
     }
 
     let platform = TargetPlatform::current().ok_or_else(|| {
@@ -61,11 +47,7 @@ pub async fn perform_self_update(
         .map_err(|e| format!("failed to create temporary update directory: {e}"))?;
 
     let archive_path = temp_dir.path().join(&asset.name);
-    let staged_binary_path = if env == InstallationEnvironment::WindowsHelper {
-        apply::persistent_staging_path(&current_exe)
-    } else {
-        temp_dir.path().join(platform.expected_binary_name())
-    };
+    let staged_binary_path = apply::persistent_staging_path(&current_exe);
 
     if let Some(tx) = progress_sender {
         let _ = tx.send(format!("Downloading {}...", asset.name));

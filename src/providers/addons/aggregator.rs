@@ -3,6 +3,13 @@ use super::client::AddonClient;
 use super::models::InstalledAddon;
 use crate::providers::models::Release;
 
+pub fn clean_addon_subject_id(subject_id: &str) -> &str {
+    subject_id
+        .strip_prefix("series:")
+        .or_else(|| subject_id.strip_prefix("movie:"))
+        .unwrap_or(subject_id)
+}
+
 pub async fn aggregate_streams(
     client: &AddonClient,
     addons: &[InstalledAddon],
@@ -20,11 +27,17 @@ pub async fn aggregate_streams(
         return (Vec::new(), Vec::new());
     }
 
+    let clean_id = clean_addon_subject_id(subject_id);
     let media_type = if is_series { "series" } else { "movie" };
-    let stream_id = if is_series && season > 0 && episode > 0 {
-        format!("{subject_id}:{season}:{episode}")
+    let stream_id = if is_series && episode > 0 {
+        let suffix = format!(":{season}:{episode}");
+        if clean_id.ends_with(&suffix) {
+            clean_id.to_string()
+        } else {
+            format!("{clean_id}{suffix}")
+        }
     } else {
-        subject_id.to_string()
+        clean_id.to_string()
     };
 
     let mut tasks = Vec::new();
@@ -35,12 +48,14 @@ pub async fn aggregate_streams(
         let id_clone = stream_id.clone();
         let m_type = media_type.to_string();
 
-        tasks.push(tokio::spawn(async move {
-            let streams_res = client_clone
-                .fetch_streams(&base_url, &m_type, &id_clone)
-                .await;
+        tasks.push(async move {
+            let streams_res = tokio::time::timeout(
+                std::time::Duration::from_millis(5000),
+                client_clone.fetch_streams(&base_url, &m_type, &id_clone),
+            )
+            .await;
             match streams_res {
-                Ok(items) => {
+                Ok(Ok(items)) => {
                     let mut releases = Vec::new();
                     for item in &items {
                         if let Some(rel) =
@@ -55,16 +70,23 @@ pub async fn aggregate_streams(
                         (releases, None)
                     }
                 }
-                Err(_) => (Vec::new(), None),
+                Ok(Err(err)) => {
+                    log::warn!("addon {addon_name} failed to fetch streams: {err}");
+                    (Vec::new(), None)
+                }
+                Err(_) => {
+                    log::warn!("addon {addon_name} timed out fetching streams");
+                    (Vec::new(), None)
+                }
             }
-        }));
+        });
     }
 
     let results = futures::future::join_all(tasks).await;
     let mut all_releases = Vec::new();
     let mut blocked_addons = Vec::new();
 
-    for res in results.into_iter().flatten() {
+    for res in results {
         all_releases.extend(res.0);
         if let Some(blocked) = res.1 {
             blocked_addons.push(blocked);
@@ -126,5 +148,95 @@ fn quality_score(quality: Option<&str>) -> u32 {
         Some("720p") => 20,
         Some("480p") => 10,
         _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn test_aggregate_streams_merges_deduplicates_sorts_and_reports_blocked_torrents() {
+        let listener1 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr1 = listener1.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener1.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let body = r#"{"streams":[
+                    {"name":"AddonA 720p","title":"Movie.720p.mp4\n💾 1.0 GB","url":"https://cdn.example.com/720p.mp4"},
+                    {"name":"AddonA 4K","title":"Movie.2160p.HEVC.mkv\n💾 10.0 GB","url":"https://cdn.example.com/2160p.mkv"}
+                ]}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let listener2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr2 = listener2.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener2.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let body = r#"{"streams":[
+                    {"name":"TorrentOnly","title":"P2P Swarm","infoHash":"0123456789abcdef0123456789abcdef01234567"}
+                ]}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let addons = vec![
+            InstalledAddon {
+                manifest_url: format!("http://{addr1}/manifest.json"),
+                name: "HTTP Addon".to_string(),
+                version: Some("1.0.0".to_string()),
+                description: None,
+                enabled: true,
+                provides_catalog: false,
+                provides_meta: false,
+                provides_stream: true,
+                id_prefixes: vec![],
+                types: vec!["movie".to_string()],
+            },
+            InstalledAddon {
+                manifest_url: format!("http://{addr2}/manifest.json"),
+                name: "P2P Addon".to_string(),
+                version: Some("1.0.0".to_string()),
+                description: None,
+                enabled: true,
+                provides_catalog: false,
+                provides_meta: false,
+                provides_stream: true,
+                id_prefixes: vec![],
+                types: vec!["movie".to_string()],
+            },
+        ];
+
+        let client = AddonClient::new();
+        let (releases, blocked) =
+            aggregate_streams(&client, &addons, "tt1234567", 0, 0, false).await;
+        assert_eq!(blocked, vec!["P2P Addon".to_string()]);
+        assert_eq!(releases.len(), 2);
+        assert_eq!(releases[0].quality.as_deref(), Some("2160p"));
+        assert_eq!(releases[1].quality.as_deref(), Some("720p"));
+    }
+
+    #[test]
+    fn test_clean_addon_subject_id_preserves_namespaces() {
+        assert_eq!(clean_addon_subject_id("series:kitsu:12345"), "kitsu:12345");
+        assert_eq!(clean_addon_subject_id("movie:kitsu:999"), "kitsu:999");
+        assert_eq!(clean_addon_subject_id("series:tt0903747"), "tt0903747");
+        assert_eq!(clean_addon_subject_id("movie:tt1234567"), "tt1234567");
+        assert_eq!(clean_addon_subject_id("tt1234567"), "tt1234567");
     }
 }

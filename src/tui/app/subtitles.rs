@@ -283,7 +283,7 @@ impl App {
             provider: self.state.active_provider,
             subject_id,
             resource_id,
-            title,
+            title: title.to_string(),
             year,
             is_episode,
             season,
@@ -323,7 +323,18 @@ impl App {
                         } else if let Some(source) = self.state.pending_playback_source.take() {
                             self.dispatch_playback_or_notify(source);
                         } else if let Some(link) = self.state.pending_play_link.take() {
-                            self.action_sender.send(Action::LaunchMpv(link, None)).ok();
+                            let source = crate::providers::models::PlaybackSource {
+                                provider: self.state.active_provider,
+                                url: link,
+                                headers: vec![(
+                                    "User-Agent".to_string(),
+                                    self.service.client.user_agent().to_string(),
+                                )],
+                                subtitle: None,
+                                source_label: "Direct".to_string(),
+                                max_height: None,
+                            };
+                            self.dispatch_playback_or_notify(source);
                         }
                     } else {
                         // P4: reset the list to ["None"] + OS candidates, then
@@ -394,7 +405,18 @@ impl App {
                     } else if let Some(source) = self.state.pending_playback_source.take() {
                         self.dispatch_playback_or_notify(source);
                     } else if let Some(link) = self.state.pending_play_link.take() {
-                        self.action_sender.send(Action::LaunchMpv(link, None)).ok();
+                        let source = crate::providers::models::PlaybackSource {
+                            provider: self.state.active_provider,
+                            url: link,
+                            headers: vec![(
+                                "User-Agent".to_string(),
+                                self.service.client.user_agent().to_string(),
+                            )],
+                            subtitle: None,
+                            source_label: "Direct".to_string(),
+                            max_height: None,
+                        };
+                        self.dispatch_playback_or_notify(source);
                     }
                 }
                 self.state.notify(
@@ -432,7 +454,18 @@ impl App {
                         } else if let Some(source) = self.state.pending_playback_source.take() {
                             self.dispatch_playback_or_notify(source);
                         } else if let Some(link) = self.state.pending_play_link.take() {
-                            self.action_sender.send(Action::LaunchMpv(link, None)).ok();
+                            let source = crate::providers::models::PlaybackSource {
+                                provider: self.state.active_provider,
+                                url: link,
+                                headers: vec![(
+                                    "User-Agent".to_string(),
+                                    self.service.client.user_agent().to_string(),
+                                )],
+                                subtitle: None,
+                                source_label: "Direct".to_string(),
+                                max_height: None,
+                            };
+                            self.dispatch_playback_or_notify(source);
                         }
                     } else {
                         // P4: reset the list to ["None"] + SubDL candidates,
@@ -503,7 +536,18 @@ impl App {
                     } else if let Some(source) = self.state.pending_playback_source.take() {
                         self.dispatch_playback_or_notify(source);
                     } else if let Some(link) = self.state.pending_play_link.take() {
-                        self.action_sender.send(Action::LaunchMpv(link, None)).ok();
+                        let source = crate::providers::models::PlaybackSource {
+                            provider: self.state.active_provider,
+                            url: link,
+                            headers: vec![(
+                                "User-Agent".to_string(),
+                                self.service.client.user_agent().to_string(),
+                            )],
+                            subtitle: None,
+                            source_label: "Direct".to_string(),
+                            max_height: None,
+                        };
+                        self.dispatch_playback_or_notify(source);
                     }
                 }
                 self.state.notify(

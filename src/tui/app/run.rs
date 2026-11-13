@@ -35,6 +35,10 @@ impl App {
             });
         }
 
+        if !self.state.bdix_probed {
+            self.action_sender.send(Action::CheckBdixNetwork).ok();
+        }
+
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -47,19 +51,30 @@ impl App {
         self.state.active_screen = Screen::Home;
 
         self.state.available_players = crate::tui::player::detect();
-        if (self.state.default_player.is_none()
-            || self.state.default_player.as_deref() == Some("auto"))
-            && let Some(first) = self.state.available_players.first()
+        if crate::player::has_graphical_display()
+            && std::env::var(crate::player::ENV_MOVIEBOX_PLAYER).is_err()
+            && self.state.default_player.as_deref().is_some_and(|p| {
+                p.eq_ignore_ascii_case("android")
+                    || p.eq_ignore_ascii_case("androidintent")
+                    || p.eq_ignore_ascii_case("android-intent")
+            })
+            && self
+                .state
+                .available_players
+                .iter()
+                .any(|&p| p != crate::tui::state::PlayerKind::AndroidIntent)
         {
-            self.state.default_player = Some(first.config_key().to_string());
+            self.state.default_player = None;
+            self.persist_config();
         }
-        let preferred = std::env::var("MOVIEBOX_PLAYER")
+        let preferred = std::env::var(crate::player::ENV_MOVIEBOX_PLAYER)
             .ok()
             .and_then(|value| crate::tui::state::PlayerKind::parse(&value))
             .or_else(|| {
                 self.state
                     .default_player
                     .as_deref()
+                    .filter(|p| !p.eq_ignore_ascii_case("auto"))
                     .and_then(crate::tui::state::PlayerKind::parse)
             });
         if let Some(preferred) = preferred
@@ -87,10 +102,12 @@ impl App {
                 let _ = crossterm::execute!(std::io::stdout(), style);
                 self.state.cursor_beam = want_beam;
             }
-            let title = self.contextual_title();
-            if title != last_window_title {
-                let _ = crate::tui::terminal::set_window_title(&title);
-                last_window_title = title;
+            if self.state.dirty || last_window_title.is_empty() {
+                let title = self.contextual_title();
+                if title != last_window_title {
+                    let _ = crate::tui::terminal::set_window_title(&title);
+                    last_window_title = title;
+                }
             }
             self.state.normalize_result_view();
             if self.state.clear_terminal_before_draw {
@@ -149,13 +166,8 @@ impl App {
                 return;
             }
             Some(ForcedProtocol::Type(protocol)) => {
-                let font_size = Self::cell_size_override().unwrap_or(ratatui_image::FontSize {
-                    width: 10,
-                    height: 20,
-                });
-                #[allow(deprecated)]
-                let mut picker = ratatui_image::picker::Picker::from_fontsize(font_size);
-                picker.set_protocol_type(protocol);
+                let picker =
+                    Self::create_picker_with_font_size(Self::cell_size_override(), protocol);
                 self.accept_picker(picker);
                 return;
             }
@@ -184,19 +196,14 @@ impl App {
         let mut picker = match (picker, Self::cell_size_override()) {
             (Some(picker), None) => picker,
             (probed, cell_size) => {
-                let font_size = cell_size.unwrap_or(ratatui_image::FontSize {
-                    width: 10,
-                    height: 20,
-                });
-                #[allow(deprecated)]
-                let mut rebuilt = ratatui_image::picker::Picker::from_fontsize(font_size);
-                if let Some(probed) = probed {
-                    rebuilt.set_protocol_type(probed.protocol_type());
-                }
-                if let Some(ForcedProtocol::Type(protocol)) = Self::forced_protocol() {
-                    rebuilt.set_protocol_type(protocol);
-                }
-                rebuilt
+                let target_protocol = Self::forced_protocol()
+                    .and_then(|p| match p {
+                        ForcedProtocol::Type(proto) => Some(proto),
+                        _ => None,
+                    })
+                    .or_else(|| probed.as_ref().map(|p| p.protocol_type()))
+                    .unwrap_or(ProtocolType::Halfblocks);
+                Self::create_picker_with_font_size(cell_size, target_protocol)
             }
         };
 
@@ -285,17 +292,40 @@ impl App {
         }
         Some(ratatui_image::FontSize { width, height })
     }
+
+    fn create_picker_with_font_size(
+        font_size: Option<ratatui_image::FontSize>,
+        protocol: ratatui_image::picker::ProtocolType,
+    ) -> ratatui_image::picker::Picker {
+        let mut picker = match font_size {
+            Some(size) =>
+            {
+                #[allow(deprecated)]
+                ratatui_image::picker::Picker::from_fontsize(size)
+            }
+            None => ratatui_image::picker::Picker::halfblocks(),
+        };
+        picker.set_protocol_type(protocol);
+        picker
+    }
     pub fn contextual_title(&self) -> String {
         match self.state.active_screen {
             Screen::Home => match self.state.mode() {
-                crate::tui::state::AppMode::Streaming => "MovieBox-Tui — Streaming".to_string(),
+                crate::tui::state::AppMode::Streaming => {
+                    if self.state.active_provider == crate::providers::models::ProviderKind::Addons
+                    {
+                        "MovieBox-Tui — Addons".to_string()
+                    } else {
+                        "MovieBox-Tui — Streaming".to_string()
+                    }
+                }
                 crate::tui::state::AppMode::Tv => "MovieBox-Tui — Live TV".to_string(),
-                crate::tui::state::AppMode::Addon => "MovieBox-Tui — Addons".to_string(),
             },
             Screen::Details => {
                 if let Some(details) = &self.state.selected_details {
-                    if !details.title.is_empty() {
-                        return format!("MovieBox-Tui — {}", details.title);
+                    let clean = crate::providers::moviebox::clean_moviebox_title(&details.title);
+                    if !clean.is_empty() {
+                        return format!("MovieBox-Tui — {clean}");
                     }
                 }
                 "MovieBox-Tui — Details".to_string()
@@ -311,6 +341,13 @@ impl App {
         }
         match action {
             Action::Quit => {
+                self.request_tasks.cancel_all();
+                self.state
+                    .cancel_download
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                self.state
+                    .fetch_cancel
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
                 return Some(());
             }
 
@@ -320,26 +357,6 @@ impl App {
 
             Action::MouseClick(col, row) => {
                 self.handle_mouse(col, row);
-            }
-
-            Action::ProbeTerminal => {
-                self.probe_terminal().await;
-                let outcome = if self.state.image_supported {
-                    let protocol = self
-                        .state
-                        .image_picker
-                        .as_ref()
-                        .map(|picker| format!("{:?}", picker.protocol_type()))
-                        .unwrap_or_default();
-                    format!("Graphics protocol: {protocol}")
-                } else {
-                    "No graphics protocol detected; using text placeholders".to_string()
-                };
-                self.state.notify(
-                    crate::tui::overlay::NotificationKind::Info,
-                    "Terminal probe",
-                    outcome,
-                );
             }
 
             Action::WheelScroll { up } => {
@@ -385,16 +402,17 @@ impl App {
             | Action::SelfUpdateProgress(..)
             | Action::SelfUpdateComplete(..)
             | Action::ToggleSettingsPopup
-            | Action::ShowSettingsPopup
-            | Action::CloseSettingsPopup
             | Action::SelectSettingsCategory(..)
             | Action::SettingsAdjustValue(..)
             | Action::SettingsActivateRow
-            | Action::SettingsResetDownloadDir => {
+            | Action::SettingsResetDownloadDir
+            | Action::ToggleProvider(..)
+            | Action::CheckBdixNetwork
+            | Action::BdixProbeResult { .. } => {
                 self.handle_system(action).await;
             }
 
-            Action::ToggleTvMode
+            Action::SwitchToTvMode
             | Action::ShowTvConfig
             | Action::TvPlaylistAdd(..)
             | Action::TvPlaylistRemove(..)
@@ -404,8 +422,7 @@ impl App {
                 self.handle_tv(action).await;
             }
 
-            Action::ToggleAddonMode
-            | Action::SwitchToStreamingMode
+            Action::SwitchToStreamingMode
             | Action::ShowAddonManager
             | Action::AddonAddManifest(..)
             | Action::AddonToggleEnabled(..)
@@ -456,10 +473,8 @@ impl App {
             Action::PlayStream
             | Action::ShowSubtitlePopup(..)
             | Action::ShowDownloadSubtitlePopup(..)
-            | Action::LaunchMpv(..)
             | Action::LaunchPlayback(..)
             | Action::DispatchPlayback(..)
-            | Action::LaunchPlayer(..)
             | Action::MarkWatched(..)
             | Action::UpdateProgress { .. }
             | Action::ReconcileHistory
@@ -477,10 +492,8 @@ impl App {
 
             Action::DownloadStream(..)
             | Action::StartDownload(..)
-            | Action::PromptDownloadEpisode
-            | Action::ConfirmDownloadEpisode
-            | Action::PromptDownloadSeason
-            | Action::ConfirmDownloadSeason
+            | Action::DownloadEpisode
+            | Action::DownloadSeason
             | Action::ProcessDownloadQueue
             | Action::UpdateDownload(..)
             | Action::DownloadCompleted(..)
@@ -520,14 +533,9 @@ impl App {
         let mut download_area = None;
 
         if self.state.download_progress.is_some() {
-            use ratatui::layout::{Constraint, Direction, Layout};
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Min(0), Constraint::Length(3)])
-                .split(main_area);
-
-            main_area = chunks[0];
-            download_area = Some(chunks[1]);
+            let [m, d] = Self::split_main_and_download(main_area);
+            main_area = m;
+            download_area = Some(d);
         }
 
         match self.state.active_screen {
@@ -544,7 +552,9 @@ impl App {
         }
 
         self.draw_download_gauge(frame, download_area);
+
         self.draw_settings_modal(frame, area);
+        self.draw_sources_picker(frame, area);
         self.draw_theme_picker(frame, area);
         self.draw_player_picker(frame, area);
         self.draw_subtitle_picker(frame, area);
@@ -558,6 +568,15 @@ impl App {
             self.state.basic_terminal,
             self.state.download_progress.is_some(),
         );
+    }
+
+    pub fn split_main_and_download(area: ratatui::layout::Rect) -> [ratatui::layout::Rect; 2] {
+        use ratatui::layout::{Constraint, Direction, Layout};
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(0), Constraint::Length(3)])
+            .split(area);
+        [chunks[0], chunks[1]]
     }
 
     fn draw_resize_badge(&self, frame: &mut Frame, area: Rect) -> bool {
@@ -614,7 +633,7 @@ impl App {
                     area.width, area.height
                 )),
                 Line::from("Minimum required size: 50×14"),
-                Line::from("Please enlarge your terminal window."),
+                Line::from("Enlarge terminal window."),
             ];
 
             let padding_top = area.height.saturating_sub(2).saturating_sub(3) / 2;
@@ -658,20 +677,7 @@ impl App {
         let is_compact = dl_area.width < 60;
         let basic = self.state.basic_terminal;
         let modal_active = self.state.has_active_modal();
-        let raw_title = self
-            .state
-            .download_title
-            .as_deref()
-            .or_else(|| {
-                self.state
-                    .selected_details
-                    .as_ref()
-                    .map(|d| d.title.as_str())
-            })
-            .unwrap_or("Media");
-
         let cancel_label = if is_compact { "[x]" } else { "[x] Cancel" };
-        let cancel_budget = (crate::tui::text::width(cancel_label) as u16).saturating_add(4);
 
         let mut left_title_spans = Vec::new();
         let prefix_style = if modal_active {
@@ -682,7 +688,7 @@ impl App {
         if basic {
             left_title_spans.push(Span::styled(" [DL] ", prefix_style));
         } else {
-            left_title_spans.push(Span::styled(" ⬇ Downloading: ", prefix_style));
+            left_title_spans.push(Span::styled(" ⬇ Downloading ", prefix_style));
         }
 
         if self.state.download_queue_total > 0 {
@@ -702,22 +708,6 @@ impl App {
                 },
             ));
         }
-
-        let prefix_width = left_title_spans.iter().map(Span::width).sum::<usize>() as u16;
-        let title_max_width = dl_area
-            .width
-            .saturating_sub(prefix_width.saturating_add(cancel_budget).saturating_add(4))
-            as usize;
-        let truncated_title = crate::tui::text::truncate_width(raw_title, title_max_width.max(6));
-        left_title_spans.push(Span::styled(
-            truncated_title,
-            if modal_active {
-                self.theme.muted
-            } else {
-                self.theme.title.add_modifier(Modifier::BOLD)
-            },
-        ));
-        left_title_spans.push(Span::raw(" "));
 
         let left_title = Line::from(left_title_spans);
         let right_title = Line::from(vec![Span::styled(
@@ -740,10 +730,8 @@ impl App {
                 self.theme.lavender
             })
             .border_type(crate::tui::overlay::border_type(basic));
-
-        let inner_area = block.inner(dl_area);
-        crate::tui::clear_area(frame, dl_area, &self.theme);
-        frame.render_widget(block, dl_area);
+        let inner_area =
+            crate::tui::overlay::render_modal_frame(frame, dl_area, block, &self.theme);
 
         if inner_area.height == 0 || inner_area.width < 10 {
             return;
@@ -858,34 +846,99 @@ impl App {
             let truncated_status = crate::tui::text::truncate_width(status_str, status_budget);
             if truncated_status.contains(" | ") {
                 let parts: Vec<&str> = truncated_status.split(" | ").collect();
-                for (idx, part) in parts.iter().enumerate() {
-                    if idx > 0 {
+                let mut size_part = None;
+                let mut speed_part = None;
+                let mut eta_part = None;
+                let mut extra_parts = Vec::new();
+
+                for part in parts {
+                    let p = part.trim();
+                    if p.starts_with("ETA") {
+                        eta_part = Some(p);
+                    } else if p.contains("/s") {
+                        speed_part = Some(p);
+                    } else if p.ends_with("B")
+                        || p.ends_with("MB")
+                        || p.ends_with("GB")
+                        || p.ends_with("MiB")
+                        || p.ends_with("GiB")
+                        || p.ends_with("KB")
+                        || p.ends_with("KiB")
+                    {
+                        if size_part.is_none() {
+                            size_part = Some(p);
+                        } else {
+                            extra_parts.push(p);
+                        }
+                    } else {
+                        extra_parts.push(p);
+                    }
+                }
+
+                if let Some(size) = size_part {
+                    row_spans.push(Span::styled(
+                        size.to_string(),
+                        if modal_active {
+                            self.theme.muted
+                        } else {
+                            self.theme.text
+                        },
+                    ));
+                }
+
+                if speed_part.is_some() || eta_part.is_some() {
+                    if size_part.is_some() {
+                        row_spans.push(Span::raw("    "));
+                    }
+                    if let Some(speed) = speed_part {
                         row_spans.push(Span::styled(
-                            " | ",
+                            speed.to_string(),
                             if modal_active {
                                 self.theme.muted
                             } else {
-                                self.theme.surface1
+                                self.theme.teal.add_modifier(Modifier::BOLD)
                             },
                         ));
                     }
-                    if modal_active {
-                        row_spans.push(Span::styled(part.to_string(), self.theme.muted));
-                    } else if part.starts_with("ETA") {
-                        row_spans.push(Span::styled(part.to_string(), self.theme.rating));
-                    } else if part.contains("/s") {
+                    if let Some(eta) = eta_part {
+                        if speed_part.is_some() {
+                            row_spans.push(Span::styled(
+                                " ~ ",
+                                if modal_active {
+                                    self.theme.muted
+                                } else {
+                                    self.theme.surface1
+                                },
+                            ));
+                        }
+                        let eta_clean = eta.strip_prefix("ETA").unwrap_or(eta).trim();
+                        let eta_display =
+                            if eta_clean.ends_with("left") || eta_clean.ends_with("remaining") {
+                                eta_clean.to_string()
+                            } else {
+                                format!("{eta_clean} left")
+                            };
                         row_spans.push(Span::styled(
-                            part.to_string(),
-                            self.theme.teal.add_modifier(Modifier::BOLD),
+                            eta_display,
+                            if modal_active {
+                                self.theme.muted
+                            } else {
+                                self.theme.rating
+                            },
                         ));
-                    } else if part.starts_with("Audio") {
-                        row_spans.push(Span::styled(
-                            part.to_string(),
-                            self.theme.lavender.add_modifier(Modifier::BOLD),
-                        ));
-                    } else {
-                        row_spans.push(Span::styled(part.to_string(), self.theme.subtext1));
                     }
+                }
+
+                for extra in extra_parts {
+                    row_spans.push(Span::raw("   "));
+                    row_spans.push(Span::styled(
+                        extra.to_string(),
+                        if modal_active {
+                            self.theme.muted
+                        } else {
+                            self.theme.subtext1
+                        },
+                    ));
                 }
             } else {
                 row_spans.push(Span::styled(
@@ -898,7 +951,6 @@ impl App {
                 ));
             }
         }
-
         frame.render_widget(Paragraph::new(Line::from(row_spans)), inner_area);
     }
 
@@ -907,13 +959,18 @@ impl App {
             use ratatui::text::{Line, Span};
 
             let theme_names = crate::tui::theme::AVAILABLE_THEMES;
+            let longest_name = theme_names
+                .iter()
+                .map(|name| crate::tui::text::width(name))
+                .max()
+                .unwrap_or(10);
             let raw_items: Vec<String> = theme_names
                 .iter()
                 .map(|name| {
                     if self.state.basic_terminal {
-                        format!("{name:<12} * * *")
+                        format!("  {name:<pad$}   * * *  ", pad = longest_name)
                     } else {
-                        format!("{name:<12} ■ ■ ■")
+                        format!("  {name:<pad$}   ■ ■ ■  ", pad = longest_name)
                     }
                 })
                 .collect();
@@ -921,25 +978,43 @@ impl App {
             let lines: Vec<Line<'static>> = theme_names
                 .iter()
                 .map(|name| {
-                    let mut spans = vec![Span::styled(format!("{name:<12} "), self.theme.text)];
+                    let mut spans = vec![
+                        Span::raw("  "),
+                        Span::styled(format!("{name:<pad$}", pad = longest_name), self.theme.text),
+                        Span::raw("   "),
+                    ];
                     spans.extend(crate::tui::theme::Theme::palette_swatch_spans(
                         name,
                         self.state.basic_terminal,
                     ));
+                    spans.push(Span::raw("  "));
                     Line::from(spans)
                 })
                 .collect();
 
-            crate::tui::overlay::picker_with_lines(
+            let popup = if self.state.show_settings_popup {
+                crate::tui::overlay::settings_picker_layout(
+                    area,
+                    self.state.settings_category,
+                    &raw_items,
+                    16,
+                )
+            } else {
+                crate::tui::overlay::picker_layout(area, &raw_items, "Apply", 16)
+            };
+
+            crate::tui::overlay::picker_with_lines_at(
                 frame,
                 area,
+                popup,
                 &lines,
                 &raw_items,
                 &mut self.state.theme_list_state,
                 crate::tui::overlay::PickerSpec {
-                    title: "Select Theme",
+                    title: "",
                     confirm_label: "Apply",
-                    minimum_width: 32,
+                    minimum_width: 16,
+                    show_counter: false,
                 },
                 &self.theme,
                 self.state.basic_terminal,
@@ -951,23 +1026,108 @@ impl App {
             crate::tui::widgets::settings::draw(frame, area, &mut self.state, &self.theme);
         }
     }
+    fn draw_sources_picker(&mut self, frame: &mut Frame, area: Rect) {
+        if self.state.show_sources_popup {
+            let providers = crate::providers::models::ProviderKind::ENABLED;
+            let raw_items: Vec<String> = providers
+                .iter()
+                .map(|p| format!("  [✓] {}  ", p.label()))
+                .collect();
+            let lines: Vec<ratatui::text::Line<'static>> = providers
+                .iter()
+                .map(|p| {
+                    let is_enabled = self.state.provider_enabled(*p);
+                    let (check, check_style) = if is_enabled {
+                        if self.state.basic_terminal {
+                            (
+                                "[X] ",
+                                self.theme
+                                    .success
+                                    .add_modifier(ratatui::style::Modifier::BOLD),
+                            )
+                        } else {
+                            (
+                                "[✓] ",
+                                self.theme
+                                    .success
+                                    .add_modifier(ratatui::style::Modifier::BOLD),
+                            )
+                        }
+                    } else {
+                        ("[ ] ", self.theme.text_dim)
+                    };
+                    let label_style = if is_enabled {
+                        self.theme.text
+                    } else {
+                        self.theme.text_dim
+                    };
+                    ratatui::text::Line::from(vec![
+                        ratatui::text::Span::raw("  "),
+                        ratatui::text::Span::styled(check, check_style),
+                        ratatui::text::Span::styled(p.label(), label_style),
+                        ratatui::text::Span::raw("  "),
+                    ])
+                })
+                .collect();
+
+            let popup = crate::tui::overlay::settings_picker_layout(
+                area,
+                self.state.settings_category,
+                &raw_items,
+                20,
+            );
+            crate::tui::overlay::picker_with_lines_at(
+                frame,
+                area,
+                popup,
+                &lines,
+                &raw_items,
+                &mut self.state.sources_list_state,
+                crate::tui::overlay::PickerSpec {
+                    title: "",
+                    confirm_label: "Toggle",
+                    minimum_width: 20,
+                    show_counter: false,
+                },
+                &self.theme,
+                self.state.basic_terminal,
+            );
+        }
+    }
     fn draw_player_picker(&mut self, frame: &mut Frame, area: Rect) {
         if self.state.player_picker_popup {
-            let items = self
+            let raw_items = self
                 .state
                 .available_players
                 .iter()
                 .map(|k| k.label().to_string())
                 .collect::<Vec<_>>();
-            crate::tui::overlay::picker(
+            let confirm_label = if self.state.settings_player_picker {
+                "Select"
+            } else {
+                "Play"
+            };
+            let popup = if self.state.settings_player_picker {
+                crate::tui::overlay::settings_picker_layout(
+                    area,
+                    self.state.settings_category,
+                    &raw_items,
+                    10,
+                )
+            } else {
+                crate::tui::overlay::picker_layout(area, &raw_items, confirm_label, 10)
+            };
+            crate::tui::overlay::picker_at(
                 frame,
                 area,
-                &items,
+                popup,
+                &raw_items,
                 &mut self.state.player_picker_state,
                 crate::tui::overlay::PickerSpec {
-                    title: "Default Media Player",
-                    confirm_label: "Select",
-                    minimum_width: 24,
+                    title: "",
+                    confirm_label,
+                    minimum_width: 10,
+                    show_counter: false,
                 },
                 &self.theme,
                 self.state.basic_terminal,
@@ -995,7 +1155,8 @@ impl App {
                 crate::tui::overlay::PickerSpec {
                     title: "Subtitles",
                     confirm_label,
-                    minimum_width: 32,
+                    minimum_width: 20,
+                    show_counter: true,
                 },
                 &self.theme,
                 self.state.basic_terminal,
@@ -1009,7 +1170,6 @@ impl App {
         }
 
         if let Some((version, notes)) = &self.state.update_available {
-            use ratatui::layout::Alignment;
             use ratatui::text::{Line, Span};
             use ratatui::widgets::Paragraph;
 
@@ -1018,162 +1178,231 @@ impl App {
                 .map(|p| crate::updater::apply::detect_environment(&p))
                 .unwrap_or(crate::updater::apply::InstallationEnvironment::DirectReplace);
 
-            let layout = crate::tui::overlay::update_modal_layout(area, notes);
+            let layout = crate::tui::overlay::update_modal_layout_with_env(
+                area,
+                notes,
+                env.has_managed_notice(),
+            );
             let popup_area = layout.popup_area;
             let display_count = layout.display_count;
-            let has_more = layout.has_more;
+            let _ = layout.has_more;
 
             let note_lines: Vec<&str> = notes
                 .lines()
                 .map(|l| l.trim())
                 .filter(|l| !l.is_empty())
+                .filter(|l| {
+                    let lower = l.to_ascii_lowercase();
+                    !lower.contains("read full changelog")
+                        && !lower.contains("press [o]")
+                        && !lower.contains("press o to")
+                })
                 .collect();
 
+            let title_str = format!("Update Available: v{version}");
+            let is_compact_modal = popup_area.width < 50;
+            let buttons = match env {
+                crate::updater::apply::InstallationEnvironment::Homebrew => {
+                    if is_compact_modal {
+                        vec![
+                            Span::styled("[b]", self.theme.shortcut),
+                            Span::styled(" Copy ", self.theme.text),
+                            Span::styled("[o]", self.theme.shortcut),
+                            Span::styled(" GitHub", self.theme.text),
+                        ]
+                    } else {
+                        vec![
+                            Span::styled("[b]", self.theme.shortcut),
+                            Span::styled(" Copy Command ──── ", self.theme.text),
+                            Span::styled("[o]", self.theme.shortcut),
+                            Span::styled(" GitHub", self.theme.text),
+                        ]
+                    }
+                }
+                crate::updater::apply::InstallationEnvironment::Scoop => {
+                    if is_compact_modal {
+                        vec![
+                            Span::styled("[s]", self.theme.shortcut),
+                            Span::styled(" Copy ", self.theme.text),
+                            Span::styled("[o]", self.theme.shortcut),
+                            Span::styled(" GitHub", self.theme.text),
+                        ]
+                    } else {
+                        vec![
+                            Span::styled("[s]", self.theme.shortcut),
+                            Span::styled(" Copy Command ──── ", self.theme.text),
+                            Span::styled("[o]", self.theme.shortcut),
+                            Span::styled(" GitHub", self.theme.text),
+                        ]
+                    }
+                }
+                crate::updater::apply::InstallationEnvironment::Termux
+                | crate::updater::apply::InstallationEnvironment::Flatpak
+                | crate::updater::apply::InstallationEnvironment::Snap
+                | crate::updater::apply::InstallationEnvironment::ReadOnly => vec![
+                    Span::styled("[o]", self.theme.shortcut),
+                    Span::styled(" Open GitHub", self.theme.text),
+                ],
+                crate::updater::apply::InstallationEnvironment::DirectReplace
+                | crate::updater::apply::InstallationEnvironment::WindowsHelper => {
+                    if is_compact_modal {
+                        vec![
+                            Span::styled("[u]", self.theme.shortcut),
+                            Span::styled(" Update ", self.theme.text),
+                            Span::styled("[o]", self.theme.shortcut),
+                            Span::styled(" GitHub", self.theme.text),
+                        ]
+                    } else {
+                        vec![
+                            Span::styled("[u]", self.theme.shortcut),
+                            Span::styled(" Update ──── ", self.theme.text),
+                            Span::styled("[o]", self.theme.shortcut),
+                            Span::styled(" GitHub", self.theme.text),
+                        ]
+                    }
+                }
+            };
+
             let inner_area = crate::tui::widgets::ModalFrame::new(
-                "Update Available",
+                &title_str,
                 &self.theme,
                 self.state.basic_terminal,
             )
+            .title_bottom(Line::from(buttons))
             .render(frame, popup_area, area);
-            let divider_char = if self.state.basic_terminal {
-                "-"
-            } else {
-                "─"
-            };
-            let divider_str = divider_char.repeat(inner_area.width as usize);
 
-            let mut text = vec![
-                Line::from(vec![
-                    Span::styled("Installed: ", self.theme.text_dim),
-                    Span::styled(
-                        format!("v{}", env!("CARGO_PKG_VERSION")),
-                        self.theme
-                            .subtext1
-                            .add_modifier(ratatui::style::Modifier::BOLD),
-                    ),
-                    Span::styled("   →   ", self.theme.accent),
-                    Span::styled("Latest: ", self.theme.text_dim),
-                    Span::styled(
-                        format!("v{version}"),
-                        self.theme.teal.add_modifier(ratatui::style::Modifier::BOLD),
-                    ),
-                ])
-                .alignment(Alignment::Center),
-            ];
-
+            let mut text = vec![Line::from("")];
             match env {
                 crate::updater::apply::InstallationEnvironment::Homebrew => {
-                    text.push(
-                        Line::from(vec![
-                            Span::styled("Homebrew Managed • Run: ", self.theme.text_dim),
-                            Span::styled(
-                                "brew upgrade moviebox-tui",
-                                self.theme
-                                    .shortcut
-                                    .add_modifier(ratatui::style::Modifier::BOLD),
-                            ),
-                        ])
-                        .alignment(Alignment::Center),
-                    );
+                    text.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled("Homebrew Managed • Run: ", self.theme.text_dim),
+                        Span::styled(
+                            "brew upgrade moviebox-tui",
+                            self.theme
+                                .shortcut
+                                .add_modifier(ratatui::style::Modifier::BOLD),
+                        ),
+                    ]));
+                    text.push(Line::from(""));
+                }
+                crate::updater::apply::InstallationEnvironment::Scoop => {
+                    text.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled("Scoop Managed • Run: ", self.theme.text_dim),
+                        Span::styled(
+                            "scoop update moviebox-tui",
+                            self.theme
+                                .shortcut
+                                .add_modifier(ratatui::style::Modifier::BOLD),
+                        ),
+                    ]));
+                    text.push(Line::from(""));
                 }
                 crate::updater::apply::InstallationEnvironment::Termux => {
-                    text.push(
-                        Line::from(vec![Span::styled(
+                    text.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(
                             "Termux / Android • Re-run installer script to update",
                             self.theme.accent,
-                        )])
-                        .alignment(Alignment::Center),
-                    );
+                        ),
+                    ]));
+                    text.push(Line::from(""));
+                }
+                crate::updater::apply::InstallationEnvironment::Flatpak => {
+                    text.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled("Flatpak sandbox • Run: flatpak update", self.theme.accent),
+                    ]));
+                    text.push(Line::from(""));
+                }
+                crate::updater::apply::InstallationEnvironment::Snap => {
+                    text.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(
+                            "Snap sandbox • Run: sudo snap refresh moviebox-tui",
+                            self.theme.accent,
+                        ),
+                    ]));
+                    text.push(Line::from(""));
                 }
                 crate::updater::apply::InstallationEnvironment::ReadOnly => {
-                    text.push(
-                        Line::from(vec![Span::styled(
-                            "Binary is read-only • Update via your package manager",
+                    text.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(
+                            "Binary is read-only • Update via package manager",
                             self.theme.accent,
-                        )])
-                        .alignment(Alignment::Center),
-                    );
+                        ),
+                    ]));
+                    text.push(Line::from(""));
                 }
                 crate::updater::apply::InstallationEnvironment::DirectReplace
                 | crate::updater::apply::InstallationEnvironment::WindowsHelper => {}
             }
 
-            text.push(Line::from(Span::styled(
-                divider_str.clone(),
-                self.theme.surface1,
-            )));
-            text.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(
-                    "Release Notes:",
-                    self.theme
-                        .highlight
-                        .add_modifier(ratatui::style::Modifier::BOLD),
-                ),
-            ]));
-            let line_width = (inner_area.width as usize).saturating_sub(6);
-            let basic = self.state.basic_terminal;
+            let mut current_category = "Added";
+            let mut rendered_bullets = 0;
 
-            for line in note_lines.iter().take(display_count) {
+            for line in &note_lines {
                 let trimmed = line.trim();
-                let mut spans = Vec::new();
-
                 if trimmed.starts_with("### ")
                     || trimmed.starts_with("## ")
                     || trimmed.starts_with("# ")
                 {
                     let title = trimmed.trim_start_matches('#').trim();
-                    spans.push(Span::raw("    "));
-                    if title.eq_ignore_ascii_case("Added") {
-                        spans.push(Span::styled(
-                            "[Added]",
-                            self.theme.teal.add_modifier(ratatui::style::Modifier::BOLD),
-                        ));
-                    } else if title.eq_ignore_ascii_case("Fixed") {
-                        spans.push(Span::styled(
-                            "[Fixed]",
-                            self.theme
-                                .rating
-                                .add_modifier(ratatui::style::Modifier::BOLD),
-                        ));
+                    if title.eq_ignore_ascii_case("Fixed") || title.eq_ignore_ascii_case("Fixes") {
+                        current_category = "Fixed";
+                    } else if title.eq_ignore_ascii_case("Added")
+                        || title.eq_ignore_ascii_case("Features")
+                        || title.eq_ignore_ascii_case("New Features")
+                    {
+                        current_category = "Added";
                     } else if title.eq_ignore_ascii_case("Changed") {
-                        spans.push(Span::styled(
-                            "[Changed]",
-                            self.theme
-                                .sapphire
-                                .add_modifier(ratatui::style::Modifier::BOLD),
-                        ));
+                        current_category = "Changed";
                     } else if title.eq_ignore_ascii_case("Performance")
                         || title.eq_ignore_ascii_case("Perf")
                     {
-                        spans.push(Span::styled(
-                            "[Performance]",
+                        current_category = "Perf";
+                    } else {
+                        current_category = title;
+                    }
+                    continue;
+                }
+
+                if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
+                    if rendered_bullets >= display_count {
+                        break;
+                    }
+                    rendered_bullets += 1;
+                    let bullet = trimmed[2..].trim();
+                    let mut spans = vec![Span::raw("  ")];
+
+                    let (badge_style, badge_text) = match current_category {
+                        "Fixed" => (
+                            self.theme
+                                .rating
+                                .add_modifier(ratatui::style::Modifier::BOLD),
+                            "[Fixed] ",
+                        ),
+                        "Changed" => (
+                            self.theme
+                                .sapphire
+                                .add_modifier(ratatui::style::Modifier::BOLD),
+                            "[Changed] ",
+                        ),
+                        "Perf" => (
                             self.theme
                                 .accent
                                 .add_modifier(ratatui::style::Modifier::BOLD),
-                        ));
-                    } else if title.eq_ignore_ascii_case("Security") {
-                        spans.push(Span::styled(
-                            "[Security]",
-                            self.theme
-                                .error
-                                .add_modifier(ratatui::style::Modifier::BOLD),
-                        ));
-                    } else {
-                        spans.push(Span::styled(
-                            title,
-                            self.theme
-                                .highlight
-                                .add_modifier(ratatui::style::Modifier::BOLD),
-                        ));
-                    }
-                } else if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
-                    let bullet = trimmed[2..].trim();
-                    spans.push(Span::raw("      "));
-                    spans.push(Span::styled(
-                        if basic { "- " } else { "• " },
-                        self.theme.accent,
-                    ));
+                            "[Perf] ",
+                        ),
+                        _ => (
+                            self.theme.teal.add_modifier(ratatui::style::Modifier::BOLD),
+                            "[Added] ",
+                        ),
+                    };
+                    spans.push(Span::styled(badge_text, badge_style));
+
                     if let Some(rest) = bullet.strip_prefix("**") {
                         if let Some(end) = rest.find("**") {
                             let title = &rest[..end];
@@ -1192,10 +1421,12 @@ impl App {
                                 spans.push(Span::styled(colon, self.theme.subtext1));
                             }
                             if !clean_rest.is_empty() {
-                                let budget = line_width
-                                    .saturating_sub(8)
-                                    .saturating_sub(crate::tui::text::width(title))
-                                    .saturating_sub(colon.len());
+                                let prefix_w = 2
+                                    + badge_text.len()
+                                    + crate::tui::text::width(title)
+                                    + colon.len();
+                                let budget =
+                                    (inner_area.width as usize).saturating_sub(prefix_w + 2);
                                 if budget > 0 {
                                     spans.push(Span::styled(
                                         crate::tui::text::truncate_width(&clean_rest, budget)
@@ -1206,118 +1437,33 @@ impl App {
                             }
                         } else {
                             let clean = bullet.replace('`', "");
+                            let budget = (inner_area.width as usize)
+                                .saturating_sub(2 + badge_text.len() + 2);
                             spans.push(Span::styled(
-                                crate::tui::text::truncate_width(
-                                    &clean,
-                                    line_width.saturating_sub(8),
-                                )
-                                .into_owned(),
+                                crate::tui::text::truncate_width(&clean, budget).into_owned(),
                                 self.theme.text,
                             ));
                         }
                     } else {
                         let clean = bullet.replace('`', "");
+                        let budget =
+                            (inner_area.width as usize).saturating_sub(2 + badge_text.len() + 2);
                         spans.push(Span::styled(
-                            crate::tui::text::truncate_width(&clean, line_width.saturating_sub(8))
-                                .into_owned(),
+                            crate::tui::text::truncate_width(&clean, budget).into_owned(),
                             self.theme.text,
                         ));
                     }
-                } else {
-                    let clean = trimmed.replace('`', "");
-                    spans.push(Span::raw("      "));
-                    spans.push(Span::styled(
-                        crate::tui::text::truncate_width(&clean, line_width.saturating_sub(6))
-                            .into_owned(),
-                        self.theme.text_dim,
-                    ));
+                    text.push(Line::from(spans));
                 }
-                text.push(Line::from(spans));
             }
 
-            let more_msg = if has_more {
-                "    Press [o] to read full changelog on GitHub"
-            } else {
-                "    Press [o] to view release on GitHub"
-            };
-            text.push(Line::from(Span::styled(more_msg, self.theme.text_dim)));
-            text.push(Line::from(Span::styled(divider_str, self.theme.surface1)));
-
-            let is_compact_modal = inner_area.width < 58;
-            let buttons = match env {
-                crate::updater::apply::InstallationEnvironment::Homebrew => {
-                    if is_compact_modal {
-                        vec![
-                            Span::styled("[b]", self.theme.shortcut),
-                            Span::styled(" Copy  ", self.theme.text),
-                            Span::styled("[o]", self.theme.shortcut),
-                            Span::styled(" Web  ", self.theme.text),
-                            Span::styled("[Esc]", self.theme.shortcut),
-                            Span::styled(" Back", self.theme.text),
-                        ]
-                    } else {
-                        vec![
-                            Span::styled("[b]", self.theme.shortcut),
-                            Span::styled(
-                                " Copy Command    ",
-                                self.theme.text.add_modifier(ratatui::style::Modifier::BOLD),
-                            ),
-                            Span::styled("[o]", self.theme.shortcut),
-                            Span::styled(" Open Release Page    ", self.theme.text),
-                            Span::styled("[Esc]", self.theme.shortcut),
-                            Span::styled(" Dismiss", self.theme.text),
-                        ]
-                    }
-                }
-                crate::updater::apply::InstallationEnvironment::Termux
-                | crate::updater::apply::InstallationEnvironment::ReadOnly => {
-                    if is_compact_modal {
-                        vec![
-                            Span::styled("[o]", self.theme.shortcut),
-                            Span::styled(" Web  ", self.theme.text),
-                            Span::styled("[Esc]", self.theme.shortcut),
-                            Span::styled(" Back", self.theme.text),
-                        ]
-                    } else {
-                        vec![
-                            Span::styled("[o]", self.theme.shortcut),
-                            Span::styled(
-                                " Open Release Page    ",
-                                self.theme.text.add_modifier(ratatui::style::Modifier::BOLD),
-                            ),
-                            Span::styled("[Esc]", self.theme.shortcut),
-                            Span::styled(" Dismiss", self.theme.text),
-                        ]
-                    }
-                }
-                crate::updater::apply::InstallationEnvironment::DirectReplace
-                | crate::updater::apply::InstallationEnvironment::WindowsHelper => {
-                    if is_compact_modal {
-                        vec![
-                            Span::styled("[u]", self.theme.shortcut),
-                            Span::styled(" Update  ", self.theme.text),
-                            Span::styled("[o]", self.theme.shortcut),
-                            Span::styled(" Web  ", self.theme.text),
-                            Span::styled("[Esc]", self.theme.shortcut),
-                            Span::styled(" Back", self.theme.text),
-                        ]
-                    } else {
-                        vec![
-                            Span::styled("[u]", self.theme.shortcut),
-                            Span::styled(
-                                " Update Now    ",
-                                self.theme.text.add_modifier(ratatui::style::Modifier::BOLD),
-                            ),
-                            Span::styled("[o]", self.theme.shortcut),
-                            Span::styled(" Open Release Page    ", self.theme.text),
-                            Span::styled("[Esc]", self.theme.shortcut),
-                            Span::styled(" Dismiss", self.theme.text),
-                        ]
-                    }
-                }
-            };
-
-            text.push(Line::from(buttons).alignment(Alignment::Center));
+            if rendered_bullets == 0 {
+                text.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled("No release highlights provided.", self.theme.text_dim),
+                ]));
+            }
+            text.push(Line::from(""));
 
             let popup = Paragraph::new(text);
             frame.render_widget(popup, inner_area);
@@ -1333,12 +1479,23 @@ impl App {
         use ratatui::text::{Line, Span};
         use ratatui::widgets::Paragraph;
 
-        let width = 56.min(area.width.saturating_sub(4)).max(36);
-        let height = 9.min(area.height.saturating_sub(2)).max(7);
-        let popup_area = crate::tui::overlay::centered(area, width, height, 36, 56);
+        let width = 42.min(area.width.saturating_sub(4)).max(32);
+        let height = 5.min(area.height.saturating_sub(2)).max(3);
+        let x = area.x + area.width.saturating_sub(width) / 2;
+        let search_y = crate::tui::overlay::home_search_y(area);
+        let y = search_y.min(area.bottom().saturating_sub(height));
+        let popup_area = ratatui::layout::Rect::new(x, y, width, height);
+
+        let target_version = self
+            .state
+            .update_release
+            .as_ref()
+            .map(|r| r.version.as_str())
+            .unwrap_or("latest");
+        let title_str = format!("Updating: v{target_version}");
 
         let inner_area = crate::tui::widgets::ModalFrame::new(
-            "Self-Update in Progress",
+            &title_str,
             &self.theme,
             self.state.basic_terminal,
         )
@@ -1347,13 +1504,6 @@ impl App {
         let spinner =
             crate::tui::widgets::loading_spinner(self.state.tick_count, self.state.basic_terminal);
 
-        let target_version = self
-            .state
-            .update_release
-            .as_ref()
-            .map(|r| r.version.as_str())
-            .unwrap_or("latest");
-
         let progress_msg = self
             .state
             .update_progress_msg
@@ -1361,17 +1511,11 @@ impl App {
             .unwrap_or("Applying update...");
 
         let action_text = if progress_msg.contains("SHA256") || progress_msg.contains("checksum") {
-            "Verifying release checksum...".to_string()
+            "Verifying checksum"
         } else if progress_msg.contains("Extracting") || progress_msg.contains("Applying") {
-            format!("Installing MovieBox-Tui v{target_version}...")
+            "Installing binary"
         } else {
-            format!("Downloading MovieBox-Tui v{target_version}...")
-        };
-
-        let (warn_icon, warn_style) = if self.state.basic_terminal {
-            ("[!] ", self.theme.shortcut)
-        } else {
-            ("⚠ ", self.theme.rating)
+            "Downloading release"
         };
 
         let text = vec![
@@ -1385,27 +1529,12 @@ impl App {
                 ),
                 Span::styled(
                     action_text,
-                    self.theme
-                        .header
-                        .add_modifier(ratatui::style::Modifier::BOLD),
+                    self.theme.text.add_modifier(ratatui::style::Modifier::BOLD),
                 ),
             ])
             .alignment(Alignment::Center),
             Line::from(""),
-            Line::from(vec![
-                Span::styled(warn_icon, warn_style),
-                Span::styled(
-                    if self.state.basic_terminal {
-                        "Please wait - do not close terminal"
-                    } else {
-                        "Please wait • do not close terminal"
-                    },
-                    self.theme.text_dim,
-                ),
-            ])
-            .alignment(Alignment::Center),
         ];
-
         let popup = Paragraph::new(text);
         frame.render_widget(popup, inner_area);
     }
@@ -1440,13 +1569,13 @@ mod tests {
             rendered.push('\n');
         }
 
-        assert!(rendered.contains("Downloading:"));
-        assert!(rendered.contains("Ek Deewane Ki Deewaniyat"));
+        assert!(rendered.contains("Downloading"));
+        assert!(!rendered.contains("Ek Deewane Ki Deewaniyat"));
         assert!(rendered.contains("[x] Cancel"));
         assert!(rendered.contains("93.2%"));
         assert!(rendered.contains("778.6 MB"));
         assert!(rendered.contains("4.6 MB/s"));
-        assert!(rendered.contains("ETA 00:12"));
+        assert!(rendered.contains("00:12 left"));
 
         app.state.basic_terminal = true;
         terminal
@@ -1513,11 +1642,8 @@ mod tests {
             }
             rendered.push('\n');
         }
-        assert!(rendered.contains("Update Available"));
-        assert!(rendered.contains("Installed:"));
-        assert!(rendered.contains("Latest:"));
+        assert!(rendered.contains("Update Available: v0.1.18"));
         assert!(rendered.contains("v0.1.18"));
-        assert!(rendered.contains("Release Notes:"));
         assert!(!rendered.contains("▌"));
         assert!(rendered.contains("[Added]"));
         assert!(rendered.contains("[Fixed]"));
@@ -1527,7 +1653,6 @@ mod tests {
         assert!(!rendered.contains("**Stream"));
         assert!(rendered.contains("[u]"));
         assert!(rendered.contains("[o]"));
-        assert!(rendered.contains("[Esc]"));
     }
 
     #[test]
@@ -1555,10 +1680,9 @@ mod tests {
             rendered.push('\n');
         }
 
-        assert!(rendered.contains("Self-Update in Progress"));
-        assert!(rendered.contains("Downloading MovieBox-Tui v"));
-        assert!(rendered.contains("⚠"));
-        assert!(rendered.contains("Please wait • do not close terminal"));
+        assert!(rendered.contains("Updating: v"));
+        assert!(rendered.contains("Downloading release"));
+        assert!(!rendered.contains("⚠"));
 
         app.state.basic_terminal = true;
         app.state.update_progress_msg = Some("Applying update...".to_string());
@@ -1576,10 +1700,9 @@ mod tests {
             }
             basic_rendered.push('\n');
         }
-        assert!(basic_rendered.contains("Self-Update in Progress"));
-        assert!(basic_rendered.contains("Installing MovieBox-Tui v"));
-        assert!(basic_rendered.contains("[!]"));
-        assert!(basic_rendered.contains("Please wait - do not close terminal"));
+        assert!(basic_rendered.contains("Updating: v"));
+        assert!(basic_rendered.contains("Installing binary"));
+        assert!(!basic_rendered.contains("[!]"));
 
         let min_backend = TestBackend::new(50, 14);
         let mut min_terminal = Terminal::new(min_backend).unwrap();
@@ -1599,8 +1722,8 @@ mod tests {
             }
             min_rendered.push('\n');
         }
-        assert!(min_rendered.contains("Self-Update in Progress"));
-        assert!(min_rendered.contains("Downloading MovieBox-Tui v"));
-        assert!(min_rendered.contains("Please wait • do not close terminal"));
+        assert!(min_rendered.contains("Updating: v"));
+        assert!(min_rendered.contains("Downloading release"));
+        assert!(!min_rendered.contains("Please wait"));
     }
 }

@@ -1,41 +1,50 @@
 use base64::Engine;
 use hmac::{Hmac, KeyInit, Mac};
-use md5::{Digest, Md5};
+use md5::Md5;
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use url::Url;
 
-const SECRET_KEY_DEFAULT: &str = "76iRl07s0xSN9jqmEWAt79EBJZulIQIsV64FZr2O";
+const DEFAULT_SECRET_BYTES: &[u8] = b"\xef\xa8\x91\x97\x4e\xec\xd3\x14\x8d\xf6\x3a\xa6\x11\x60\x2d\xef\xd1\x01\x25\x9b\xa5\x21\x02\x2c\x57\xae\x05\x66\xbd\x8e";
 const SIGNATURE_BODY_MAX_BYTES: usize = 102_400;
-
-static DEFAULT_SECRET_BYTES: std::sync::LazyLock<Vec<u8>> =
-    std::sync::LazyLock::new(|| b64_decode(SECRET_KEY_DEFAULT));
 
 type HmacMd5 = Hmac<Md5>;
 
-fn md5_hex(data: &[u8]) -> String {
-    let mut hasher = Md5::new();
-    hasher.update(data);
-    let digest = hasher.finalize();
-    let mut hex = String::with_capacity(32);
-    for b in digest {
-        use std::fmt::Write;
-        let _ = write!(&mut hex, "{:02x}", b);
+const STOCK_CERT_SHA256: &str = "03d4b741632d136bc23e2de4c6adcdb7712f1980b619c183221801730bbd0410";
+const BUILD_TAG_SALT: &str = "oneroom";
+const BUILD_TAG_HEADER: reqwest::header::HeaderName =
+    reqwest::header::HeaderName::from_static("x-client-build");
+const BUILD_TAG_INFO_KEY: &str = "X-Client-Build";
+
+fn build_tag_stamp(ts_ms: u64, rand_part: u32) -> String {
+    format!("{}{:03}000{}", ts_ms / 1000, ts_ms % 1000, rand_part)
+}
+
+fn build_tag_for_cert(ts_ms: u64, rand_part: u32, cert_sha256_hex: &str) -> String {
+    let stamp = build_tag_stamp(ts_ms, rand_part);
+    let hash = crate::cache::md5_hex_bytes(
+        format!("{}{}{}", cert_sha256_hex, BUILD_TAG_SALT, stamp).as_bytes(),
+    );
+    format!("{}.{}", stamp, hash)
+}
+
+pub fn generate_x_client_build(ts_ms: u64) -> String {
+    use rand::RngExt;
+    let mut rng = rand::rng();
+    build_tag_for_cert(ts_ms, rng.random_range(0..1000), STOCK_CERT_SHA256)
+}
+
+fn client_info_with_build_tag(client_info: &str, tag: &str) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(client_info) else {
+        return client_info.to_string();
+    };
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert(
+            BUILD_TAG_INFO_KEY.to_string(),
+            serde_json::Value::String(tag.to_string()),
+        );
     }
-    hex
-}
-
-fn b64_decode(val: &str) -> Vec<u8> {
-    let mut padded = val.to_string();
-    let padding = (4 - padded.len() % 4) % 4;
-    padded.push_str(&"=".repeat(padding));
-    base64::engine::general_purpose::STANDARD
-        .decode(padded)
-        .unwrap_or_default()
-}
-
-fn b64_encode(data: &[u8]) -> String {
-    base64::engine::general_purpose::STANDARD.encode(data)
+    serde_json::to_string(&value).unwrap_or_else(|_| client_info.to_string())
 }
 
 fn insert_header(
@@ -56,7 +65,7 @@ fn insert_header(
 pub fn generate_x_client_token(ts: u64) -> String {
     let ts_str = ts.to_string();
     let reversed_ts: String = ts_str.chars().rev().collect();
-    let hash_val = md5_hex(reversed_ts.as_bytes());
+    let hash_val = crate::cache::md5_hex_bytes(reversed_ts.as_bytes());
     format!("{},{}", ts_str, hash_val)
 }
 
@@ -114,7 +123,7 @@ pub fn build_canonical_string(
         } else {
             bytes
         };
-        (md5_hex(truncated), len.to_string())
+        (crate::cache::md5_hex_bytes(truncated), len.to_string())
     } else {
         (String::new(), String::new())
     };
@@ -140,12 +149,12 @@ pub fn generate_x_tr_signature(
     timestamp_ms: u64,
 ) -> String {
     let canonical = build_canonical_string(method, accept, content_type, url, body, timestamp_ms);
-    let Ok(mut mac) = HmacMd5::new_from_slice(&DEFAULT_SECRET_BYTES) else {
+    let Ok(mut mac) = HmacMd5::new_from_slice(DEFAULT_SECRET_BYTES) else {
         log::warn!("moviebox signature fallback: invalid HMAC key material");
         return format!("{}|2|", timestamp_ms);
     };
     mac.update(canonical.as_bytes());
-    let sig_b64 = b64_encode(&mac.finalize().into_bytes());
+    let sig_b64 = base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
 
     format!("{}|2|{}", timestamp_ms, sig_b64)
 }
@@ -170,6 +179,8 @@ pub fn build_signed_headers(
     let client_token = generate_x_client_token(ts);
     let signature =
         generate_x_tr_signature(method, Some(accept), Some(content_type), url, body, ts);
+    let build_tag = generate_x_client_build(ts);
+    let client_info = client_info_with_build_tag(client_info, &build_tag);
 
     let mut headers = reqwest::header::HeaderMap::new();
 
@@ -187,10 +198,11 @@ pub fn build_signed_headers(
         reqwest::header::HeaderName::from_static("x-tr-signature"),
         &signature,
     );
+    insert_header(&mut headers, BUILD_TAG_HEADER, &build_tag);
     insert_header(
         &mut headers,
         reqwest::header::HeaderName::from_static("x-client-info"),
-        client_info,
+        &client_info,
     );
     insert_header(
         &mut headers,
@@ -350,5 +362,84 @@ mod tests {
         assert!((50020117..=50020121).contains(&code));
         assert_eq!(parsed["sp_code"], "40401");
         assert_eq!(parsed["X-Play-Mode"], "2");
+    }
+
+    fn test_cert_hex() -> String {
+        use sha2::Digest;
+        sha2::Sha256::digest(b"stock-certificate")
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect()
+    }
+
+    #[test]
+    fn test_build_tag_matches_published_vectors() {
+        assert_eq!(
+            build_tag_for_cert(1700000000123, 45, &test_cert_hex()),
+            "170000000012300045.1a8f8b991f95799fba169a8a7f889ebc"
+        );
+        assert_eq!(
+            build_tag_for_cert(1700000000007, 7, &test_cert_hex()),
+            "17000000000070007.d1c4e3525f7a8bf894ffdb6fcda377b2"
+        );
+    }
+
+    #[test]
+    fn test_generate_x_client_build_format() {
+        let tag = generate_x_client_build(1700000000123);
+        let (stamp, hash) = tag.split_once('.').expect("tag has stamp.hash shape");
+        assert!((17..=19).contains(&stamp.len()));
+        assert!(stamp.chars().all(|c| c.is_ascii_digit()));
+        assert!(stamp.starts_with("1700000000123"));
+        assert_eq!(hash.len(), 32);
+        assert!(
+            hash.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
+    }
+
+    #[test]
+    fn test_client_info_with_build_tag_inserts_and_replaces() {
+        let tagged = client_info_with_build_tag(r#"{"device_id":"d1"}"#, "stamp.hash");
+        let parsed: serde_json::Value = serde_json::from_str(&tagged).expect("valid JSON");
+        assert_eq!(parsed["device_id"], "d1");
+        assert_eq!(parsed["X-Client-Build"], "stamp.hash");
+
+        let replaced = client_info_with_build_tag(&tagged, "new.tag");
+        let parsed: serde_json::Value = serde_json::from_str(&replaced).expect("valid JSON");
+        assert_eq!(parsed["X-Client-Build"], "new.tag");
+
+        assert_eq!(
+            client_info_with_build_tag("not json", "stamp.hash"),
+            "not json"
+        );
+    }
+
+    #[test]
+    fn test_build_signed_headers_include_build_tag() {
+        let (_, client_info) = generate_client_info_and_ua();
+        let headers = build_signed_headers(
+            "GET",
+            "https://api.example.com/path",
+            None,
+            None,
+            "ua",
+            &client_info,
+            "1.2.3.4",
+        );
+        let tag = headers
+            .get("x-client-build")
+            .and_then(|v| v.to_str().ok())
+            .expect("x-client-build header present");
+        let (stamp, hash) = tag.split_once('.').expect("tag shape");
+        assert!((17..=19).contains(&stamp.len()));
+        assert_eq!(hash.len(), 32);
+
+        let info = headers
+            .get("x-client-info")
+            .and_then(|v| v.to_str().ok())
+            .expect("x-client-info header present");
+        let parsed: serde_json::Value = serde_json::from_str(info).expect("valid JSON");
+        assert_eq!(parsed["X-Client-Build"], tag);
     }
 }

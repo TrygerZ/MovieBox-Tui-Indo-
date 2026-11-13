@@ -21,7 +21,7 @@ only shows a short status line. See [logging.md](logging.md) for location and se
 - Operating system and terminal (e.g. macOS + iTerm2, Windows + Windows Terminal,
   Termux).
 - The player used, if the issue is playback.
-- The log file (sanitized — safe to share; URLs and paths are redacted).
+- The log file (sanitized and safe to share; URLs and paths are redacted).
 
 ## Reading the log
 

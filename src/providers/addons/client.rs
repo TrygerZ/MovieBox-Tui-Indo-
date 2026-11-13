@@ -31,12 +31,13 @@ impl AddonClient {
         } else if !crate::net::is_http_url(&url) {
             url = format!("https://{url}");
         }
-        if !url.ends_with("/manifest.json") && !url.contains("/manifest.json?") {
-            if url.ends_with('/') {
-                url.push_str("manifest.json");
-            } else {
-                url.push_str("/manifest.json");
-            }
+        let (base, suffix) = match url.find(['?', '#']) {
+            Some(idx) => (&url[..idx], &url[idx..]),
+            None => (url.as_str(), ""),
+        };
+        if !base.ends_with("/manifest.json") {
+            let trimmed_base = base.trim_end_matches('/');
+            url = format!("{trimmed_base}/manifest.json{suffix}");
         }
         url
     }
@@ -121,28 +122,7 @@ impl AddonClient {
             .await
             .map_err(|e| format!("Invalid catalog response JSON: {e}"))?;
 
-        if let Some(metas_arr) = raw.get("metas").and_then(|m| m.as_array()) {
-            let metas: Vec<MetaItem> =
-                serde_json::from_value(serde_json::Value::Array(metas_arr.clone()))
-                    .map_err(|e| format!("Failed to parse metas: {e}"))?;
-            return Ok(metas);
-        } else if let Some(items_arr) = raw
-            .get("items")
-            .or_else(|| raw.get("results"))
-            .and_then(|m| m.as_array())
-        {
-            let metas: Vec<MetaItem> =
-                serde_json::from_value(serde_json::Value::Array(items_arr.clone()))
-                    .map_err(|e| format!("Failed to parse items: {e}"))?;
-            return Ok(metas);
-        } else if let Some(arr) = raw.as_array() {
-            let metas: Vec<MetaItem> =
-                serde_json::from_value(serde_json::Value::Array(arr.clone()))
-                    .map_err(|e| format!("Failed to parse raw array metas: {e}"))?;
-            return Ok(metas);
-        }
-
-        Ok(Vec::new())
+        parse_catalog_metas(raw)
     }
 
     pub async fn fetch_catalog(
@@ -173,28 +153,7 @@ impl AddonClient {
             .await
             .map_err(|e| format!("Invalid catalog response JSON: {e}"))?;
 
-        if let Some(metas_arr) = raw.get("metas").and_then(|m| m.as_array()) {
-            let metas: Vec<MetaItem> =
-                serde_json::from_value(serde_json::Value::Array(metas_arr.clone()))
-                    .map_err(|e| format!("Failed to parse metas: {e}"))?;
-            return Ok(metas);
-        } else if let Some(items_arr) = raw
-            .get("items")
-            .or_else(|| raw.get("results"))
-            .and_then(|m| m.as_array())
-        {
-            let metas: Vec<MetaItem> =
-                serde_json::from_value(serde_json::Value::Array(items_arr.clone()))
-                    .map_err(|e| format!("Failed to parse items: {e}"))?;
-            return Ok(metas);
-        } else if let Some(arr) = raw.as_array() {
-            let metas: Vec<MetaItem> =
-                serde_json::from_value(serde_json::Value::Array(arr.clone()))
-                    .map_err(|e| format!("Failed to parse raw array metas: {e}"))?;
-            return Ok(metas);
-        }
-
-        Ok(Vec::new())
+        parse_catalog_metas(raw)
     }
 
     pub async fn fetch_meta(
@@ -250,23 +209,32 @@ impl AddonClient {
             return Err(format!("Streams returned HTTP {}", resp.status()));
         }
 
-        let raw: serde_json::Value = resp
+        let mut raw: serde_json::Value = resp
             .json()
             .await
             .map_err(|e| format!("Invalid streams response JSON: {e}"))?;
 
-        if let Some(streams_arr) = raw.get("streams").and_then(|s| s.as_array()) {
-            let streams: Vec<StreamItem> =
-                serde_json::from_value(serde_json::Value::Array(streams_arr.clone()))
-                    .map_err(|e| format!("Failed to parse streams: {e}"))?;
-            return Ok(streams);
-        } else if let Some(arr) = raw.as_array() {
-            let streams: Vec<StreamItem> =
-                serde_json::from_value(serde_json::Value::Array(arr.clone()))
-                    .map_err(|e| format!("Failed to parse raw stream array: {e}"))?;
-            return Ok(streams);
+        if let Some(val) = raw.get_mut("streams").map(serde_json::Value::take) {
+            serde_json::from_value(val).map_err(|e| format!("Failed to parse streams: {e}"))
+        } else if raw.is_array() {
+            serde_json::from_value(raw)
+                .map_err(|e| format!("Failed to parse raw stream array: {e}"))
+        } else {
+            Ok(Vec::new())
         }
+    }
+}
 
+fn parse_catalog_metas(mut raw: serde_json::Value) -> Result<Vec<MetaItem>, String> {
+    if let Some(val) = raw.get_mut("metas").map(serde_json::Value::take) {
+        serde_json::from_value(val).map_err(|e| format!("Failed to parse metas: {e}"))
+    } else if let Some(val) = raw.get_mut("items").map(serde_json::Value::take) {
+        serde_json::from_value(val).map_err(|e| format!("Failed to parse items: {e}"))
+    } else if let Some(val) = raw.get_mut("results").map(serde_json::Value::take) {
+        serde_json::from_value(val).map_err(|e| format!("Failed to parse items: {e}"))
+    } else if raw.is_array() {
+        serde_json::from_value(raw).map_err(|e| format!("Failed to parse raw array metas: {e}"))
+    } else {
         Ok(Vec::new())
     }
 }

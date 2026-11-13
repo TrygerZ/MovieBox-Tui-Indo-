@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FavoriteItem {
@@ -19,7 +19,7 @@ impl FavoriteItem {
         let title = if title.trim().is_empty() {
             details.title.clone()
         } else {
-            title
+            title.to_string()
         };
         let stype = if details.is_series() { 2 } else { 1 };
         let release_year = details.year.clone().unwrap_or_default();
@@ -68,37 +68,28 @@ impl FavoriteItem {
 pub struct FavoritesManager {
     #[serde(default)]
     pub items: Vec<FavoriteItem>,
+    #[serde(skip)]
+    id_index: std::collections::HashSet<String>,
 }
 
 impl FavoritesManager {
     pub fn new() -> Self {
-        match Self::favorites_file_path() {
+        match crate::config::favorites_path() {
             Some(path) => Self::load_from_path(&path),
             None => Self::default(),
         }
-    }
-
-    fn favorites_file_path() -> Option<PathBuf> {
-        crate::config::favorites_path()
     }
 
     pub fn load_from_path(path: &Path) -> Self {
         if path.exists() {
             match fs::read_to_string(path) {
                 Ok(content) => match serde_json::from_str::<Self>(&content) {
-                    Ok(manager) => return manager,
+                    Ok(mut manager) => {
+                        manager.rebuild_index();
+                        return manager;
+                    }
                     Err(e) => {
-                        let stamp = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs();
-                        let corrupt_path = path.with_extension(format!("corrupt.{stamp}"));
-                        log::error!(
-                            "failed to parse favorites from {} ({e}), rotating to {}",
-                            crate::logging::sanitize_path(path),
-                            crate::logging::sanitize_path(&corrupt_path)
-                        );
-                        let _ = fs::rename(path, corrupt_path);
+                        crate::config::rotate_corrupt_file(path, &format!("favorites ({e})"));
                     }
                 },
                 Err(e) => {
@@ -113,7 +104,7 @@ impl FavoritesManager {
     }
 
     pub fn save(&self) {
-        if let Some(path) = Self::favorites_file_path() {
+        if let Some(path) = crate::config::favorites_path() {
             self.save_to_path(&path);
         }
     }
@@ -126,12 +117,36 @@ impl FavoritesManager {
         }
     }
 
+    pub fn rebuild_index(&mut self) {
+        self.id_index.clear();
+        for item in &self.items {
+            let prov_canonical = crate::providers::models::ProviderKind::parse(&item.provider)
+                .map(|p| p.cache_key().to_string())
+                .unwrap_or_else(|| item.provider.trim().to_ascii_lowercase());
+            self.id_index.insert(format!(
+                "{}:{}:{}",
+                prov_canonical, item.subject_id, item.stype
+            ));
+        }
+    }
+
     pub fn is_favorite(&self, identity: &crate::models::SubjectIdentity<'_>) -> bool {
+        if !identity.subject_id.is_empty() {
+            let prov_canonical = crate::providers::models::ProviderKind::parse(identity.provider)
+                .map(|p| p.cache_key().to_string())
+                .unwrap_or_else(|| identity.provider.trim().to_ascii_lowercase());
+            let key = format!(
+                "{}:{}:{}",
+                prov_canonical, identity.subject_id, identity.stype
+            );
+            if self.id_index.contains(key.as_str()) {
+                return true;
+            }
+        }
         self.items
             .iter()
             .any(|item| item.identity().matches(identity))
     }
-
     pub fn toggle(&mut self, item: FavoriteItem) -> bool {
         let now_favorited = if let Some(pos) = self
             .items
@@ -144,17 +159,20 @@ impl FavoritesManager {
             self.items.push(item);
             true
         };
+        self.rebuild_index();
         self.save();
         now_favorited
     }
 
     pub fn remove(&mut self, identity: &crate::models::SubjectIdentity<'_>) {
         self.items.retain(|item| !item.identity().matches(identity));
+        self.rebuild_index();
         self.save();
     }
 
     pub fn clear(&mut self) {
         self.items.clear();
+        self.rebuild_index();
         self.save();
     }
 }
@@ -162,7 +180,6 @@ impl FavoritesManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     fn dummy_item(
         provider: &str,
         subject_id: &str,
